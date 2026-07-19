@@ -87,6 +87,8 @@ pub enum ClientMessage {
     /// Onboarding: user requests initial setup. Agent asks questions,
     /// stores answers as user-scoped memories.
     Initialize { session_id: Uuid },
+    /// Cancel an in-progress agent loop for this session
+    CancelChat { session_id: Uuid },
     Ping,
 }
 
@@ -129,6 +131,8 @@ pub enum ServerMessage {
         mode: PermissionMode,
     },
     Pong,
+    /// Agent loop was cancelled by the user
+    ChatCancelled { session_id: Uuid },
     /// Server is shutting down
     Shutdown,
     /// Chat statistics (sent after final delta)

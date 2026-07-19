@@ -289,6 +289,11 @@ async fn handle_connection(
                 });
             }
 
+            ClientMessage::CancelChat { session_id: sid } => {
+                agent.cancel_chat(sid).await;
+                let _ = tx.send(ServerMessage::ChatCancelled { session_id: sid });
+            }
+
             ClientMessage::Ping => {
                 let _ = tx.send(ServerMessage::Pong);
             }

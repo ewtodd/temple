@@ -189,6 +189,9 @@ fn spawn_ws(
                             s.entries.push(ChatEntry::System("server shutdown".into()));
                             s.running = false;
                         }
+                        ServerMessage::ChatCancelled { .. } => {
+                            s.entries.push(ChatEntry::System("(cancelled by user)".into()));
+                        }
                         ServerMessage::Pong | ServerMessage::SessionClosed { .. } => {}
                     }
                 }
@@ -495,6 +498,13 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             }
 
             match k.code {
+                Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Cancel in-progress agent loop
+                    cmd_h.send(ClientMessage::CancelChat {
+                        session_id: s.session_id,
+                    }).ok();
+                    s.entries.push(ChatEntry::System("(cancelled)".into()));
+                }
                 Char('g') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.editor_pending = true;
                 }
@@ -522,7 +532,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         "/quit" | "/exit" => { s.running = false; }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/models · /model X · /mode X · /initial (onboarding) · /help · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/models · /model X · /mode X · /initial · /help · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use temple_protocol::*;
 use tokio::sync::{oneshot, Mutex};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::litellm::{ChatMessage, ChatRequest, LiteLLM, StreamEvent, ToolDefinition};
@@ -12,11 +13,15 @@ use crate::permissions::PermissionScope;
 use crate::router::Router;
 
 /// Maximum tool-loop rounds per user message before forcing an answer.
-const MAX_TOOL_ROUNDS: usize = 12;
+const MAX_TOOL_ROUNDS: usize = 30;
 /// Max conversation messages kept in context (plus system prompt).
 const MAX_HISTORY: usize = 60;
 /// Max bytes returned from a single tool result (keeps context manageable).
 const MAX_TOOL_RESULT: usize = 24_000;
+/// Max retries on stream failure before giving up
+const MAX_STREAM_RETRIES: usize = 3;
+/// Detect stuck loops: if same tool+args seen this many times, intervene
+const STUCK_THRESHOLD: usize = 3;
 
 /// Resolves permission requests from the agent loop via the client.
 pub struct PermissionResolver {
@@ -86,6 +91,8 @@ pub struct Agent {
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
+    /// Per-session cancellation tokens for in-progress agent loops
+    cancel_tokens: Mutex<HashMap<Uuid, CancellationToken>>,
     default_model: String,
     router_model: String,
     title_model: String,
@@ -107,6 +114,7 @@ impl Agent {
             memory,
             permissions: Arc::new(PermissionResolver::new()),
             sessions: Mutex::new(HashMap::new()),
+            cancel_tokens: Mutex::new(HashMap::new()),
             default_model: default_model.to_string(),
             router_model: "qwen3-4b-instruct".to_string(),
             title_model: "qwen3-4b-instruct".to_string(),
@@ -180,7 +188,16 @@ impl Agent {
     }
 
     pub async fn close_session(&self, session_id: Uuid) {
+        // Cancel any in-progress loop
+        self.cancel_chat(session_id).await;
         self.sessions.lock().await.remove(&session_id);
+    }
+
+    /// Cancel an in-progress agent loop for this session.
+    pub async fn cancel_chat(&self, session_id: Uuid) {
+        if let Some(token) = self.cancel_tokens.lock().await.remove(&session_id) {
+            token.cancel();
+        }
     }
 
     pub async fn set_session_model(&self, session_id: Uuid, model: &str) {
@@ -198,7 +215,10 @@ impl Agent {
             .unwrap_or_else(|| self.default_model.clone())
     }
 
-    /// The full agent loop for one user message.
+    /// The full agent loop for one user message. Self-healing: retries on
+    /// stream failures, recovers from malformed tool calls, detects stuck
+    /// loops. Only ends when the model produces a final answer, the user
+    /// cancels, or MAX_TOOL_ROUNDS is hit.
     pub async fn process_chat(
         &self,
         session_id: Uuid,
@@ -208,11 +228,21 @@ impl Agent {
     ) {
         let started = Instant::now();
 
+        // Register cancellation token for this session
+        let cancel_token = CancellationToken::new();
+        {
+            let mut tokens = self.cancel_tokens.lock().await;
+            if let Some(old) = tokens.insert(session_id, cancel_token.clone()) {
+                old.cancel();
+            }
+        }
+
         // Get session info
-        let (username, cwd, is_initialized, session_model) = {
+        let (username, cwd, _is_initialized, session_model) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
+                self.cancel_tokens.lock().await.remove(&session_id);
                 return;
             };
             s.history.push(ChatMessage::user(content));
@@ -223,7 +253,6 @@ impl Agent {
         let model = if content.starts_with('/') || content.starts_with(':') {
             session_model
         } else {
-            // Try local model router first, fall back to heuristic
             let complexity = Router::classify_with_model(&self.local, content)
                 .await
                 .unwrap_or_else(|| Router::classify(content));
@@ -232,9 +261,7 @@ impl Agent {
                     tracing::info!("Router: simple → fast model");
                     "fast-gemma-4-12b-it".to_string()
                 }
-                ComplexityClass::Medium | ComplexityClass::Complex | ComplexityClass::Critical => {
-                    session_model
-                }
+                _ => session_model,
             }
         };
 
@@ -246,8 +273,14 @@ impl Agent {
         let mut total_prefill_ms: u64 = 0;
         let mut total_decode_ms: u64 = 0;
         let mut total_prefill_tokens: u32 = 0;
+        let mut tool_call_history: Vec<String> = Vec::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
+            if cancel_token.is_cancelled() {
+                emit(AgentEvent::Error("cancelled by user".into()));
+                break;
+            }
+
             let mut messages = vec![ChatMessage::system(system_prompt.clone())];
             {
                 let sessions = self.sessions.lock().await;
@@ -268,57 +301,85 @@ impl Agent {
                 temperature: None,
             };
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
-            let litellm = self.litellm.clone();
-            let round_start = Instant::now();
-            tokio::spawn(async move {
-                litellm.chat_stream(req, tx).await;
-            });
+            // ── Stream with retry (self-healing) ──
+            let result = {
+                let mut last_err = String::new();
+                let mut stream_result: Option<crate::litellm::StreamResult> = None;
+                let mut stream_first_delta: Option<Instant> = None;
+                let stream_round_start = Instant::now();
 
-            let mut result: Option<crate::litellm::StreamResult> = None;
-            let mut stream_error: Option<String> = None;
-            let mut first_delta_at: Option<Instant> = None;
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    StreamEvent::Delta(d) => {
-                        if first_delta_at.is_none() {
-                            first_delta_at = Some(Instant::now());
+                for attempt in 0..MAX_STREAM_RETRIES {
+                    if cancel_token.is_cancelled() { break; }
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+                    let litellm = self.litellm.clone();
+                    let req_clone = req.clone();
+                    tokio::spawn(async move {
+                        litellm.chat_stream(req_clone, tx).await;
+                    });
+
+                    let mut attempt_error: Option<String> = None;
+                    stream_first_delta = None;
+                    while let Some(ev) = rx.recv().await {
+                        if cancel_token.is_cancelled() { break; }
+                        match ev {
+                            StreamEvent::Delta(d) => {
+                                if stream_first_delta.is_none() {
+                                    stream_first_delta = Some(Instant::now());
+                                }
+                                emit(AgentEvent::Delta(d));
+                            }
+                            StreamEvent::Done(r) => { stream_result = Some(r); break; }
+                            StreamEvent::Error(e) => { attempt_error = Some(e); break; }
                         }
-                        emit(AgentEvent::Delta(d));
                     }
-                    StreamEvent::Done(r) => {
-                        result = Some(r);
+
+                    if stream_result.is_some() {
+                        let round_end = Instant::now();
+                        match stream_first_delta {
+                            Some(t_first) => {
+                                total_prefill_ms += t_first.duration_since(stream_round_start).as_millis() as u64;
+                                total_decode_ms += round_end.duration_since(t_first).as_millis() as u64;
+                            }
+                            None => {
+                                total_prefill_ms += round_end.duration_since(stream_round_start).as_millis() as u64;
+                            }
+                        }
                         break;
                     }
-                    StreamEvent::Error(e) => {
-                        stream_error = Some(e);
-                        break;
+
+                    last_err = attempt_error.unwrap_or("stream ended without result".into());
+                    if attempt < MAX_STREAM_RETRIES - 1 {
+                        let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                        tracing::warn!("Stream retry {}/{}: {} in {:?}", attempt+1, MAX_STREAM_RETRIES, last_err, delay);
+                        emit(AgentEvent::ToolEvent {
+                            name: "system".into(), status: ToolStatus::Started,
+                            detail: format!("retry {}/{} after stream error", attempt+1, MAX_STREAM_RETRIES),
+                        });
+                        tokio::time::sleep(delay).await;
                     }
                 }
-            }
 
-            let round_end = Instant::now();
-            match first_delta_at {
-                Some(t_first) => {
-                    total_prefill_ms += t_first.duration_since(round_start).as_millis() as u64;
-                    total_decode_ms += round_end.duration_since(t_first).as_millis() as u64;
+                match stream_result {
+                    Some(r) => r,
+                    None => {
+                        // All retries failed — inject error context and let
+                        // the model try a different approach
+                        tracing::error!("All {} stream retries failed: {}", MAX_STREAM_RETRIES, last_err);
+                        let mut sessions = self.sessions.lock().await;
+                        if let Some(s) = sessions.get_mut(&session_id) {
+                            s.history.push(ChatMessage::assistant(
+                                Some(format!("(stream error: {last_err})")), None,
+                            ));
+                            s.history.push(ChatMessage::user(
+                                "The previous request failed due to a stream error. Try again or take a different approach."
+                            ));
+                        }
+                        continue;
+                    }
                 }
-                None => {
-                    total_prefill_ms += round_end.duration_since(round_start).as_millis() as u64;
-                }
-            }
-
-            if let Some(e) = stream_error {
-                emit(AgentEvent::Error(format!("stream failed: {e}")));
-                self.rollback_last_user_message(session_id).await;
-                return;
-            }
-
-            let Some(result) = result else {
-                emit(AgentEvent::Error("stream ended without result".into()));
-                self.rollback_last_user_message(session_id).await;
-                return;
             };
+
+            if cancel_token.is_cancelled() { break; }
 
             if let Some(u) = &result.usage {
                 total_completion += u.completion_tokens;
@@ -342,25 +403,42 @@ impl Agent {
             }
 
             for tc in &result.tool_calls {
+                if cancel_token.is_cancelled() { break; }
                 let name = &tc.function.name;
+                let args_str = &tc.function.arguments;
+
+                // Stuck-loop detection
+                let signature = format!("{name}:{args_str}");
+                let repeat_count = tool_call_history.iter().filter(|s| **s == signature).count();
+                tool_call_history.push(signature.clone());
+                if repeat_count >= STUCK_THRESHOLD {
+                    tracing::warn!("Stuck loop: {name} {repeat_count}×");
+                    emit(AgentEvent::ToolEvent {
+                        name: name.clone(), status: ToolStatus::Failed,
+                        detail: format!("stuck: {name} repeated {repeat_count}× — try different approach"),
+                    });
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.history.push(ChatMessage::tool_result(
+                            tc.id.clone(), name.clone(),
+                            format!("ERROR: {name} called {repeat_count}× with same args. Try a different approach."),
+                        ));
+                    }
+                    continue;
+                }
+
                 emit(AgentEvent::ToolEvent {
-                    name: name.clone(),
-                    status: ToolStatus::Started,
-                    detail: summarize_args(&tc.function.arguments),
+                    name: name.clone(), status: ToolStatus::Started,
+                    detail: summarize_args(args_str),
                 });
 
-                let output = self
-                    .execute_tool(session_id, name, &tc.function.arguments, scope.clone(), emit)
-                    .await;
-
+                let output = self.execute_tool(session_id, name, args_str, scope.clone(), emit).await;
                 let (status, text) = match &output {
                     Ok(t) => (ToolStatus::Finished, truncate(t, MAX_TOOL_RESULT)),
                     Err(e) => (ToolStatus::Failed, truncate(e, MAX_TOOL_RESULT)),
                 };
-
                 emit(AgentEvent::ToolEvent {
-                    name: name.clone(),
-                    status,
+                    name: name.clone(), status,
                     detail: text.chars().take(200).collect(),
                 });
 
@@ -368,8 +446,7 @@ impl Agent {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.history.push(ChatMessage::tool_result(
-                        tc.id.clone(),
-                        name.clone(),
+                        tc.id.clone(), name.clone(),
                         truncate(&result_text, MAX_TOOL_RESULT),
                     ));
                 }
@@ -377,10 +454,19 @@ impl Agent {
 
             if round == MAX_TOOL_ROUNDS - 1 {
                 final_content = format!(
-                    "(stopped after {MAX_TOOL_ROUNDS} tool rounds — task may be incomplete)"
+                    "(reached {MAX_TOOL_ROUNDS} tool rounds — summarizing)"
                 );
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.history.push(ChatMessage::user(
+                        "You've reached the maximum tool rounds. Summarize what you accomplished and what remains."
+                    ));
+                }
             }
         }
+
+        // Clean up cancellation token
+        self.cancel_tokens.lock().await.remove(&session_id);
 
         // Store assistant reply in history + DB
         if !final_content.is_empty() {
@@ -390,19 +476,13 @@ impl Agent {
                     s.history.push(ChatMessage::assistant(Some(final_content.clone()), None));
                 }
             }
-
             let _ = self.memory.store_conversation(&ConversationEntry {
-                role: "user".into(),
-                content: content.to_string(),
-                timestamp: chrono::Utc::now(),
-                session_id,
-                model_used: None,
+                role: "user".into(), content: content.to_string(),
+                timestamp: chrono::Utc::now(), session_id, model_used: None,
             }).await;
             let _ = self.memory.store_conversation(&ConversationEntry {
-                role: "assistant".into(),
-                content: final_content.clone(),
-                timestamp: chrono::Utc::now(),
-                session_id,
+                role: "assistant".into(), content: final_content.clone(),
+                timestamp: chrono::Utc::now(), session_id,
                 model_used: Some(model.clone()),
             }).await;
         }
@@ -415,13 +495,9 @@ impl Agent {
             total_completion as f64 / (total_decode_ms as f64 / 1000.0)
         } else { 0.0 };
         emit(AgentEvent::Done(ChatStatsData {
-            model,
-            prompt_tokens: last_prompt_tokens,
-            completion_tokens: total_completion,
-            duration_ms,
-            context_length: last_prompt_tokens,
-            prefill_tps,
-            decode_tps,
+            model, prompt_tokens: last_prompt_tokens,
+            completion_tokens: total_completion, duration_ms,
+            context_length: last_prompt_tokens, prefill_tps, decode_tps,
         }));
     }
 

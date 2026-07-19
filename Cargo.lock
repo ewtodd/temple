@@ -2046,6 +2046,7 @@ dependencies = [
  "temple-protocol",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
