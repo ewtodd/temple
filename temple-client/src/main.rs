@@ -281,6 +281,14 @@ enum LineKind {
     Normal,
     Code,
     Dim,
+    ToolStart,
+    ToolDone,
+    ToolFail,
+    ToolDetail,
+    Separator,
+    UserHeader,
+    AgentHeader,
+    Stats,
 }
 
 /// Render an assistant message body into display lines:
@@ -570,52 +578,77 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let show_art = s.entries.len() < 3;
     let art_lines = if show_art { TEMPLE_ART.lines().count() } else { 0 };
 
-    // Build all display lines
+    // Build all display lines with visual separation
     let mut lines: Vec<StyledLine> = Vec::new();
-    let content_width = w.saturating_sub(2);
+    let content_width = w.saturating_sub(4);
+    let sep = "─".repeat(w.saturating_sub(2));
 
-    for entry in &s.entries {
+    for (idx, entry) in s.entries.iter().enumerate() {
+        // Separator before each message (except the very first)
+        if idx > 0 {
+            lines.push(StyledLine { text: sep.clone(), kind: LineKind::Separator });
+        }
+
         match entry {
             ChatEntry::User(text) => {
-                for (i, l) in render_markdown_lite(text, content_width.saturating_sub(6)).iter().enumerate() {
+                lines.push(StyledLine {
+                    text: " you".into(),
+                    kind: LineKind::UserHeader,
+                });
+                for l in render_markdown_lite(text, content_width.saturating_sub(2)) {
                     lines.push(StyledLine {
-                        text: if i == 0 { format!("you › {}", l.text) } else { format!("    {}", l.text) },
+                        text: format!(" {}", l.text),
                         kind: l.kind,
                     });
                 }
             }
             ChatEntry::Assistant { content, stats } => {
-                let body = render_markdown_lite(content, content_width.saturating_sub(9));
-                for (i, l) in body.iter().enumerate() {
-                    let prefix = if i == 0 { "renco › " } else { "       " };
+                let model_tag = s.model.as_str();
+                lines.push(StyledLine {
+                    text: format!(" renco · {model_tag}"),
+                    kind: LineKind::AgentHeader,
+                });
+                let body = render_markdown_lite(content, content_width.saturating_sub(2));
+                for l in body.iter() {
                     lines.push(StyledLine {
-                        text: format!("{prefix}{}", l.text),
+                        text: format!(" {}", l.text),
                         kind: l.kind,
                     });
                 }
                 if let Some(st) = stats {
                     lines.push(StyledLine {
-                        text: format!("       ⏱ {st}"),
-                        kind: LineKind::Dim,
+                        text: format!(" ⏱ {st}"),
+                        kind: LineKind::Stats,
                     });
                 }
             }
             ChatEntry::System(text) => {
                 for l in wrap_text(text, content_width.saturating_sub(2)) {
-                    lines.push(StyledLine { text: format!("• {l}"), kind: LineKind::Dim });
+                    lines.push(StyledLine {
+                        text: format!(" {l}"),
+                        kind: LineKind::Dim,
+                    });
                 }
             }
             ChatEntry::Tool { name, status, detail } => {
-                let icon = match status {
-                    ToolStatus::Started => "⚙",
-                    ToolStatus::Finished => "✓",
-                    ToolStatus::Failed => "✗",
+                let (icon, kind) = match status {
+                    ToolStatus::Started => ("⟳", LineKind::ToolStart),
+                    ToolStatus::Finished => ("✓", LineKind::ToolDone),
+                    ToolStatus::Failed => ("✗", LineKind::ToolFail),
                 };
-                let d: String = detail.chars().take(80).collect();
                 lines.push(StyledLine {
-                    text: format!("  {icon} {name} {d}"),
-                    kind: LineKind::Dim,
+                    text: format!("   {icon} {name}"),
+                    kind,
                 });
+                if !detail.is_empty() {
+                    let d: String = detail.chars().take(200).collect();
+                    for l in wrap_text(&d, content_width.saturating_sub(6)) {
+                        lines.push(StyledLine {
+                            text: format!("   │ {l}"),
+                            kind: LineKind::ToolDetail,
+                        });
+                    }
+                }
             }
         }
     }
@@ -681,8 +714,16 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let in_sel = selection.map(|((sl, _), (el, _))| i >= sl && i <= el).unwrap_or(false);
         let color = match l.kind {
             LineKind::Normal => None,
-            LineKind::Code => Some(Color::DarkGrey),
+            LineKind::Code => Some(Color::Grey),
             LineKind::Dim => Some(Color::DarkGrey),
+            LineKind::ToolStart => Some(Color::Yellow),
+            LineKind::ToolDone => Some(Color::Green),
+            LineKind::ToolFail => Some(Color::Red),
+            LineKind::ToolDetail => Some(Color::DarkGrey),
+            LineKind::Separator => Some(Color::DarkGrey),
+            LineKind::UserHeader => Some(Color::Cyan),
+            LineKind::AgentHeader => Some(Color::Green),
+            LineKind::Stats => Some(Color::DarkGrey),
         };
         let elem = match (color, in_sel) {
             (Some(c), true) => element! {
@@ -709,20 +750,24 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         children.push(elem.into());
     }
 
-    // Prompt
+    // Prompt box — bordered, subtle background, like opencode
     let prompt_text = if let Some((_, _, ref path)) = s_permission {
         format!("Allow {path}? (y/N)")
     } else {
-        format!("› {}", s_prompt)
+        if s_prompt.is_empty() {
+            "│ ".into()
+        } else {
+            format!("│ {}", s_prompt)
+        }
     };
     children.push(element! {
-        View(height: 1u16, border_style: BorderStyle::None) {
+        View(
+            height: 3u16,
+            border_style: BorderStyle::Round,
+            border_color: Color::DarkGrey,
+            background_color: Color::Black,
+        ) {
             Text(content: prompt_text)
-        }
-    }.into());
-    children.push(element! {
-        View(height: 1u16) {
-            Text(content: "─".repeat(w))
         }
     }.into());
 
