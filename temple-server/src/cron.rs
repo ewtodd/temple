@@ -174,11 +174,12 @@ impl CronScheduler {
         Ok(())
     }
 
-    /// Weekly self-maintenance.
+    /// Weekly self-maintenance: update personality based on recent conversations.
     pub async fn self_maintenance(&self) -> Result<(), String> {
-        tracing::info!("Running weekly self-maintenance...");
+        tracing::info!("Running weekly self-maintenance (personality update)...");
+        self.agent.update_personality().await;
         self.ntfy.lock().await
-            .notify("renco: maintenance", "Weekly maintenance cycle completed.")
+            .notify("renco: maintenance", "Weekly maintenance cycle completed — personality reviewed.")
             .await?;
         Ok(())
     }

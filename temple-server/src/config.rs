@@ -4,26 +4,20 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Listen address for the WebSocket server
     pub listen: String,
-    /// Litellm API endpoint
     pub litellm_url: String,
-    /// Litellm API key (if empty, reads from env LITELLM_API_KEY)
     pub litellm_api_key: Option<String>,
-    /// Database path for persistent memory
     pub db_path: PathBuf,
-    /// ntfy configuration
     pub ntfy: NtfyConfig,
-    /// Nextcloud configuration
     pub nextcloud: NextcloudConfig,
-    /// Model routing configuration
     pub models: ModelConfig,
-    /// Cron schedule overrides
     pub cron: CronConfig,
-    /// Default permission mode
     pub default_permission: String,
-    /// Allowed directories for default mode (beyond CWD)
     pub allowed_dirs: Vec<String>,
+    /// Local llama.cpp instance for routing/title generation (on oracle).
+    /// Points at localhost, not litellm — zero network latency.
+    pub local_llama_url: String,
+    pub local_llama_model: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -135,6 +129,8 @@ impl Default for Config {
             cron: CronConfig::default(),
             default_permission: "default".into(),
             allowed_dirs: vec!["/etc/nixos".into(), "/home".into()],
+            local_llama_url: "http://127.0.0.1:8080/v1".into(),
+            local_llama_model: "qwen3-4b-instruct".into(),
         }
     }
 }

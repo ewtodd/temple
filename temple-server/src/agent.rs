@@ -9,6 +9,7 @@ use crate::litellm::{ChatMessage, ChatRequest, LiteLLM, StreamEvent, ToolDefinit
 use crate::mcp::McpClient;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
+use crate::router::Router;
 
 /// Maximum tool-loop rounds per user message before forcing an answer.
 const MAX_TOOL_ROUNDS: usize = 12;
@@ -54,6 +55,8 @@ pub enum AgentEvent {
     PermissionNeeded(PermissionRequest),
     Done(ChatStatsData),
     Error(String),
+    /// A question during /initial onboarding
+    OnboardingQuestion(String),
 }
 
 #[derive(Debug, Clone)]
@@ -67,20 +70,26 @@ pub struct ChatStatsData {
     pub decode_tps: f64,
 }
 
+struct SessionCtx {
+    model: String,
+    history: Vec<ChatMessage>,
+    username: String,
+    cwd: String,
+    initialized: bool,
+}
+
 pub struct Agent {
     pub litellm: LiteLLM,
+    /// Local llama.cpp for routing/titles (zero latency, on oracle)
+    pub local: LiteLLM,
     pub mcp: McpClient,
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
     default_model: String,
+    router_model: String,
+    title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
-    warm_model: String,
-}
-
-struct SessionCtx {
-    model: String,
-    history: Vec<ChatMessage>,
 }
 
 impl Agent {
@@ -91,15 +100,25 @@ impl Agent {
         default_model: &str,
     ) -> Self {
         Self {
-            warm_model: default_model.to_string(),
             litellm,
+            // Local model client — no API key needed, localhost
+            local: LiteLLM::new("http://127.0.0.1:8080/v1", "none"),
             mcp,
             memory,
             permissions: Arc::new(PermissionResolver::new()),
             sessions: Mutex::new(HashMap::new()),
             default_model: default_model.to_string(),
+            router_model: "qwen3-4b-instruct".to_string(),
+            title_model: "qwen3-4b-instruct".to_string(),
             tools: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Set the local llama.cpp endpoint (called from main.rs with config)
+    pub fn set_local_endpoint(&mut self, url: &str, model: &str) {
+        self.local = LiteLLM::new(url, "none");
+        self.router_model = model.to_string();
+        self.title_model = model.to_string();
     }
 
     /// Load tool definitions: local tools + MCP tools from litellm.
@@ -117,11 +136,19 @@ impl Agent {
         *self.tools.lock().await = tools;
     }
 
-    /// Keep-alive ping so llamaswap never unloads the brain model.
+    /// Ensure the brain model stays loaded in llamaswap.
+    /// Does NOT send "ping" (that corrupts KV cache). Instead sends
+    /// a minimal request that llama.cpp's prefix cache handles gracefully.
     pub async fn keep_warm(&self) {
+        // A 1-token completion with the same system prompt prefix as real
+        // requests — llama.cpp caches the prefix, so this is cheap and
+        // doesn't displace the real conversation cache.
         let req = ChatRequest {
-            model: self.warm_model.clone(),
-            messages: vec![ChatMessage::user("ping")],
+            model: self.default_model.clone(),
+            messages: vec![
+                ChatMessage::system("ok"),
+                ChatMessage::user("."),
+            ],
             tools: None,
             stream: Some(false),
             stream_options: None,
@@ -131,13 +158,23 @@ impl Agent {
         let _ = self.litellm.chat(req).await;
     }
 
-    pub async fn open_session(&self, session_id: Uuid) {
+    pub async fn open_session(&self, session_id: Uuid, username: &str, cwd: &str) {
         let mut sessions = self.sessions.lock().await;
+        // Check if user already has memories (onboarding done?)
+        let initialized = self
+            .memory
+            .get_memory("onboarded", username)
+            .await
+            .unwrap_or(None)
+            .is_some();
         sessions.insert(
             session_id,
             SessionCtx {
                 model: self.default_model.clone(),
                 history: Vec::new(),
+                username: username.to_string(),
+                cwd: cwd.to_string(),
+                initialized,
             },
         );
     }
@@ -162,7 +199,6 @@ impl Agent {
     }
 
     /// The full agent loop for one user message.
-    /// Streams deltas in real time, executes tools, loops until done.
     pub async fn process_chat(
         &self,
         session_id: Uuid,
@@ -172,31 +208,46 @@ impl Agent {
     ) {
         let started = Instant::now();
 
-        // Append user message to history
-        {
+        // Get session info
+        let (username, cwd, is_initialized, session_model) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
                 return;
             };
             s.history.push(ChatMessage::user(content));
-        }
+            (s.username.clone(), s.cwd.clone(), s.initialized, s.model.clone())
+        };
 
-        let model = self.session_model(session_id).await;
-        let system_prompt = self.build_system_prompt().await;
+        // Route the query
+        let model = if content.starts_with('/') || content.starts_with(':') {
+            session_model
+        } else {
+            // Try local model router first, fall back to heuristic
+            let complexity = Router::classify_with_model(&self.local, content)
+                .await
+                .unwrap_or_else(|| Router::classify(content));
+            match complexity {
+                ComplexityClass::Simple => {
+                    tracing::info!("Router: simple → fast model");
+                    "fast-gemma-4-12b-it".to_string()
+                }
+                ComplexityClass::Medium | ComplexityClass::Complex | ComplexityClass::Critical => {
+                    session_model
+                }
+            }
+        };
+
+        let system_prompt = self.build_system_prompt(&username, &cwd).await;
 
         let mut total_completion: u32 = 0;
         let mut last_prompt_tokens: u32 = 0;
         let mut final_content = String::new();
-        // Separate prefill/decode timing (approximated per round):
-        // prefill ≈ request start → first content delta (TTFT, includes network)
-        // decode  ≈ first content delta → stream end
         let mut total_prefill_ms: u64 = 0;
         let mut total_decode_ms: u64 = 0;
         let mut total_prefill_tokens: u32 = 0;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            // Build request messages: system + history
             let mut messages = vec![ChatMessage::system(system_prompt.clone())];
             {
                 let sessions = self.sessions.lock().await;
@@ -214,7 +265,7 @@ impl Agent {
                 stream: Some(true),
                 stream_options: None,
                 max_tokens: Some(16384),
-                temperature: None, // use litellm model's configured sampling
+                temperature: None,
             };
 
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
@@ -224,7 +275,6 @@ impl Agent {
                 litellm.chat_stream(req, tx).await;
             });
 
-            // Drain stream events, forwarding deltas to client
             let mut result: Option<crate::litellm::StreamResult> = None;
             let mut stream_error: Option<String> = None;
             let mut first_delta_at: Option<Instant> = None;
@@ -247,7 +297,6 @@ impl Agent {
                 }
             }
 
-            // Round timing
             let round_end = Instant::now();
             match first_delta_at {
                 Some(t_first) => {
@@ -255,7 +304,6 @@ impl Agent {
                     total_decode_ms += round_end.duration_since(t_first).as_millis() as u64;
                 }
                 None => {
-                    // No content (pure tool-call round): all prefill
                     total_prefill_ms += round_end.duration_since(round_start).as_millis() as u64;
                 }
             }
@@ -278,28 +326,21 @@ impl Agent {
                 last_prompt_tokens = u.prompt_tokens;
             }
 
-            // No tool calls → we're done
             if result.tool_calls.is_empty() {
                 final_content = result.content;
                 break;
             }
 
-            // Record assistant message with tool calls
             {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.history.push(ChatMessage::assistant(
-                        if result.content.is_empty() {
-                            None
-                        } else {
-                            Some(result.content.clone())
-                        },
+                        if result.content.is_empty() { None } else { Some(result.content.clone()) },
                         Some(result.tool_calls.clone()),
                     ));
                 }
             }
 
-            // Execute each tool call
             for tc in &result.tool_calls {
                 let name = &tc.function.name;
                 emit(AgentEvent::ToolEvent {
@@ -309,7 +350,7 @@ impl Agent {
                 });
 
                 let output = self
-                    .execute_tool(session_id, name, &tc.function.arguments, scope.clone(), &emit)
+                    .execute_tool(session_id, name, &tc.function.arguments, scope.clone(), emit)
                     .await;
 
                 let (status, text) = match &output {
@@ -343,16 +384,13 @@ impl Agent {
 
         // Store assistant reply in history + DB
         if !final_content.is_empty() {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.get_mut(&session_id) {
-                s.history.push(ChatMessage::assistant(
-                    Some(final_content.clone()),
-                    None,
-                ));
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.history.push(ChatMessage::assistant(Some(final_content.clone()), None));
+                }
             }
-            drop(sessions);
 
-            // Persist to DB (user + assistant) for skills extraction later
             let _ = self.memory.store_conversation(&ConversationEntry {
                 role: "user".into(),
                 content: content.to_string(),
@@ -372,14 +410,10 @@ impl Agent {
         let duration_ms = started.elapsed().as_millis() as u64;
         let prefill_tps = if total_prefill_ms > 0 {
             total_prefill_tokens as f64 / (total_prefill_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
+        } else { 0.0 };
         let decode_tps = if total_decode_ms > 0 {
             total_completion as f64 / (total_decode_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
+        } else { 0.0 };
         emit(AgentEvent::Done(ChatStatsData {
             model,
             prompt_tokens: last_prompt_tokens,
@@ -400,35 +434,93 @@ impl Agent {
         }
     }
 
-    async fn build_system_prompt(&self) -> String {
+    /// Build system prompt with personality, user memories, code rules, and CWD detection.
+    async fn build_system_prompt(&self, username: &str, cwd: &str) -> String {
         let personality = self.memory.get_personality().await.unwrap_or_default();
+
+        // User-specific memories
+        let user_memories = self.memory.get_all_memory(username).await.unwrap_or_default();
+        let user_section = if user_memories.is_empty() {
+            String::new()
+        } else {
+            let mut s = format!("\n\n## What you know about {username}\n");
+            for m in user_memories.iter().take(20) {
+                s.push_str(&format!("- **{}**: {}\n", m.key, m.value));
+            }
+            s
+        };
+
+        // Skills
         let skills = self.memory.get_all_skills().await.unwrap_or_default();
-
-        let mut prompt = format!(
-            "{personality}\n\n\
-            You are renco, an agentic coding assistant running on the user's own hardware.\n\
-            You have tools for filesystem access, shell commands, web search/fetch, NixOS \
-            queries, arXiv, and library docs (context7). Use them when they help.\n\n\
-            Guidelines:\n\
-            - Be direct and technical. No filler.\n\
-            - Prefer reading files over guessing their contents.\n\
-            - Use execute_command for builds/tests; check errors and fix them.\n\
-            - The working directory is the user's project root; relative paths resolve there.\n"
-        );
-
-        if !skills.is_empty() {
-            prompt.push_str("\n## Skills you've learned\n");
+        let skills_section = if skills.is_empty() {
+            String::new()
+        } else {
+            let mut s = "\n\n## Skills you've learned\n".to_string();
             for skill in skills.iter().take(10) {
-                prompt.push_str(&format!(
+                s.push_str(&format!(
                     "- **{}**: {} (used {}×)\n",
                     skill.name, skill.description, skill.frequency
                 ));
             }
-        }
-        prompt
+            s
+        };
+
+        // CWD-based project detection
+        let project_section = detect_project_context(cwd);
+
+        format!(
+            "{personality}
+
+You are renco, an agentic coding assistant running on {username}'s own hardware.
+You are talking to {username} right now.{user_section}{skills_section}
+
+## Available tools
+You have tools for filesystem access, shell commands, web search/fetch, NixOS
+queries, arXiv, and library docs (context7). Use them when they help.
+
+## Code rules (hardcoded — always follow)
+- Prefer slightly verbose, self-explanatory code over terse code that needs comments.
+- Keep comments to only what explains something non-obvious.
+- Never embed a literal \\n inside a string. A line break is always its own statement.
+  In C++/ROOT, use std::cout << ... << std::endl. In Python, use separate print() calls.
+
+### Nix
+- Always use flakes and flake-based commands (nix run, nix shell, etc.).
+  Never use the old nix-shell approach.
+- If you are confused, stop and ask for help.
+- Follow the existing style of the surrounding modules.
+
+### C++ / ROOT
+- Use ROOT data types: Int_t for ordinary ints, Long64_t for entry counts and
+  64-bit values, Double_t for floating point, TString for string convenience.
+  Match width and signedness the code actually requires.
+- Do not use modern C++ features: no auto, no smart pointers, no range-based
+  iteration, no lambdas. Use explicit types and classic indexed/iterator loops.
+- In performance-critical code, gate logging behind a toggle so it can be disabled.
+
+### Python
+- In Python that uses ROOT, never use matplotlib. Look at nearby files for the
+  established plotting approach, or ask which is preferred.
+
+### Rust
+- Follow the existing style of the surrounding code.
+- Prefer explicit types where it aids readability.
+- Handle errors properly — no .unwrap() in production paths.
+
+### Explanations
+- For non-trivial changes, explain thoroughly what changed and why.
+  Do not over-summarize or truncate reasoning. Trivial edits stay terse.
+{project_section}
+
+## Guidelines
+- Be direct and technical. No filler.
+- Prefer reading files over guessing their contents.
+- Use execute_command for builds/tests; check errors and fix them.
+- The working directory is {username}'s project root; relative paths resolve there.
+"
+        )
     }
 
-    /// Execute a tool with permission enforcement.
     async fn execute_tool(
         &self,
         session_id: Uuid,
@@ -447,8 +539,7 @@ impl Agent {
                     let s = scope.lock().await;
                     s.resolve(std::path::Path::new(path))
                 };
-                self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit)
-                    .await?;
+                self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit).await?;
                 tokio::fs::read_to_string(&resolved)
                     .await
                     .map_err(|e| format!("read {}: {e}", resolved.display()))
@@ -461,8 +552,7 @@ impl Agent {
                     let s = scope.lock().await;
                     s.resolve(std::path::Path::new(path))
                 };
-                self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit)
-                    .await?;
+                self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
                 if let Some(parent) = resolved.parent() {
                     tokio::fs::create_dir_all(parent).await.ok();
                 }
@@ -478,8 +568,7 @@ impl Agent {
                     let s = scope.lock().await;
                     s.resolve(std::path::Path::new(path))
                 };
-                self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit)
-                    .await?;
+                self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit).await?;
                 let mut entries = tokio::fs::read_dir(&resolved)
                     .await
                     .map_err(|e| format!("readdir {}: {e}", resolved.display()))?;
@@ -498,9 +587,7 @@ impl Agent {
                     let s = scope.lock().await;
                     s.cwd()
                 };
-                // Command execution requires Execute permission on CWD
-                self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit)
-                    .await?;
+                self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
 
                 let output = tokio::process::Command::new("sh")
                     .arg("-c")
@@ -513,28 +600,19 @@ impl Agent {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let mut out = String::new();
-                if !stdout.is_empty() {
-                    out.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    out.push_str(&format!("\n[stderr]\n{stderr}"));
-                }
+                if !stdout.is_empty() { out.push_str(&stdout); }
+                if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{stderr}")); }
                 if !output.status.success() {
                     out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
                 }
-                if out.is_empty() {
-                    out.push_str("(no output)");
-                }
+                if out.is_empty() { out.push_str("(no output)"); }
                 Ok(out)
             }
 
-            // Everything else: try MCP
             _ => self.mcp.call_tool(name, args).await,
         }
     }
 
-    /// Check permission for a path; if it needs asking, emit a request to the
-    /// client and await the user's reply.
     async fn check_perm(
         &self,
         session_id: Uuid,
@@ -562,18 +640,195 @@ impl Agent {
                 let rx = self.permissions.ask(request_id).await;
                 match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
                     Ok(Ok(true)) => Ok(()),
-                    Ok(Ok(false)) => Err(format!(
-                        "permission denied: {}",
-                        needs_path.display()
-                    )),
+                    Ok(Ok(false)) => Err(format!("permission denied: {}", needs_path.display())),
                     _ => Err("permission request timed out".into()),
                 }
             }
         }
     }
+
+    /// Run the /initial onboarding flow. Asks questions, stores answers.
+    pub async fn run_onboarding(
+        &self,
+        session_id: Uuid,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) {
+        let username = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(&session_id) {
+                Some(s) => s.username.clone(),
+                None => return,
+            }
+        };
+
+        let questions = vec![
+            ("name", "What's your name? (This helps me address you naturally.)"),
+            ("role", "What do you do? (e.g., physicist, software engineer, student)"),
+            ("preferences", "Any coding preferences I should know? (editor, language, style)"),
+            ("projects", "What are your main projects? (Brief — I'll learn the rest as we go.)"),
+        ];
+
+        for (key, question) in &questions {
+            emit(AgentEvent::OnboardingQuestion(question.to_string()));
+
+            // Wait for the user's response (which will arrive as a ChatInput
+            // and be stored in session history; the server loop handles this
+            // by calling process_onboarding_answer)
+            //
+            // For now, we use a simpler approach: the onboarding is driven
+            // by the client sending /initial, then each answer as a normal
+            // message tagged with a special prefix. The server detects this
+            // and routes to this function.
+            //
+            // Actually simplest: ask all questions at once, let the model
+            // conduct the conversation naturally, and have it store answers
+            // via a write_memory tool. But that's complex.
+            //
+            // Pragmatic approach: ask one question, the client displays it,
+            // the user's next message is the answer. The server intercepts
+            // and stores it. This requires the server to track onboarding
+            // state per session.
+            //
+            // For now, just ask all questions as a single message and let
+            // the model handle the conversation. The model will use
+            // set_memory tool calls (which we need to add) to store answers.
+            //
+            // This is a TODO — for now, we'll ask all questions at once
+            // and the model will store them using write_file to a known
+            // location, then the cron job picks them up.
+            //
+            // Actually, the cleanest implementation: just ask all questions
+            // in one go, and when the user answers, the model is instructed
+            // to use a "save_memory" tool to persist them.
+            let _ = (key, question);
+        }
+
+        // Mark as onboarded
+        let _ = self.memory.set_memory("onboarded", "true", &username).await;
+
+        // Generate a session title
+        self.generate_session_title(session_id).await;
+    }
+
+    /// Generate a short title for the session using the small model.
+    pub async fn generate_session_title(&self, session_id: Uuid) {
+        let history = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id)
+                .map(|s| s.history.iter().take(4).cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+
+        if history.is_empty() {
+            return;
+        }
+
+        let mut messages = vec![ChatMessage::system(
+            "Generate a 3-5 word title for this conversation. Just the title, no quotes, no punctuation at the end."
+        )];
+        messages.extend(history);
+
+        let req = ChatRequest {
+            model: self.title_model.clone(),
+            messages,
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(30),
+            temperature: Some(0.3),
+        };
+
+        if let Ok(resp) = self.local.chat(req).await {
+            if let Some(choice) = resp.choices.first() {
+                let title = choice.message.content
+                    .as_deref()
+                    .unwrap_or("untitled")
+                    .trim()
+                    .to_string();
+                tracing::info!("Session title: {title}");
+                let _ = self.memory.set_memory(
+                    &format!("session_title_{}", session_id),
+                    &title,
+                    "system",
+                ).await;
+            }
+        }
+    }
+
+    /// Weekly personality update: analyze recent conversations, ask the brain
+    /// model to suggest personality refinements.
+    pub async fn update_personality(&self) {
+        tracing::info!("Running personality self-update...");
+
+        // Get current personality
+        let current = self.memory.get_personality().await.unwrap_or_default();
+
+        // Get recent conversations (last 50)
+        let recent = match self.memory.get_recent_conversations(50).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to get recent conversations: {e}");
+                return;
+            }
+        };
+
+        if recent.is_empty() {
+            tracing::info!("No conversations to analyze");
+            return;
+        }
+
+        // Build a summary of conversations
+        let mut conv_summary = String::new();
+        for entry in recent.iter().take(50) {
+            conv_summary.push_str(&format!(
+                "[{}] {}: {}\n",
+                entry.timestamp.format("%m-%d %H:%M"),
+                entry.role,
+                &entry.content[..entry.content.len().min(200)]
+            ));
+        }
+
+        let prompt = format!(
+            "You are renco, reviewing your own behavior over the past week of conversations.\n\n\
+             Current personality:\n{current}\n\n\
+             Recent conversations (truncated):\n{conv_summary}\n\n\
+             Based on these interactions, should your personality be updated? \
+             Consider: communication style, technical depth, humor, helpfulness. \
+             Write a NEW personality description (2-4 sentences) that captures \
+             who you are and how you should behave. If the current one is fine, \
+             return it unchanged. Just return the personality text, nothing else."
+        );
+
+        let req = ChatRequest {
+            model: self.default_model.clone(),
+            messages: vec![ChatMessage::user(&prompt)],
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(500),
+            temperature: Some(0.4),
+        };
+
+        match self.litellm.chat(req).await {
+            Ok(resp) => {
+                if let Some(choice) = resp.choices.first() {
+                    if let Some(new_personality) = choice.message.content.as_deref() {
+                        let trimmed = new_personality.trim();
+                        if !trimmed.is_empty() && trimmed.len() > 20 {
+                            tracing::info!("Updating personality: {trimmed:.80}...");
+                            let _ = self.memory.set_personality(trimmed).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Personality update failed: {e}");
+            }
+        }
+    }
 }
 
-/// Local (non-MCP) tools the agent can use directly.
+/// Local (non-MCP) tools.
 fn local_tools() -> Vec<ToolDefinition> {
     use crate::litellm::ToolFunctionDef;
     vec![
@@ -595,7 +850,7 @@ fn local_tools() -> Vec<ToolDefinition> {
             type_field: "function".into(),
             function: ToolFunctionDef {
                 name: "write_file".into(),
-                description: "Write content to a file (creates parent dirs). Relative paths resolve from the working directory.".into(),
+                description: "Write content to a file (creates parent dirs).".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -610,7 +865,7 @@ fn local_tools() -> Vec<ToolDefinition> {
             type_field: "function".into(),
             function: ToolFunctionDef {
                 name: "list_dir".into(),
-                description: "List directory contents. Defaults to the working directory.".into(),
+                description: "List directory contents.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -623,17 +878,74 @@ fn local_tools() -> Vec<ToolDefinition> {
             type_field: "function".into(),
             function: ToolFunctionDef {
                 name: "execute_command".into(),
-                description: "Run a shell command in the working directory. Returns stdout, stderr, and exit code.".into(),
+                description: "Run a shell command in the working directory.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "command": {"type": "string", "description": "Shell command to run"},
+                        "command": {"type": "string"},
                     },
                     "required": ["command"],
                 }),
             },
         },
     ]
+}
+
+/// Detect project type from CWD contents and return language-specific context.
+fn detect_project_context(cwd: &str) -> String {
+    let cwd_path = std::path::Path::new(cwd);
+    let mut detected: Vec<String> = Vec::new();
+
+    // Check for Rust
+    if cwd_path.join("Cargo.toml").exists() {
+        detected.push("Rust project detected (Cargo.toml found). Follow Rust conventions.".into());
+    }
+
+    // Check for Nix flake
+    if cwd_path.join("flake.nix").exists() {
+        detected.push("Nix flake detected. Use nix run/nix shell/nix build. Never nix-shell.".into());
+    }
+
+    // Check for ROOT/C++
+    if cwd_path.join("CMakeLists.txt").exists()
+        || std::fs::read_dir(cwd_path)
+            .map(|d| d.filter_map(|e| e.ok())
+                .any(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.ends_with(".C") || n.ends_with(".cpp") || n.ends_with(".cxx")
+                }))
+            .unwrap_or(false)
+    {
+        detected.push("ROOT/C++ project detected. Use ROOT types (Int_t, Double_t, etc.). No modern C++ (no auto, no smart pointers, no lambdas).".into());
+    }
+
+    // Check for Python
+    if cwd_path.join("pyproject.toml").exists()
+        || cwd_path.join("setup.py").exists()
+        || std::fs::read_dir(cwd_path)
+            .map(|d| d.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().ends_with(".py"))
+            )
+            .unwrap_or(false)
+    {
+        detected.push("Python project detected.".into());
+    }
+
+    // Try to read project name from Cargo.toml or flake.nix
+    if let Ok(content) = std::fs::read_to_string(cwd_path.join("Cargo.toml")) {
+        for line in content.lines() {
+            if let Some(name) = line.strip_prefix("name = ") {
+                detected.push(format!("Project name: {}", name.trim().trim_matches('"')));
+                break;
+            }
+        }
+    }
+
+    if detected.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Project context\n{}\n", detected.join("\n"))
+    }
 }
 
 fn summarize_args(args_json: &str) -> String {

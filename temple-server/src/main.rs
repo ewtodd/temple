@@ -110,12 +110,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp = mcp::McpClient::new(&cfg.litellm_url, &api_key);
 
     // Initialize agent
-    let agent = Arc::new(agent::Agent::new(
+    let mut agent = agent::Agent::new(
         litellm,
         mcp,
         memory.clone(),
         &cfg.models.default_model,
-    ));
+    );
+    agent.set_local_endpoint(&cfg.local_llama_url, &cfg.local_llama_model);
+    let agent = Arc::new(agent);
 
     // Load tools (local + MCP)
     agent.refresh_tools().await;
@@ -131,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
             let sys_session = uuid::Uuid::nil();
-            agent.open_session(sys_session).await;
+            agent.open_session(sys_session, "ntfy", &cfg2.data_dir_workspace()).await;
             let scope = Arc::new(Mutex::new(permissions::PermissionScope::new(
                 std::path::Path::new(&cfg2.data_dir_workspace()),
                 PermissionMode::Default,

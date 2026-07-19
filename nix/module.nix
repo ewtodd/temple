@@ -33,6 +33,8 @@ let
       use_local_router = false;
       default_model = cfg.defaultModel;
     };
+    local_llama_url = cfg.localLlamaUrl;
+    local_llama_model = cfg.localLlamaModel;
   };
   port = toString (lib.last (lib.splitString ":" cfg.listen));
 in
@@ -127,6 +129,18 @@ in
       type = types.bool;
       default = false;
       description = "Open the WebSocket port in the firewall (needed for LAN clients).";
+    };
+
+    localLlamaUrl = mkOption {
+      type = types.str;
+      default = "http://127.0.0.1:8080/v1";
+      description = "Local llama.cpp endpoint for routing/title generation (on oracle, zero-latency).";
+    };
+
+    localLlamaModel = mkOption {
+      type = types.str;
+      default = "qwen3-4b-instruct";
+      description = "Small model name for local routing and title generation.";
     };
 
     extraArgs = mkOption {

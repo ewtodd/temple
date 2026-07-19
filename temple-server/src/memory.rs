@@ -207,6 +207,32 @@ impl Memory {
 
     // ── Personality ──
 
+    /// Get recent conversations across all sessions (for personality updates).
+    pub async fn get_recent_conversations(&self, limit: i64) -> rusqlite::Result<Vec<ConversationEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, role, content, timestamp, model_used FROM conversations ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ConversationEntry {
+                session_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                role: row.get(1)?,
+                content: row.get(2)?,
+                timestamp: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                    .map(|d| d.to_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                model_used: row.get(4)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            if let Ok(r) = row {
+                results.push(r);
+            }
+        }
+        Ok(results)
+    }
+
     pub async fn get_personality(&self) -> rusqlite::Result<String> {
         let val = self.get_memory("renco_personality", "system").await?;
         Ok(val.unwrap_or_else(|| {

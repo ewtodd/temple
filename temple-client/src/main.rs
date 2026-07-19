@@ -514,7 +514,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         "/quit" | "/exit" => { s.running = false; }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/models · /model X · /mode X · /help · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/models · /model X · /mode X · /initial (onboarding) · /help · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
