@@ -174,11 +174,17 @@ impl Signal {
                 None => continue,
             };
 
-            let source = envelope.get("sourceNumber")
-                .or_else(|| envelope.get("source"))
+            // Extract sender identifiers — Signal may use phone number, UUID,
+            // or profile name depending on privacy settings and protocol version.
+            let source_number = envelope.get("sourceNumber")
                 .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+            let source_uuid = envelope.get("sourceUuid")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let source_name = envelope.get("sourceName")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
 
             let message = envelope.get("dataMessage")
                 .and_then(|d| d.get("message"))
@@ -190,15 +196,30 @@ impl Signal {
                 continue;
             }
 
-            // Whitelist check
-            if !self.config.allowed_senders.is_empty()
-                && !self.config.allowed_senders.contains(&source)
-            {
-                tracing::warn!("signal: ignoring message from non-whitelisted sender: {source}");
+            // Whitelist check: match against phone number, UUID, or name.
+            // This handles cases where Signal redacts the phone number and
+            // only provides a UUID (increasingly common for privacy).
+            let matched = self.config.allowed_senders.iter().any(|allowed| {
+                allowed == source_number
+                    || allowed == source_uuid
+                    || allowed == source_name
+            });
+            if !self.config.allowed_senders.is_empty() && !matched {
+                tracing::warn!(
+                    "signal: ignoring message from non-whitelisted sender: number={source_number} uuid={source_uuid} name={source_name}"
+                );
                 continue;
             }
 
-            handler(source, message);
+            // Use whichever identifier matched as the source for replies
+            let source = if !source_number.is_empty() {
+                source_number
+            } else if !source_uuid.is_empty() {
+                source_uuid
+            } else {
+                source_name
+            };
+            handler(source.to_string(), message);
         }
     }
 }
