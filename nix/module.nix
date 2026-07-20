@@ -18,6 +18,15 @@ let
     db_path = "${cfg.dataDir}/memory.db";
     allowed_dirs = cfg.allowedDirs;
     default_permission = cfg.defaultPermission;
+    signal = {
+      enabled = cfg.signal.enable;
+      socket_addr = cfg.signal.socketAddr;
+      # default_recipient and allowed_senders come from env vars
+      # (SIGNAL_RECIPIENT) via environmentFile, not config.toml — phone
+      # numbers are secrets and shouldn't be in the nix store.
+      default_recipient = "";
+      allowed_senders = [ ];
+    };
     nextcloud = {
       enabled = cfg.nextcloud.enable;
       server_url = cfg.nextcloud.serverUrl;
@@ -108,14 +117,17 @@ in
     };
 
     environmentFile = mkOption {
-      type = types.nullOr types.path;
+      type = types.nullOr (types.either types.path (types.listOf types.path));
       default = null;
       example = "/run/agenix/temple-env";
       description = ''
-        EnvironmentFile for secrets. Must define LITELLM_API_KEY.
-        Compatible with agenix secrets (a file containing
-        LITELLM_API_KEY=sk-...). Other secrets (NTFY_TOKEN,
-        NEXTCLOUD_PASSWORD) are picked up from the environment too.
+        EnvironmentFile for secrets (systemd-style). Can be a single path
+        or a list of paths — all are loaded. Any of these env vars are
+        picked up:
+        - LITELLM_API_KEY or LITELLM_MASTER_KEY (litellm auth)
+        - SIGNAL_RECIPIENT (your phone number, E.164 with + prefix;
+          used as outbound recipient AND sole allowed sender for inbound)
+        Compatible with agenix secrets (one KEY=VALUE per line).
       '';
     };
 
@@ -124,6 +136,20 @@ in
       default = [ ];
       example = [ "/etc/nixos" "/home" ];
       description = "Extra directories the agent may access without prompting (beyond each session's CWD).";
+    };
+
+    signal = {
+      enable = mkEnableOption "Signal bot (two-way notifications via signal-cli)";
+
+      socketAddr = mkOption {
+        type = types.str;
+        default = "127.0.0.1:7583";
+        description = "signal-cli daemon TCP socket address.";
+      };
+
+      # Phone numbers (recipient + allowed senders) are secrets — they come
+      # from the signalEnvironmentFile as SIGNAL_RECIPIENT (your number).
+      # The recipient is also added as the sole allowed sender.
     };
 
     nextcloud = {
@@ -205,7 +231,7 @@ in
         RestrictSUIDSGID = true;
       }
       // (optionalAttrs (cfg.environmentFile != null) {
-        EnvironmentFile = cfg.environmentFile;
+        EnvironmentFile = if builtins.isList cfg.environmentFile then cfg.environmentFile else [ cfg.environmentFile ];
       });
     };
 

@@ -32,6 +32,7 @@ talks to models you host yourself.
 │  • Warm-model keep-alive (llamaswap never unloads)       │
 │  • Cron: skills extraction, smart flake updates          │
 │  • Planner/executor/reviewer pipeline (deepseek + qwen)  │
+│  • Signal bot (two-way notifications via signal-cli)     │
 │  • Nextcloud calendar                                    │
 └──────────────────────────────────────────────────────────┘
         ▲ WebSocket (JSON protocol)
@@ -90,8 +91,9 @@ services.temple-server = {
   openFirewall = true;               # LAN clients connect directly
   litellmUrl = "https://llm.example.com";
   defaultModel = "deepseek-v4-flash-high";
-  environmentFile = "/run/agenix/litellm-master-key";  # LITELLM_API_KEY=... or LITELLM_MASTER_KEY=...
+  environmentFile = "/run/agenix/temple-env";  # LITELLM_API_KEY=... + SIGNAL_RECIPIENT=...
   allowedDirs = [ "/etc/nixos" "/home" ];
+  signal.enable = true;               # two-way Signal bot (needs signal-cli daemon)
 };
 ```
 

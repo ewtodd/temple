@@ -8,10 +8,12 @@ mod nextcloud;
 mod permissions;
 mod router;
 mod server;
+mod signal;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Generator, Shell};
 use std::sync::Arc;
+use temple_protocol::PermissionMode;
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
@@ -97,6 +99,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "empty".into()
         });
 
+    // Apply signal config overrides from environment (agenix secret)
+    // SIGNAL_RECIPIENT supports comma-separated numbers, e.g.:
+    //   SIGNAL_RECIPIENT=+15551234567,+15559876543
+    // The first is the default notification target; all are allowed senders.
+    let cfg = if let Some(recipient_str) = std::env::var("SIGNAL_RECIPIENT").ok() {
+        let recipients: Vec<String> = recipient_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut signal_cfg = cfg.signal.clone();
+        if let Some(first) = recipients.first() {
+            signal_cfg.default_recipient = first.clone();
+        }
+        if signal_cfg.allowed_senders.is_empty() {
+            signal_cfg.allowed_senders = recipients;
+        }
+        Arc::new(config::Config {
+            signal: signal_cfg,
+            ..(*cfg).clone()
+        })
+    } else {
+        cfg
+    };
+
     let memory = Arc::new(
         memory::Memory::open(&cfg.db_path)
             .await
@@ -121,19 +148,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agent.refresh_tools().await;
 
     // Initialize integrations
+    let signal = Arc::new(signal::Signal::new(&cfg.signal));
     let nextcloud = Arc::new(Mutex::new(nextcloud::Nextcloud::new(&cfg.nextcloud)));
+
+    // Signal two-way loop: inbound messages → agent → outbound reply
+    if cfg.signal.enabled {
+        let agent = agent.clone();
+        let signal = signal.clone();
+        let cfg2 = cfg.clone();
+        tokio::spawn(async move {
+            let sys_session = uuid::Uuid::nil();
+            agent.open_session(
+                sys_session,
+                "signal",
+                &cfg2.data_dir_workspace(),
+            ).await;
+            let scope = Arc::new(Mutex::new(
+                permissions::PermissionScope::new(
+                    std::path::Path::new(&cfg2.data_dir_workspace()),
+                    PermissionMode::Default,
+                    &cfg2.allowed_dirs,
+                ).await,
+            ));
+
+            let agent_for_handler = agent.clone();
+            let scope_for_handler = scope.clone();
+            let signal_for_handler = signal.clone();
+            let handler = Arc::new(move |sender: String, message: String| {
+                let agent = agent_for_handler.clone();
+                let scope = scope_for_handler.clone();
+                let signal = signal_for_handler.clone();
+                tokio::spawn(async move {
+                    tracing::info!("signal inbound from {sender}: {message:.60}");
+                    let response = Arc::new(std::sync::Mutex::new(String::new()));
+                    let resp = response.clone();
+                    let emit = move |ev: agent::AgentEvent| {
+                        if let agent::AgentEvent::Delta(d) = ev {
+                            response.lock().unwrap().push_str(&d);
+                        }
+                    };
+                    agent
+                        .process_chat(sys_session, &message, scope, &emit)
+                        .await;
+                    let text = resp.lock().unwrap().clone();
+                    if !text.trim().is_empty() {
+                        // Split into chunks — Signal messages should stay under ~2000 chars
+                        let truncated: String = text.chars().take(1900).collect();
+                        let suffix = if text.chars().count() > 1900 {
+                            "\n…[truncated]"
+                        } else {
+                            ""
+                        };
+                        signal
+                            .send(&sender, &format!("{truncated}{suffix}"))
+                            .await
+                            .ok();
+                    }
+                });
+            });
+
+            signal.receive_loop(handler).await;
+        });
+    }
 
     // Cron scheduler
     {
         let agent = agent.clone();
         let memory = memory.clone();
+        let signal = signal.clone();
         let nextcloud = nextcloud.clone();
         tokio::spawn(async move {
-            let scheduler = cron::CronScheduler::new(agent, memory, nextcloud);
+            let scheduler = cron::CronScheduler::new(agent, memory, signal, nextcloud);
             if let Err(e) = scheduler.run_forever().await {
                 tracing::error!("cron error: {e}");
             }
         });
+    }
+
+    // Notify online
+    if cfg.signal.enabled {
+        signal
+            .notify("renco", "Temple server started, renco is online.")
+            .await
+            .ok();
     }
 
     // Run the WebSocket server

@@ -8,6 +8,7 @@ pub struct Config {
     pub litellm_url: String,
     pub litellm_api_key: Option<String>,
     pub db_path: PathBuf,
+    pub signal: SignalConfig,
     pub nextcloud: NextcloudConfig,
     pub models: ModelConfig,
     pub cron: CronConfig,
@@ -17,6 +18,30 @@ pub struct Config {
     /// Points at localhost, not litellm — zero network latency.
     pub local_llama_url: String,
     pub local_llama_model: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SignalConfig {
+    pub enabled: bool,
+    /// signal-cli daemon TCP socket, e.g. "127.0.0.1:7583"
+    pub socket_addr: String,
+    /// Phone numbers allowed to send inbound commands (E.164 format, + prefix).
+    /// If empty, all senders are rejected.
+    pub allowed_senders: Vec<String>,
+    /// Default recipient for outbound notifications (user's phone number).
+    pub default_recipient: String,
+}
+
+impl Default for SignalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_addr: "127.0.0.1:7583".into(),
+            allowed_senders: Vec::new(),
+            default_recipient: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -112,6 +137,7 @@ impl Default for Config {
             litellm_url: "https://llm.ethanwtodd.com".into(),
             litellm_api_key: None,
             db_path: PathBuf::from("./temple-memory.db"),
+            signal: SignalConfig::default(),
             nextcloud: NextcloudConfig::default(),
             models: ModelConfig::default(),
             cron: CronConfig::default(),

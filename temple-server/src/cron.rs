@@ -5,10 +5,12 @@ use chrono::Datelike;
 use crate::agent::Agent;
 use crate::memory::Memory;
 use crate::nextcloud::Nextcloud;
+use crate::signal::Signal;
 
 pub struct CronScheduler {
     agent: Arc<Agent>,
     memory: Arc<Memory>,
+    signal: Arc<Signal>,
     nextcloud: Arc<Mutex<Nextcloud>>,
 }
 
@@ -16,9 +18,10 @@ impl CronScheduler {
     pub fn new(
         agent: Arc<Agent>,
         memory: Arc<Memory>,
+        signal: Arc<Signal>,
         nextcloud: Arc<Mutex<Nextcloud>>,
     ) -> Self {
-        Self { agent, memory, nextcloud }
+        Self { agent, memory, signal, nextcloud }
     }
 
     /// Daily skills extraction: asks the model to review the day's
@@ -249,8 +252,22 @@ impl CronScheduler {
                     return Err("failed to revert flake.lock".into());
                 }
                 tracing::info!("Reverted flake.lock — kept llama.cpp at {current_rev}");
+                self.signal
+                    .notify(
+                        "renco: flake update",
+                        &format!("llama.cpp update skipped — {risk_count} risk keywords in {current_rev}..{new_rev}"),
+                    )
+                    .await
+                    .ok();
             } else {
                 tracing::info!("llama.cpp update looks safe ({risk_count} keywords)");
+                self.signal
+                    .notify(
+                        "renco: flake update",
+                        &format!("flake updated; llama.cpp {current_rev} → {new_rev}"),
+                    )
+                    .await
+                    .ok();
             }
         }
 
@@ -262,6 +279,12 @@ impl CronScheduler {
     pub async fn self_maintenance(&self) -> Result<(), String> {
         tracing::info!("Running weekly self-maintenance (personality update)...");
         self.agent.update_personality().await;
+        self.signal
+            .notify(
+                "renco: maintenance",
+                "Weekly maintenance cycle completed — personality reviewed.",
+            )
+            .await?;
         Ok(())
     }
 
