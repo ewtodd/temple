@@ -69,33 +69,25 @@ impl Signal {
         Ok(())
     }
 
-    /// Convenience: send a notification with a title prefix to all recipients.
+    /// Convenience: send a notification with a title prefix.
+    /// Sends to the default recipient (or all recipients if multiple are set).
     pub async fn notify(&self, title: &str, body: &str) -> Result<(), String> {
         let msg = if title.is_empty() {
             body.to_string()
         } else {
             format!("*{title}*\n\n{body}")
         };
-        // Send to default recipient, plus any extra allowed senders
-        // (so notifications reach everyone authorized to command renco).
-        let mut recipients = vec![self.config.default_recipient.clone()];
-        for s in &self.config.allowed_senders {
-            if !recipients.contains(s) {
-                recipients.push(s.clone());
-            }
-        }
-        let mut errors = Vec::new();
-        for r in &recipients {
-            if let Err(e) = self.send(r, &msg).await {
-                tracing::warn!("signal send to {r} failed: {e}");
-                errors.push(e);
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
+        self.send(&self.config.default_recipient.clone(), &msg).await
+    }
+
+    /// Send a notification to a specific recipient.
+    pub async fn notify_recipient(&self, recipient: &str, title: &str, body: &str) -> Result<(), String> {
+        let msg = if title.is_empty() {
+            body.to_string()
         } else {
-            Err(errors.join("; "))
-        }
+            format!("*{title}*\n\n{body}")
+        };
+        self.send(recipient, &msg).await
     }
 
     /// Run the inbound receive loop. Maintains a persistent TCP connection

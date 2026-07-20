@@ -7,6 +7,27 @@ use crate::memory::Memory;
 use crate::nextcloud::Nextcloud;
 use crate::signal::Signal;
 
+/// Send a notification to all registered signal users.
+async fn notify_all_users(signal: &Signal, memory: &Memory, title: &str, body: &str) {
+    match memory.get_signal_users().await {
+        Ok(users) => {
+            if users.is_empty() {
+                tracing::warn!("no signal users to notify");
+                return;
+            }
+            for (username, phone, uuid) in &users {
+                let recipient = uuid.as_deref().unwrap_or(phone.as_str());
+                if let Err(e) = signal.notify_recipient(recipient, title, body).await {
+                    tracing::warn!("signal notify {username} failed: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("get signal users: {e}");
+        }
+    }
+}
+
 pub struct CronScheduler {
     agent: Arc<Agent>,
     memory: Arc<Memory>,
@@ -252,22 +273,14 @@ impl CronScheduler {
                     return Err("failed to revert flake.lock".into());
                 }
                 tracing::info!("Reverted flake.lock — kept llama.cpp at {current_rev}");
-                self.signal
-                    .notify(
-                        "renco: flake update",
-                        &format!("llama.cpp update skipped — {risk_count} risk keywords in {current_rev}..{new_rev}"),
-                    )
-                    .await
-                    .ok();
+                notify_all_users(&self.signal, &self.memory, "renco: flake update",
+                    &format!("llama.cpp update skipped — {risk_count} risk keywords in {current_rev}..{new_rev}"),
+                ).await;
             } else {
                 tracing::info!("llama.cpp update looks safe ({risk_count} keywords)");
-                self.signal
-                    .notify(
-                        "renco: flake update",
-                        &format!("flake updated; llama.cpp {current_rev} → {new_rev}"),
-                    )
-                    .await
-                    .ok();
+                notify_all_users(&self.signal, &self.memory, "renco: flake update",
+                    &format!("flake updated; llama.cpp {current_rev} → {new_rev}"),
+                ).await;
             }
         }
 
@@ -279,12 +292,9 @@ impl CronScheduler {
     pub async fn self_maintenance(&self) -> Result<(), String> {
         tracing::info!("Running weekly self-maintenance (personality update)...");
         self.agent.update_personality().await;
-        self.signal
-            .notify(
-                "renco: maintenance",
-                "Weekly maintenance cycle completed — personality reviewed.",
-            )
-            .await?;
+        notify_all_users(&self.signal, &self.memory, "renco: maintenance",
+            "Weekly maintenance cycle completed — personality reviewed.",
+        ).await;
         Ok(())
     }
 

@@ -48,6 +48,13 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
             CREATE INDEX IF NOT EXISTS idx_memory_key ON memory_store(key);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_key_scope ON memory_store(key, scope);
+            CREATE TABLE IF NOT EXISTS signal_users (
+                username TEXT PRIMARY KEY,
+                phone TEXT NOT NULL,
+                uuid TEXT,
+                verified_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_signal_users_uuid ON signal_users(uuid);
             ",
         )?;
         Ok(Self {
@@ -248,5 +255,78 @@ impl Memory {
 
     pub async fn set_personality(&self, text: &str) -> rusqlite::Result<()> {
         self.set_memory("renco_personality", text, "system").await
+    }
+
+    // ── Signal users ──
+
+    /// Upsert a signal user's phone number (from token file).
+    pub async fn upsert_signal_user_phone(
+        &self,
+        username: &str,
+        phone: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO signal_users (username, phone) VALUES (?1, ?2) \
+             ON CONFLICT(username) DO UPDATE SET phone = EXCLUDED.phone",
+            params![username, phone],
+        )?;
+        Ok(())
+    }
+
+    /// Record a verified UUID for a signal user.
+    pub async fn set_signal_user_uuid(
+        &self,
+        username: &str,
+        uuid: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE signal_users SET uuid = ?2, verified_at = ?3 WHERE username = ?1",
+            params![username, uuid, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Get all verified signal users (phone + UUID).
+    pub async fn get_signal_users(&self) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT username, phone, uuid FROM signal_users",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            if let Ok(r) = row {
+                results.push(r);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Find a signal user by phone or UUID.
+    pub async fn find_signal_user(
+        &self,
+        identifier: &str,
+    ) -> rusqlite::Result<Option<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT username, phone, uuid FROM signal_users WHERE phone = ?1 OR uuid = ?1",
+        )?;
+        let mut rows = stmt.query(params![identifier])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+            ))),
+            None => Ok(None),
+        }
     }
 }

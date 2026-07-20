@@ -22,6 +22,12 @@ struct Cli {
     cwd: String,
     #[arg(short = 'C', long)]
     client_id: Option<String>,
+    /// Auth token (or set TEMPLE_TOKEN env var)
+    #[arg(short = 't', long, env = "TEMPLE_TOKEN")]
+    token: Option<String>,
+    /// Use TLS (wss://) — set automatically if server starts with https://
+    #[arg(long)]
+    tls: bool,
     #[arg(long, value_enum)]
     generate_completions: Option<Shell>,
 }
@@ -77,6 +83,7 @@ struct AppState {
 
 fn spawn_ws(
     server: String, cwd: String, client_id: String,
+    token: Option<String>,
     state: Arc<Mutex<AppState>>,
     ui_cmd: mpsc::Receiver<ClientMessage>,
 ) {
@@ -89,7 +96,7 @@ fn spawn_ws(
                 hostname: whoami::hostname(),
                 username: whoami::username(),
             };
-            let (mut conn, _) = match client::connect(&server, sess).await {
+            let (mut conn, _) = match client::connect(&server, &token, sess).await {
                 Ok(c) => c,
                 Err(e) => {
                     state.lock().unwrap().entries.push(ChatEntry::System(
@@ -818,7 +825,7 @@ fn main() {
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();
-    spawn_ws(cli.server, cwd_str, client_id, state.clone(), cmd_rx);
+    spawn_ws(cli.server, cwd_str, client_id, cli.token, state.clone(), cmd_rx);
 
     smol::block_on(async {
         loop {

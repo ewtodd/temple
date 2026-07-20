@@ -18,6 +18,10 @@ pub struct Config {
     /// Points at localhost, not litellm — zero network latency.
     pub local_llama_url: String,
     pub local_llama_model: String,
+    /// Path to the auth tokens file. Each line: `token:username:phone`.
+    /// The file is read on each connection so new tokens work without restart.
+    /// If None, auth is disabled (LAN-only mode).
+    pub auth_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -145,6 +149,7 @@ impl Default for Config {
             allowed_dirs: vec!["/etc/nixos".into(), "/home".into()],
             local_llama_url: "http://127.0.0.1:8080/v1".into(),
             local_llama_model: "qwen3-4b-instruct".into(),
+            auth_token_file: None,
         }
     }
 }

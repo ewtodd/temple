@@ -12,7 +12,7 @@ temple-protocol = { path = "../temple-protocol" }
 iocraft = "0.8"
 crossterm = "0.29"
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 dirs = "5"
 url = "2"

@@ -1,5 +1,6 @@
 /// WebSocket client — connects to temple-server, returns channels.
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use futures_util::{SinkExt, StreamExt};
 use temple_protocol::*;
 use tokio::sync::mpsc;
@@ -11,10 +12,33 @@ pub struct TempleConnection {
 
 pub async fn connect(
     server_addr: &str,
+    token: &Option<String>,
     session_open: SessionOpen,
 ) -> Result<(TempleConnection, tokio::task::JoinHandle<()>), String> {
-    let url = format!("ws://{server_addr}");
-    let (ws_stream, _) = connect_async(&url)
+    // Build the WebSocket URL — detect TLS if the server addr starts with https://
+    let url = if server_addr.starts_with("https://") {
+        let host = server_addr.trim_start_matches("https://");
+        format!("wss://{host}")
+    } else if server_addr.starts_with("http://") {
+        let host = server_addr.trim_start_matches("http://");
+        format!("ws://{host}")
+    } else {
+        format!("ws://{server_addr}")
+    };
+
+    let mut request = url.into_client_request()
+        .map_err(|e| format!("invalid request: {e}"))?;
+
+    // Add Authorization header if token is set
+    if let Some(t) = token {
+        let header_value = format!("Bearer {t}");
+        request.headers_mut().insert(
+            "Authorization",
+            header_value.parse().map_err(|e| format!("header parse: {e}"))?,
+        );
+    }
+
+    let (ws_stream, _) = connect_async(request)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
 

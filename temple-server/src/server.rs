@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
 use futures_util::{SinkExt, StreamExt};
 use temple_protocol::*;
 use uuid::Uuid;
@@ -9,9 +9,12 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentEvent};
 use crate::permissions::PermissionScope;
 use crate::config::Config;
+use crate::memory::Memory;
+use crate::auth::{check_token, load_signal_users};
 
 pub async fn run_server(
     agent: Arc<Agent>,
+    memory: Arc<Memory>,
     config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&config.listen).await?;
@@ -26,6 +29,13 @@ pub async fn run_server(
             keep_alive.keep_warm().await;
         }
     });
+
+    // Load signal users from token file into DB (for UUID verification)
+    if config.signal.enabled {
+        if let Err(e) = load_signal_users(&memory, &config).await {
+            tracing::warn!("Failed to load signal users: {e}");
+        }
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -47,7 +57,44 @@ async fn handle_connection(
     agent: Arc<Agent>,
     config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ws = accept_async(stream).await?;
+    let ws = if let Some(ref token_file) = config.auth_token_file {
+        let token_file = token_file.clone();
+        // Capture the token from the callback via shared state
+        let captured_token = Arc::new(Mutex::new(None::<String>));
+        let ct = captured_token.clone();
+        let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            if let Some(auth) = req.headers().get("Authorization") {
+                let auth_str = auth.to_str().unwrap_or("");
+                if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                    if check_token(&token_file, token).is_ok() {
+                        // Store the token for later user lookup
+                        // (can't block in this callback, so just store the string)
+                        let ct = ct.clone();
+                        // Use try_lock — callback is sync, can't await
+                        if let Ok(mut guard) = ct.try_lock() {
+                            *guard = Some(token.to_string());
+                        }
+                        return Ok(response);
+                    }
+                }
+            }
+            // Reject with 401
+            let mut resp = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::default();
+            *resp.status_mut() = http_status_unauthorized();
+            Err(resp)
+        };
+        match accept_hdr_async(stream, callback).await {
+            Ok(ws) => ws,
+            Err(_) => {
+                tracing::warn!("Rejected unauthorized connection");
+                return Ok(());
+            }
+        }
+    } else {
+        // No auth configured — accept all (LAN-only mode)
+        tokio_tungstenite::accept_async(stream).await?
+    };
+
     // Split into independent read/write halves — no shared mutex, no deadlock.
     let (mut ws_write, mut ws_read) = ws.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
@@ -241,4 +288,9 @@ async fn handle_connection(
     }
     send_task.abort();
     Ok(())
+}
+
+/// Build a 401 Unauthorized HTTP status response.
+fn http_status_unauthorized() -> tokio_tungstenite::tungstenite::http::StatusCode {
+    tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
 }

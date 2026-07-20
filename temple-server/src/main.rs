@@ -1,4 +1,5 @@
 mod agent;
+mod auth;
 mod config;
 mod cron;
 mod litellm;
@@ -38,6 +39,12 @@ struct Cli {
     /// Generate shell completions
     #[arg(long, value_enum)]
     generate_completions: Option<Shell>,
+
+    /// Generate a new auth token for a user.
+    /// Usage: --generate-token USERNAME PHONE
+    /// Writes `token:username:phone` to the auth_token_file and prints the token.
+    #[arg(long, num_args = 2, value_names = ["USERNAME", "PHONE"])]
+    generate_token: Option<Vec<String>>,
 }
 
 impl Cli {
@@ -81,6 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg
     };
 
+    // --generate-token: generate a new auth token, write to file, print, exit.
+    if let Some(args) = &cli.generate_token {
+        let username = &args[0];
+        let phone = &args[1];
+        let token = generate_and_save_token(&cfg, username, phone)?;
+        println!("{token}");
+        return Ok(());
+    }
+
     let cfg = Arc::new(cfg);
 
     tracing::info!("Starting temple server...");
@@ -98,31 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!("No litellm API key set — using 'empty'");
             "empty".into()
         });
-
-    // Apply signal config overrides from environment (agenix secret)
-    // SIGNAL_RECIPIENT supports comma-separated numbers, e.g.:
-    //   SIGNAL_RECIPIENT=+15551234567,+15559876543
-    // The first is the default notification target; all are allowed senders.
-    let cfg = if let Some(recipient_str) = std::env::var("SIGNAL_RECIPIENT").ok() {
-        let recipients: Vec<String> = recipient_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let mut signal_cfg = cfg.signal.clone();
-        if let Some(first) = recipients.first() {
-            signal_cfg.default_recipient = first.clone();
-        }
-        if signal_cfg.allowed_senders.is_empty() {
-            signal_cfg.allowed_senders = recipients;
-        }
-        Arc::new(config::Config {
-            signal: signal_cfg,
-            ..(*cfg).clone()
-        })
-    } else {
-        cfg
-    };
 
     let memory = Arc::new(
         memory::Memory::open(&cfg.db_path)
@@ -155,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cfg.signal.enabled {
         let agent = agent.clone();
         let signal = signal.clone();
+        let memory_for_signal = memory.clone();
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
             let sys_session = uuid::Uuid::nil();
@@ -174,12 +166,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let agent_for_handler = agent.clone();
             let scope_for_handler = scope.clone();
             let signal_for_handler = signal.clone();
+            let memory_for_handler = memory_for_signal.clone();
+            let token_file_for_handler = cfg2.auth_token_file.clone();
             let handler = Arc::new(move |sender: String, message: String| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
+                let memory = memory_for_handler.clone();
+                let token_file = token_file_for_handler.clone();
                 tokio::spawn(async move {
                     tracing::info!("signal inbound from {sender}: {message:.60}");
+
+                    // Check if sender is a verified signal user
+                    let user = memory.find_signal_user(&sender).await
+                        .unwrap_or(None);
+
+                    let username = match &user {
+                        Some((u, _, Some(_))) => u.clone(), // verified (has UUID)
+                        Some((u, _, None)) => u.clone(),    // phone known, UUID pending
+                        None => {
+                            // Unknown sender — check if it's a /verify command
+                            // for an unverified user
+                            if let Some(token) = message.strip_prefix("/verify ") {
+                                let token = token.trim();
+                                // Try to find this token in the auth file
+                                if let Some(ref token_file) = token_file {
+                                    if let Ok(auth_user) = auth::check_token(token_file, token) {
+                                        // Found the token — record the UUID
+                                        let _ = memory.set_signal_user_uuid(
+                                            &auth_user.username,
+                                            &sender,
+                                        ).await;
+                                        signal.send(&sender, &format!(
+                                            "Verified! You are now registered as {}. You can send messages to renco.",
+                                            auth_user.username
+                                        )).await.ok();
+                                        return;
+                                    }
+                                }
+                            }
+                            tracing::warn!(
+                                "signal: ignoring message from unknown sender: {sender}"
+                            );
+                            return;
+                        }
+                    };
+
+                    // If user's UUID wasn't set yet, set it now (first message)
+                    if let Some((_, _, None)) = &user {
+                        let _ = memory.set_signal_user_uuid(&username, &sender).await;
+                    }
+
                     let response = Arc::new(std::sync::Mutex::new(String::new()));
                     let resp = response.clone();
                     let emit = move |ev: agent::AgentEvent| {
@@ -192,7 +229,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await;
                     let text = resp.lock().unwrap().clone();
                     if !text.trim().is_empty() {
-                        // Split into chunks — Signal messages should stay under ~2000 chars
                         let truncated: String = text.chars().take(1900).collect();
                         let suffix = if text.chars().count() > 1900 {
                             "\n…[truncated]"
@@ -225,14 +261,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Notify online
+    // Notify all signal users that renco is online
     if cfg.signal.enabled {
-        signal
-            .notify("renco", "Temple server started, renco is online.")
-            .await
-            .ok();
+        match memory.get_signal_users().await {
+            Ok(users) => {
+                for (username, phone, uuid) in &users {
+                    let recipient = uuid.as_deref().unwrap_or(phone.as_str());
+                    signal.notify_recipient(recipient, "renco", "Temple server started, renco is online.")
+                        .await.ok();
+                }
+            }
+            Err(e) => tracing::warn!("get signal users for startup notify: {e}"),
+        }
     }
 
     // Run the WebSocket server
-    server::run_server(agent, cfg).await
+    server::run_server(agent, memory, cfg).await
+}
+
+/// Generate a random 32-byte auth token, write `token:username:phone` to the
+/// auth_token_file, and return the token. The file is created if it doesn't
+/// exist; existing lines are preserved.
+fn generate_and_save_token(
+    cfg: &config::Config,
+    username: &str,
+    phone: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use rand::Rng;
+    let token: String = (0..32)
+        .map(|_| {
+            let n = rand::thread_rng().gen_range(0..62);
+            if n < 26 {
+                (b'a' + n) as char
+            } else if n < 52 {
+                (b'A' + (n - 26)) as char
+            } else {
+                (b'0' + (n - 52)) as char
+            }
+        })
+        .collect();
+
+    let token_file = cfg.auth_token_file.as_ref()
+        .ok_or("auth_token_file not set in config — cannot generate token")?;
+
+    if let Some(parent) = token_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let line = format!("{token}:{username}:{phone}\n");
+    let mut existing = std::fs::read_to_string(token_file).unwrap_or_default();
+    // Remove any existing line for this username (re-generating replaces)
+    existing.retain(|c| c != '\n' && c != '\r');
+    let lines: Vec<&str> = existing.lines()
+        .filter(|l| {
+            let parts: Vec<&str> = l.splitn(3, ':').collect();
+            parts.len() < 2 || parts[1] != username
+        })
+        .collect();
+    let new_content = if lines.is_empty() {
+        line
+    } else {
+        format!("{}\n{}", lines.join("\n"), line)
+    };
+    std::fs::write(token_file, new_content)?;
+
+    Ok(token)
 }
