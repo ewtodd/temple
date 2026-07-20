@@ -192,6 +192,7 @@ in
 
   config = mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
+    environment.etc."temple/config.toml".source = configFile;
 
     users.users.temple = {
       isSystemUser = true;
