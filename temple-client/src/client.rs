@@ -1,6 +1,10 @@
 /// WebSocket client — connects to temple-server, returns channels.
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{
+    connect_async,
+    connect_async_tls_with_config,
+    tungstenite::client::IntoClientRequest,
+    Connector,
+};
 use futures_util::{SinkExt, StreamExt};
 use temple_protocol::*;
 use tokio::sync::mpsc;
@@ -16,14 +20,14 @@ pub async fn connect(
     session_open: SessionOpen,
 ) -> Result<(TempleConnection, tokio::task::JoinHandle<()>), String> {
     // Build the WebSocket URL — detect TLS if the server addr starts with https://
-    let url = if server_addr.starts_with("https://") {
+    let (url, use_tls) = if server_addr.starts_with("https://") {
         let host = server_addr.trim_start_matches("https://");
-        format!("wss://{host}")
+        (format!("wss://{host}"), true)
     } else if server_addr.starts_with("http://") {
         let host = server_addr.trim_start_matches("http://");
-        format!("ws://{host}")
+        (format!("ws://{host}"), false)
     } else {
-        format!("ws://{server_addr}")
+        (format!("ws://{server_addr}"), false)
     };
 
     let mut request = url.into_client_request()
@@ -38,9 +42,20 @@ pub async fn connect(
         );
     }
 
-    let (ws_stream, _) = connect_async(request)
-        .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+    // Use TLS connector for wss:// connections
+    let (ws_stream, _) = if use_tls {
+        let connector = Connector::NativeTls(
+            native_tls::TlsConnector::new()
+                .map_err(|e| format!("tls connector: {e}"))?,
+        );
+        connect_async_tls_with_config(request, None, false, Some(connector))
+            .await
+            .map_err(|e| format!("connect failed: {e}"))?
+    } else {
+        connect_async(request)
+            .await
+            .map_err(|e| format!("connect failed: {e}"))?
+    };
 
     // Split — no shared mutex, no deadlock.
     let (mut ws_write, mut ws_read) = ws_stream.split();
