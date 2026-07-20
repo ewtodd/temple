@@ -1,9 +1,23 @@
-use temple_protocol::{ComplexityClass, RouterDecision};
+use temple_protocol::ComplexityClass;
 use crate::litellm::{ChatMessage, ChatRequest, LiteLLM};
+use crate::config::ModelConfig;
 
 /// Request router. Uses heuristics first, falls back to local small model
-/// for ambiguous cases.
+/// for ambiguous cases. Maps complexity classes to configured fleet models.
 pub struct Router;
+
+/// Where the agent should send the request.
+#[derive(Debug, Clone)]
+pub enum Route {
+    /// Send to this model directly, no pipeline.
+    Direct { model: String },
+    /// Run the planner→executor→reviewer pipeline.
+    Pipeline {
+        planner: String,
+        executor: String,
+        reviewer: String,
+    },
+}
 
 impl Router {
     /// Quick heuristic classification — no model call needed.
@@ -47,6 +61,7 @@ impl Router {
     /// Returns None if the local model is unavailable.
     pub async fn classify_with_model(
         local: &LiteLLM,
+        router_model: &str,
         query: &str,
     ) -> Option<ComplexityClass> {
         let heuristic = Self::classify(query);
@@ -57,7 +72,7 @@ impl Router {
         }
 
         let req = ChatRequest {
-            model: "qwen3-4b-instruct".to_string(),
+            model: router_model.to_string(),
             messages: vec![
                 ChatMessage::system(
                     "Classify this user query into exactly one word: simple, medium, complex, or critical.\n\
@@ -85,6 +100,26 @@ impl Router {
             s if s.starts_with("complex") => Some(ComplexityClass::Complex),
             s if s.starts_with("critical") => Some(ComplexityClass::Critical),
             _ => Some(ComplexityClass::Medium),
+        }
+    }
+
+    /// Map a complexity class to a concrete route using configured models.
+    pub fn route(complexity: ComplexityClass, models: &ModelConfig) -> Route {
+        match complexity {
+            ComplexityClass::Simple => Route::Direct {
+                model: models.simple_model.clone(),
+            },
+            ComplexityClass::Medium => Route::Direct {
+                model: models.default_model.clone(),
+            },
+            ComplexityClass::Complex => Route::Pipeline {
+                planner: models.planner_model.clone(),
+                executor: models.executor_model.clone(),
+                reviewer: models.reviewer_model.clone(),
+            },
+            ComplexityClass::Critical => Route::Direct {
+                model: models.critical_model.clone(),
+            },
         }
     }
 }

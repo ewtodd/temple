@@ -84,9 +84,6 @@ pub enum ClientMessage {
         session_id: Uuid,
         mode: PermissionMode,
     },
-    /// Onboarding: user requests initial setup. Agent asks questions,
-    /// stores answers as user-scoped memories.
-    Initialize { session_id: Uuid },
     /// Cancel an in-progress agent loop for this session
     CancelChat { session_id: Uuid },
     Ping,

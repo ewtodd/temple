@@ -18,12 +18,6 @@ let
     db_path = "${cfg.dataDir}/memory.db";
     allowed_dirs = cfg.allowedDirs;
     default_permission = cfg.defaultPermission;
-    ntfy = {
-      enabled = cfg.ntfy.enable;
-      server_url = cfg.ntfy.serverUrl;
-      control_topic = cfg.ntfy.controlTopic;
-      out_topic = cfg.ntfy.outTopic;
-    };
     nextcloud = {
       enabled = cfg.nextcloud.enable;
       server_url = cfg.nextcloud.serverUrl;
@@ -32,6 +26,11 @@ let
     models = {
       use_local_router = false;
       default_model = cfg.defaultModel;
+      simple_model = cfg.simpleModel;
+      planner_model = cfg.plannerModel;
+      executor_model = cfg.executorModel;
+      reviewer_model = cfg.reviewerModel;
+      critical_model = cfg.criticalModel;
     };
     local_llama_url = cfg.localLlamaUrl;
     local_llama_model = cfg.localLlamaModel;
@@ -63,7 +62,37 @@ in
     defaultModel = mkOption {
       type = types.str;
       default = "deepseek-v4-flash-high";
-      description = "Default model for new sessions (must exist on the litellm proxy).";
+      description = "Default model for new sessions and Medium complexity (must exist on the litellm proxy).";
+    };
+
+    simpleModel = mkOption {
+      type = types.str;
+      default = "qwen3-4b-instruct";
+      description = "Model for Simple queries (local classifier on oracle).";
+    };
+
+    plannerModel = mkOption {
+      type = types.str;
+      default = "deepseek-v4-flash-high";
+      description = "Planner model for Complex pipeline (deepseek on son-of-anton).";
+    };
+
+    executorModel = mkOption {
+      type = types.str;
+      default = "qwen3.6-27b-coding";
+      description = "Executor model for Complex pipeline (qwen coding on anton).";
+    };
+
+    reviewerModel = mkOption {
+      type = types.str;
+      default = "deepseek-v4-flash-high";
+      description = "Reviewer model for Complex pipeline (deepseek on son-of-anton).";
+    };
+
+    criticalModel = mkOption {
+      type = types.str;
+      default = "deepseek-v4-flash-high";
+      description = "Model for Critical complexity queries (deepseek direct).";
     };
 
     defaultPermission = mkOption {
@@ -95,22 +124,6 @@ in
       default = [ ];
       example = [ "/etc/nixos" "/home" ];
       description = "Extra directories the agent may access without prompting (beyond each session's CWD).";
-    };
-
-    ntfy = {
-      enable = mkEnableOption "ntfy two-way notifications";
-      serverUrl = mkOption {
-        type = types.str;
-        default = "https://ntfy.ethanwtodd.com";
-      };
-      controlTopic = mkOption {
-        type = types.str;
-        default = "temple-ctrl";
-      };
-      outTopic = mkOption {
-        type = types.str;
-        default = "temple-out";
-      };
     };
 
     nextcloud = {

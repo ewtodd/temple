@@ -8,41 +8,15 @@ pub struct Config {
     pub litellm_url: String,
     pub litellm_api_key: Option<String>,
     pub db_path: PathBuf,
-    pub ntfy: NtfyConfig,
     pub nextcloud: NextcloudConfig,
     pub models: ModelConfig,
     pub cron: CronConfig,
     pub default_permission: String,
     pub allowed_dirs: Vec<String>,
-    /// Local llama.cpp instance for routing/title generation (on oracle).
+    /// Local llama.cpp instance for routing/titles (on oracle).
     /// Points at localhost, not litellm — zero network latency.
     pub local_llama_url: String,
     pub local_llama_model: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct NtfyConfig {
-    pub enabled: bool,
-    pub server_url: String,
-    /// Topic for incoming commands to renco
-    pub control_topic: String,
-    /// Topic for outgoing notifications
-    pub out_topic: String,
-    /// Token from agenix
-    pub token: Option<String>,
-}
-
-impl Default for NtfyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_url: "https://ntfy.ethanwtodd.com".into(),
-            control_topic: "temple-ctrl".into(),
-            out_topic: "temple-out".into(),
-            token: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,8 +46,18 @@ pub struct ModelConfig {
     pub use_local_router: bool,
     /// Path to small GGUF for router (optional)
     pub local_router_model: Option<String>,
-    /// Default model for fallback
+    /// Default model for fallback / Medium complexity
     pub default_model: String,
+    /// Fast model for Simple queries (oracle local classifier)
+    pub simple_model: String,
+    /// Planner model for Complex pipeline (deepseek on son-of-anton)
+    pub planner_model: String,
+    /// Executor model for Complex pipeline (qwen coding on anton)
+    pub executor_model: String,
+    /// Reviewer model for Complex pipeline (deepseek on son-of-anton)
+    pub reviewer_model: String,
+    /// Model for Critical complexity (deepseek direct)
+    pub critical_model: String,
     /// Model definitions
     pub models: Vec<ModelDef>,
 }
@@ -84,6 +68,11 @@ impl Default for ModelConfig {
             use_local_router: false,
             local_router_model: None,
             default_model: "deepseek-v4-flash-high".into(),
+            simple_model: "qwen3-4b-instruct".into(),
+            planner_model: "deepseek-v4-flash-high".into(),
+            executor_model: "qwen3.6-27b-coding".into(),
+            reviewer_model: "deepseek-v4-flash-high".into(),
+            critical_model: "deepseek-v4-flash-high".into(),
             models: Vec::new(),
         }
     }
@@ -123,7 +112,6 @@ impl Default for Config {
             litellm_url: "https://llm.ethanwtodd.com".into(),
             litellm_api_key: None,
             db_path: PathBuf::from("./temple-memory.db"),
-            ntfy: NtfyConfig::default(),
             nextcloud: NextcloudConfig::default(),
             models: ModelConfig::default(),
             cron: CronConfig::default(),
@@ -136,7 +124,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Workspace directory for system-initiated sessions (ntfy, cron).
+    /// Workspace directory for system-initiated sessions (cron).
     pub fn data_dir_workspace(&self) -> String {
         self.db_path
             .parent()

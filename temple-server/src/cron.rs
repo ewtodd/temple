@@ -4,13 +4,11 @@ use chrono::Datelike;
 
 use crate::agent::Agent;
 use crate::memory::Memory;
-use crate::ntfy::Ntfy;
 use crate::nextcloud::Nextcloud;
 
 pub struct CronScheduler {
     agent: Arc<Agent>,
     memory: Arc<Memory>,
-    ntfy: Arc<Mutex<Ntfy>>,
     nextcloud: Arc<Mutex<Nextcloud>>,
 }
 
@@ -18,17 +16,20 @@ impl CronScheduler {
     pub fn new(
         agent: Arc<Agent>,
         memory: Arc<Memory>,
-        ntfy: Arc<Mutex<Ntfy>>,
         nextcloud: Arc<Mutex<Nextcloud>>,
     ) -> Self {
-        Self { agent, memory, ntfy, nextcloud }
+        Self { agent, memory, nextcloud }
     }
 
-    /// Daily skills extraction: asks the brain model to review the day's
-    /// conversations and distill reusable skills.
+    /// Daily skills extraction: asks the model to review the day's
+    /// conversations and distill reusable skills, then writes skills.md.
     pub async fn extract_skills(&self) -> Result<(), String> {
         tracing::info!("Running daily skills extraction...");
 
+        // 1. Ask the model to extract skills from recent conversations
+        self.extract_skills_from_conversations().await;
+
+        // 2. Dump all skills (including new ones) to skills.md
         let skills = self.memory.get_all_skills().await
             .map_err(|e| format!("get skills: {e}"))?;
 
@@ -66,6 +67,100 @@ impl CronScheduler {
 
         tracing::info!("Skills extraction complete — {} skills", skills.len());
         Ok(())
+    }
+
+    /// Ask the model to review recent conversations and extract reusable
+    /// skills into the skills table.
+    async fn extract_skills_from_conversations(&self) {
+        let recent = match self.memory.get_recent_conversations(50).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to get recent conversations: {e}");
+                return;
+            }
+        };
+
+        if recent.is_empty() {
+            tracing::info!("No conversations to extract skills from");
+            return;
+        }
+
+        let mut conv_summary = String::new();
+        for entry in recent.iter().take(50) {
+            conv_summary.push_str(&format!(
+                "[{}] {}: {}\n",
+                entry.timestamp.format("%m-%d %H:%M"),
+                entry.role,
+                &entry.content[..entry.content.len().min(300)]
+            ));
+        }
+
+        let prompt = format!(
+            "You are reviewing recent conversations between renco (an AI agent) and a user.\n\n\
+             Review these conversations and extract any reusable skills — patterns, techniques,\n\
+             or procedures that renco used successfully and should remember for future sessions.\n\n\
+             For each skill, output a JSON object on its own line:\n\
+             {{\"name\": \"short-name\", \"description\": \"what it does\", \"pattern\": \"the reusable pattern\"}}\n\n\
+             Only extract genuinely reusable skills (not one-off actions). If there are none,\n\
+             output nothing.\n\n\
+             Conversations:\n{conv_summary}"
+        );
+
+        let req = crate::litellm::ChatRequest {
+            model: self.agent.models.default_model.clone(),
+            messages: vec![
+                crate::litellm::ChatMessage::system(
+                    "You are a skill extraction assistant. Output only JSON objects, one per line."
+                ),
+                crate::litellm::ChatMessage::user(&prompt),
+            ],
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(2048),
+            temperature: Some(0.3),
+        };
+
+        match self.agent.litellm.chat(req).await {
+            Ok(resp) => {
+                if let Some(choice) = resp.choices.first() {
+                    if let Some(content) = choice.message.content.as_deref() {
+                        let mut extracted = 0;
+                        for line in content.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || !line.starts_with('{') {
+                                continue;
+                            }
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                                let name = v["name"].as_str().unwrap_or("").to_string();
+                                let desc = v["description"].as_str().unwrap_or("").to_string();
+                                let pattern = v["pattern"].as_str().unwrap_or("").to_string();
+                                if name.is_empty() || desc.is_empty() {
+                                    continue;
+                                }
+                                let skill = temple_protocol::Skill {
+                                    name,
+                                    description: desc,
+                                    pattern,
+                                    source_session: None,
+                                    frequency: 1,
+                                    last_used: Some(chrono::Utc::now()),
+                                };
+                                if let Err(e) = self.memory.upsert_skill(&skill).await {
+                                    tracing::warn!("Failed to upsert skill: {e}");
+                                } else {
+                                    extracted += 1;
+                                }
+                            }
+                        }
+                        tracing::info!("Extracted {extracted} skills from conversations");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Skill extraction model call failed: {e}");
+            }
+        }
     }
 
     /// Daily nix flake update with llama.cpp regression checking.
@@ -154,19 +249,8 @@ impl CronScheduler {
                     return Err("failed to revert flake.lock".into());
                 }
                 tracing::info!("Reverted flake.lock — kept llama.cpp at {current_rev}");
-
-                self.ntfy.lock().await
-                    .notify("renco: flake update",
-                        &format!("llama.cpp update skipped — {risk_count} risk keywords in {current_rev}..{new_rev}"))
-                    .await
-                    .ok();
             } else {
                 tracing::info!("llama.cpp update looks safe ({risk_count} keywords)");
-                self.ntfy.lock().await
-                    .notify("renco: flake update",
-                        &format!("flake updated; llama.cpp {current_rev} → {new_rev}"))
-                    .await
-                    .ok();
             }
         }
 
@@ -178,9 +262,6 @@ impl CronScheduler {
     pub async fn self_maintenance(&self) -> Result<(), String> {
         tracing::info!("Running weekly self-maintenance (personality update)...");
         self.agent.update_personality().await;
-        self.ntfy.lock().await
-            .notify("renco: maintenance", "Weekly maintenance cycle completed — personality reviewed.")
-            .await?;
         Ok(())
     }
 

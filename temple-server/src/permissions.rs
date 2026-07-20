@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use temple_protocol::{AccessKind, PermissionMode};
+use tokio::fs;
 
 /// Represents a session's permission scope.
 #[derive(Debug, Clone)]
@@ -10,12 +11,14 @@ pub struct PermissionScope {
 }
 
 impl PermissionScope {
-    pub fn new(cwd: &Path, mode: PermissionMode, allowed: &[String]) -> Self {
-        let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let allowed_paths = allowed
-            .iter()
-            .filter_map(|s| std::fs::canonicalize(Path::new(s)).ok())
-            .collect();
+    pub async fn new(cwd: &Path, mode: PermissionMode, allowed: &[String]) -> Self {
+        let canonical = fs::canonicalize(cwd).await.unwrap_or_else(|_| cwd.to_path_buf());
+        let mut allowed_paths = Vec::with_capacity(allowed.len());
+        for s in allowed {
+            if let Ok(p) = fs::canonicalize(Path::new(s)).await {
+                allowed_paths.push(p);
+            }
+        }
         Self {
             cwd: canonical,
             mode,
@@ -35,16 +38,16 @@ impl PermissionScope {
         self.mode = mode;
     }
 
-    fn is_in_cwd(&self, path: &Path) -> bool {
-        let canonical = match std::fs::canonicalize(path) {
+    async fn is_in_cwd(&self, path: &Path) -> bool {
+        let canonical = match fs::canonicalize(path).await {
             Ok(p) => p,
             Err(_) => return path.starts_with(&self.cwd),
         };
         canonical.starts_with(&self.cwd)
     }
 
-    fn is_in_allowed(&self, path: &Path) -> bool {
-        let canonical = match std::fs::canonicalize(path) {
+    async fn is_in_allowed(&self, path: &Path) -> bool {
+        let canonical = match fs::canonicalize(path).await {
             Ok(p) => p,
             Err(_) => return false,
         };
@@ -52,17 +55,17 @@ impl PermissionScope {
     }
 
     /// Ok(()) → granted. Err(path) → needs user prompt.
-    pub fn check_access(&self, path: &Path, access: AccessKind) -> Result<(), PathBuf> {
+    pub async fn check_access(&self, path: &Path, access: AccessKind) -> Result<(), PathBuf> {
         match self.mode {
             PermissionMode::Yolo => Ok(()),
 
             PermissionMode::Lockdown => {
                 if (access == AccessKind::Read || access == AccessKind::ReadDir)
-                    && (self.is_in_cwd(path) || self.is_in_allowed(path))
+                    && (self.is_in_cwd(path).await || self.is_in_allowed(path).await)
                 {
                     return Ok(());
                 }
-                if access == AccessKind::Write && self.is_in_allowed(path) {
+                if access == AccessKind::Write && self.is_in_allowed(path).await {
                     return Ok(());
                 }
                 if access == AccessKind::Execute {
@@ -73,7 +76,7 @@ impl PermissionScope {
             }
 
             PermissionMode::Ask => {
-                if self.is_in_cwd(path) || self.is_in_allowed(path) {
+                if self.is_in_cwd(path).await || self.is_in_allowed(path).await {
                     Ok(())
                 } else {
                     Err(path.to_path_buf())
@@ -81,7 +84,7 @@ impl PermissionScope {
             }
 
             PermissionMode::Default => {
-                if self.is_in_cwd(path) || self.is_in_allowed(path) {
+                if self.is_in_cwd(path).await || self.is_in_allowed(path).await {
                     Ok(())
                 } else {
                     Err(path.to_path_buf())

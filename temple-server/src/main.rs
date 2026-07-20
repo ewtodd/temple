@@ -5,7 +5,6 @@ mod litellm;
 mod mcp;
 mod memory;
 mod nextcloud;
-mod ntfy;
 mod permissions;
 mod router;
 mod server;
@@ -13,7 +12,6 @@ mod server;
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Generator, Shell};
 use std::sync::Arc;
-use temple_protocol::PermissionMode;
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
@@ -114,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         litellm,
         mcp,
         memory.clone(),
-        &cfg.models.default_model,
+        cfg.models.clone(),
     );
     agent.set_local_endpoint(&cfg.local_llama_url, &cfg.local_llama_model);
     let agent = Arc::new(agent);
@@ -123,76 +121,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agent.refresh_tools().await;
 
     // Initialize integrations
-    let ntfy = Arc::new(Mutex::new(ntfy::Ntfy::new(&cfg.ntfy)));
     let nextcloud = Arc::new(Mutex::new(nextcloud::Nextcloud::new(&cfg.nextcloud)));
-
-    // ntfy two-way loop: inbound messages → agent → outbound reply
-    if cfg.ntfy.enabled {
-        let agent = agent.clone();
-        let ntfy = ntfy.clone();
-        let cfg2 = cfg.clone();
-        tokio::spawn(async move {
-            let sys_session = uuid::Uuid::nil();
-            agent.open_session(sys_session, "ntfy", &cfg2.data_dir_workspace()).await;
-            let scope = Arc::new(Mutex::new(permissions::PermissionScope::new(
-                std::path::Path::new(&cfg2.data_dir_workspace()),
-                PermissionMode::Default,
-                &cfg2.allowed_dirs,
-            )));
-            loop {
-                match ntfy.lock().await.poll_incoming().await {
-                    Ok(messages) => {
-                        for msg in messages {
-                            tracing::info!("ntfy inbound: {msg:.60}");
-                            let response = Arc::new(std::sync::Mutex::new(String::new()));
-                            let resp = response.clone();
-                            let emit = move |ev: agent::AgentEvent| {
-                                if let agent::AgentEvent::Delta(d) = ev {
-                                    response.lock().unwrap().push_str(&d);
-                                }
-                            };
-                            agent
-                                .process_chat(sys_session, &msg, scope.clone(), &emit)
-                                .await;
-                            let text = resp.lock().unwrap().clone();
-                            if !text.trim().is_empty() {
-                                let truncated: String = text.chars().take(4000).collect();
-                                ntfy.lock().await.notify("renco", &truncated).await.ok();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("ntfy poll: {e}");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                        continue;
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            }
-        });
-    }
 
     // Cron scheduler
     {
         let agent = agent.clone();
         let memory = memory.clone();
-        let ntfy = ntfy.clone();
         let nextcloud = nextcloud.clone();
         tokio::spawn(async move {
-            let scheduler = cron::CronScheduler::new(agent, memory, ntfy, nextcloud);
+            let scheduler = cron::CronScheduler::new(agent, memory, nextcloud);
             if let Err(e) = scheduler.run_forever().await {
                 tracing::error!("cron error: {e}");
             }
         });
-    }
-
-    // Notify online
-    if cfg.ntfy.enabled {
-        ntfy.lock()
-            .await
-            .notify("renco", "Temple server started, renco is online.")
-            .await
-            .ok();
     }
 
     // Run the WebSocket server

@@ -47,6 +47,7 @@ impl Memory {
             );
             CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
             CREATE INDEX IF NOT EXISTS idx_memory_key ON memory_store(key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_key_scope ON memory_store(key, scope);
             ",
         )?;
         Ok(Self {
@@ -106,7 +107,9 @@ impl Memory {
         let conn = self.conn.lock().await;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT OR REPLACE INTO memory_store (id, key, value, scope, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT created_at FROM memory_store WHERE key=?2 AND scope=?4), ?5), ?5)",
+            "INSERT INTO memory_store (id, key, value, scope, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+             ON CONFLICT(key, scope) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
             rusqlite::params![uuid::Uuid::new_v4().to_string(), key, value, scope, now],
         )?;
         Ok(())
@@ -189,9 +192,9 @@ impl Memory {
                 source_session: row
                     .get::<_, Option<String>>(3)?
                     .and_then(|s| Uuid::parse_str(&s).ok()),
-                frequency: row.get(3)?,
+                frequency: row.get(4)?,
                 last_used: row
-                    .get::<_, Option<String>>(4)?
+                    .get::<_, Option<String>>(5)?
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                     .map(|d| d.to_utc()),
             })

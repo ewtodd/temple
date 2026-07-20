@@ -102,7 +102,8 @@ async fn handle_connection(
                     std::path::Path::new(&open.cwd),
                     PermissionMode::Default,
                     &config.allowed_dirs,
-                );
+                )
+                .await;
                 permissions = Some(Arc::new(Mutex::new(scope)));
                 agent.open_session(session_id, &open.username, &open.cwd).await;
                 let info = SessionInfo {
@@ -131,38 +132,6 @@ async fn handle_connection(
                     });
                     continue;
                 };
-
-                // Handle /initial onboarding
-                if content.trim() == "/initial" {
-                    let agent = agent.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let emit = move |ev: AgentEvent| {
-                            let msg = match ev {
-                                AgentEvent::OnboardingQuestion(q) => {
-                                    ServerMessage::ChatDelta {
-                                        session_id: sid,
-                                        delta: q,
-                                        done: true,
-                                    }
-                                }
-                                AgentEvent::Delta(d) => ServerMessage::ChatDelta {
-                                    session_id: sid,
-                                    delta: d,
-                                    done: false,
-                                },
-                                AgentEvent::Error(e) => ServerMessage::ChatError {
-                                    session_id: sid,
-                                    error: e,
-                                },
-                                _ => return,
-                            };
-                            let _ = tx.send(msg);
-                        };
-                        agent.run_onboarding(sid, &emit).await;
-                    });
-                    continue;
-                }
 
                 // Run agent loop in a task; forward events to this client
                 let agent = agent.clone();
@@ -207,11 +176,6 @@ async fn handle_connection(
                             AgentEvent::Error(e) => ServerMessage::ChatError {
                                 session_id: sid,
                                 error: e,
-                            },
-                            AgentEvent::OnboardingQuestion(q) => ServerMessage::ChatDelta {
-                                session_id: sid,
-                                delta: q,
-                                done: true,
                             },
                         };
                         let _ = tx.send(msg);
@@ -259,34 +223,6 @@ async fn handle_connection(
                     p.lock().await.set_mode(mode);
                 }
                 let _ = tx.send(ServerMessage::ModeChanged { session_id: sid, mode });
-            }
-
-            ClientMessage::Initialize { session_id: sid } => {
-                let agent = agent.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let emit = move |ev: AgentEvent| {
-                        let msg = match ev {
-                            AgentEvent::OnboardingQuestion(q) => ServerMessage::ChatDelta {
-                                session_id: sid,
-                                delta: q,
-                                done: true,
-                            },
-                            AgentEvent::Delta(d) => ServerMessage::ChatDelta {
-                                session_id: sid,
-                                delta: d,
-                                done: false,
-                            },
-                            AgentEvent::Error(e) => ServerMessage::ChatError {
-                                session_id: sid,
-                                error: e,
-                            },
-                            _ => return,
-                        };
-                        let _ = tx.send(msg);
-                    };
-                    agent.run_onboarding(sid, &emit).await;
-                });
             }
 
             ClientMessage::CancelChat { session_id: sid } => {

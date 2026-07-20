@@ -6,11 +6,12 @@ use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::config::ModelConfig;
 use crate::litellm::{ChatMessage, ChatRequest, LiteLLM, StreamEvent, ToolDefinition};
 use crate::mcp::McpClient;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
-use crate::router::Router;
+use crate::router::{Route, Router};
 
 /// Maximum tool-loop rounds per user message before forcing an answer.
 const MAX_TOOL_ROUNDS: usize = 30;
@@ -22,6 +23,8 @@ const MAX_TOOL_RESULT: usize = 24_000;
 const MAX_STREAM_RETRIES: usize = 3;
 /// Detect stuck loops: if same tool+args seen this many times, intervene
 const STUCK_THRESHOLD: usize = 3;
+/// Max planner→executor→reviewer revision rounds
+const MAX_REVISION_ROUNDS: usize = 3;
 
 /// Resolves permission requests from the agent loop via the client.
 pub struct PermissionResolver {
@@ -60,8 +63,6 @@ pub enum AgentEvent {
     PermissionNeeded(PermissionRequest),
     Done(ChatStatsData),
     Error(String),
-    /// A question during /initial onboarding
-    OnboardingQuestion(String),
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +74,44 @@ pub struct ChatStatsData {
     pub context_length: u32,
     pub prefill_tps: f64,
     pub decode_tps: f64,
+}
+
+/// Accumulates token/timing stats across multiple tool-loop rounds
+/// and pipeline revision rounds.
+struct StatsAccum {
+    total_completion: u32,
+    last_prompt_tokens: u32,
+    total_prefill_ms: u64,
+    total_decode_ms: u64,
+    total_prefill_tokens: u32,
+}
+
+impl StatsAccum {
+    fn new() -> Self {
+        Self {
+            total_completion: 0,
+            last_prompt_tokens: 0,
+            total_prefill_ms: 0,
+            total_decode_ms: 0,
+            total_prefill_tokens: 0,
+        }
+    }
+
+    fn prefill_tps(&self) -> f64 {
+        if self.total_prefill_ms > 0 {
+            self.total_prefill_tokens as f64 / (self.total_prefill_ms as f64 / 1000.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn decode_tps(&self) -> f64 {
+        if self.total_decode_ms > 0 {
+            self.total_completion as f64 / (self.total_decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 struct SessionCtx {
@@ -93,7 +132,7 @@ pub struct Agent {
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
     /// Per-session cancellation tokens for in-progress agent loops
     cancel_tokens: Mutex<HashMap<Uuid, CancellationToken>>,
-    default_model: String,
+    pub models: ModelConfig,
     router_model: String,
     title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
@@ -104,7 +143,7 @@ impl Agent {
         litellm: LiteLLM,
         mcp: McpClient,
         memory: Arc<Memory>,
-        default_model: &str,
+        models: ModelConfig,
     ) -> Self {
         Self {
             litellm,
@@ -115,9 +154,9 @@ impl Agent {
             permissions: Arc::new(PermissionResolver::new()),
             sessions: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
-            default_model: default_model.to_string(),
             router_model: "qwen3-4b-instruct".to_string(),
             title_model: "qwen3-4b-instruct".to_string(),
+            models,
             tools: Mutex::new(Vec::new()),
         }
     }
@@ -152,7 +191,7 @@ impl Agent {
         // requests — llama.cpp caches the prefix, so this is cheap and
         // doesn't displace the real conversation cache.
         let req = ChatRequest {
-            model: self.default_model.clone(),
+            model: self.models.default_model.clone(),
             messages: vec![
                 ChatMessage::system("ok"),
                 ChatMessage::user("."),
@@ -178,7 +217,7 @@ impl Agent {
         sessions.insert(
             session_id,
             SessionCtx {
-                model: self.default_model.clone(),
+                model: self.models.default_model.clone(),
                 history: Vec::new(),
                 username: username.to_string(),
                 cwd: cwd.to_string(),
@@ -212,13 +251,11 @@ impl Agent {
             .await
             .get(&session_id)
             .map(|s| s.model.clone())
-            .unwrap_or_else(|| self.default_model.clone())
+            .unwrap_or_else(|| self.models.default_model.clone())
     }
 
-    /// The full agent loop for one user message. Self-healing: retries on
-    /// stream failures, recovers from malformed tool calls, detects stuck
-    /// loops. Only ends when the model produces a final answer, the user
-    /// cancels, or MAX_TOOL_ROUNDS is hit.
+    /// The full agent loop for one user message. Routes the query, then
+    /// either runs a direct tool loop or a planner→executor→reviewer pipeline.
     pub async fn process_chat(
         &self,
         session_id: Uuid,
@@ -250,30 +287,292 @@ impl Agent {
         };
 
         // Route the query
-        let model = if content.starts_with('/') || content.starts_with(':') {
-            session_model
+        let route = if content.starts_with('/') || content.starts_with(':') {
+            Route::Direct { model: session_model }
         } else {
-            let complexity = Router::classify_with_model(&self.local, content)
-                .await
-                .unwrap_or_else(|| Router::classify(content));
-            match complexity {
-                ComplexityClass::Simple => {
-                    tracing::info!("Router: simple → fast model");
-                    "fast-gemma-4-12b-it".to_string()
-                }
-                _ => session_model,
+            let complexity = Router::classify_with_model(
+                &self.local, &self.router_model, content
+            ).await.unwrap_or_else(|| Router::classify(content));
+            tracing::info!("Router: {complexity:?}");
+            Router::route(complexity, &self.models)
+        };
+
+        let base_system_prompt = self.build_system_prompt(&username, &cwd).await;
+
+        // Stats accumulators across all rounds
+        let mut stats = StatsAccum::new();
+
+        let (final_content, model_for_stats) = match &route {
+            Route::Direct { model } => {
+                let mut tool_history = Vec::new();
+                let content = self.run_tool_loop(
+                    session_id, model, &base_system_prompt, &cancel_token,
+                    &scope, emit, &mut stats, &mut tool_history,
+                ).await;
+                (content, model.clone())
+            }
+            Route::Pipeline { planner, executor, reviewer } => {
+                self.run_pipeline(
+                    session_id, content, &base_system_prompt,
+                    planner, executor, reviewer,
+                    &cancel_token, &scope, emit, &mut stats,
+                ).await
             }
         };
 
-        let system_prompt = self.build_system_prompt(&username, &cwd).await;
+        // Clean up cancellation token
+        self.cancel_tokens.lock().await.remove(&session_id);
 
-        let mut total_completion: u32 = 0;
-        let mut last_prompt_tokens: u32 = 0;
+        // Store assistant reply in history + DB
+        if !final_content.is_empty() {
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.history.push(ChatMessage::assistant(Some(final_content.clone()), None));
+                }
+            }
+            let _ = self.memory.store_conversation(&ConversationEntry {
+                role: "user".into(), content: content.to_string(),
+                timestamp: chrono::Utc::now(), session_id, model_used: None,
+            }).await;
+            let _ = self.memory.store_conversation(&ConversationEntry {
+                role: "assistant".into(), content: final_content.clone(),
+                timestamp: chrono::Utc::now(), session_id,
+                model_used: Some(model_for_stats.clone()),
+            }).await;
+        }
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        emit(AgentEvent::Done(ChatStatsData {
+            model: model_for_stats,
+            prompt_tokens: stats.last_prompt_tokens,
+            completion_tokens: stats.total_completion,
+            duration_ms,
+            context_length: stats.last_prompt_tokens,
+            prefill_tps: stats.prefill_tps(),
+            decode_tps: stats.decode_tps(),
+        }));
+    }
+
+    /// Run the planner→executor→reviewer pipeline for Complex queries.
+    /// Returns (final_content, model_name_for_stats).
+    async fn run_pipeline(
+        &self,
+        session_id: Uuid,
+        user_prompt: &str,
+        base_system_prompt: &str,
+        planner: &str,
+        executor: &str,
+        reviewer: &str,
+        cancel_token: &CancellationToken,
+        scope: &Arc<Mutex<PermissionScope>>,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        stats: &mut StatsAccum,
+    ) -> (String, String) {
+        let mut tool_history = Vec::new();
+
+        // ── 1. Planner: decompose the user prompt into specific instructions ──
+        if cancel_token.is_cancelled() {
+            return (String::new(), executor.to_string());
+        }
+
+        emit(AgentEvent::ToolEvent {
+            name: "planner".into(), status: ToolStatus::Started,
+            detail: "decomposing prompt".into(),
+        });
+
+        let plan = self.call_planner(planner, user_prompt, cancel_token).await;
+        if cancel_token.is_cancelled() {
+            return (String::new(), executor.to_string());
+        }
+
+        emit(AgentEvent::ToolEvent {
+            name: "planner".into(), status: ToolStatus::Finished,
+            detail: plan.chars().take(200).collect(),
+        });
+
+        // Inject the plan into the system prompt for the executor
+        let executor_prompt = format!(
+            "{base_system_prompt}\n\n## Plan from planner\nThe planner has decomposed the user's request into the following steps. Follow this plan:\n\n{plan}"
+        );
+
+        // ── 2. Executor: run the tool loop with the plan ──
+        let mut executor_output = self.run_tool_loop(
+            session_id, executor, &executor_prompt, cancel_token,
+            scope, emit, stats, &mut tool_history,
+        ).await;
+
+        // ── 3. Reviewer: evaluate the executor's output ──
+        for revision_round in 0..MAX_REVISION_ROUNDS {
+            if cancel_token.is_cancelled() {
+                break;
+            }
+
+            emit(AgentEvent::ToolEvent {
+                name: "reviewer".into(), status: ToolStatus::Started,
+                detail: format!("review round {}", revision_round + 1),
+            });
+
+            let (approved, feedback) = self.call_reviewer(
+                reviewer, user_prompt, &executor_output, cancel_token,
+            ).await;
+
+            if cancel_token.is_cancelled() {
+                break;
+            }
+
+            if approved {
+                emit(AgentEvent::ToolEvent {
+                    name: "reviewer".into(), status: ToolStatus::Finished,
+                    detail: "approved".into(),
+                });
+                break;
+            }
+
+            emit(AgentEvent::ToolEvent {
+                name: "reviewer".into(), status: ToolStatus::Finished,
+                detail: format!("revision needed: {}", feedback.chars().take(200).collect::<String>()),
+            });
+
+            // Inject revision feedback as a user message in session history
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.history.push(ChatMessage::assistant(
+                        Some(executor_output.clone()), None,
+                    ));
+                    s.history.push(ChatMessage::user(&format!(
+                        "The reviewer has feedback on your work. Please revise:\n\n{feedback}"
+                    )));
+                }
+            }
+
+            // Run executor again with the revision feedback
+            executor_output = self.run_tool_loop(
+                session_id, executor, &executor_prompt, cancel_token,
+                scope, emit, stats, &mut tool_history,
+            ).await;
+        }
+
+        (executor_output, executor.to_string())
+    }
+
+    /// Call the planner model to decompose a user prompt into a structured plan.
+    async fn call_planner(
+        &self,
+        model: &str,
+        user_prompt: &str,
+        _cancel_token: &CancellationToken,
+    ) -> String {
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage::system(
+                    "You are a planning assistant. Given a user's request, decompose it into \
+                     specific, actionable steps for a coding agent. Be concise but precise. \
+                     Include:\n\
+                     - What files to read or modify\n\
+                     - What commands to run\n\
+                     - What the expected outcome looks like\n\
+                     - Potential pitfalls to watch for\n\
+                     Output just the plan, no preamble."
+                ),
+                ChatMessage::user(user_prompt),
+            ],
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(2048),
+            temperature: Some(0.3),
+        };
+
+        match self.litellm.chat(req).await {
+            Ok(resp) => {
+                if let Some(choice) = resp.choices.first() {
+                    if let Some(content) = choice.message.content.as_deref() {
+                        return content.trim().to_string();
+                    }
+                }
+                "No plan generated — proceed directly.".into()
+            }
+            Err(e) => {
+                tracing::warn!("Planner call failed: {e}");
+                format!("(planner error: {e} — proceed directly)")
+            }
+        }
+    }
+
+    /// Call the reviewer model to evaluate the executor's output.
+    /// Returns (approved, feedback). feedback is empty if approved.
+    async fn call_reviewer(
+        &self,
+        model: &str,
+        user_prompt: &str,
+        executor_output: &str,
+        _cancel_token: &CancellationToken,
+    ) -> (bool, String) {
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage::system(
+                    "You are a code reviewer. Evaluate whether the assistant's response \
+                     correctly and completely addresses the user's request.\n\n\
+                     Respond with EXACTLY one of:\n\
+                     - APPROVED\n\
+                     - REVISE: <specific feedback on what to fix>\n\n\
+                     Be strict but fair. Only approve if the work is correct and complete."
+                ),
+                ChatMessage::user(&format!(
+                    "## Original user request\n{user_prompt}\n\n\
+                     ## Assistant's response\n{executor_output}"
+                )),
+            ],
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(1024),
+            temperature: Some(0.2),
+        };
+
+        match self.litellm.chat(req).await {
+            Ok(resp) => {
+                if let Some(choice) = resp.choices.first() {
+                    if let Some(content) = choice.message.content.as_deref() {
+                        let trimmed = content.trim();
+                        if trimmed.to_uppercase().starts_with("APPROVED") {
+                            return (true, String::new());
+                        }
+                        if let Some(feedback) = trimmed.strip_prefix("REVISE:") {
+                            return (false, feedback.trim().to_string());
+                        }
+                        // Unexpected format — treat as revision request
+                        return (false, trimmed.to_string());
+                    }
+                }
+                (true, String::new())
+            }
+            Err(e) => {
+                tracing::warn!("Reviewer call failed: {e}");
+                (true, String::new())
+            }
+        }
+    }
+
+    /// Run the streaming tool-use loop. Sends messages to the model, streams
+    /// deltas to the client, executes tool calls, and returns the final
+    /// content when the model produces a non-tool-call response.
+    async fn run_tool_loop(
+        &self,
+        session_id: Uuid,
+        model: &str,
+        system_prompt: &str,
+        cancel_token: &CancellationToken,
+        scope: &Arc<Mutex<PermissionScope>>,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        stats: &mut StatsAccum,
+        tool_call_history: &mut Vec<String>,
+    ) -> String {
         let mut final_content = String::new();
-        let mut total_prefill_ms: u64 = 0;
-        let mut total_decode_ms: u64 = 0;
-        let mut total_prefill_tokens: u32 = 0;
-        let mut tool_call_history: Vec<String> = Vec::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
             if cancel_token.is_cancelled() {
@@ -281,7 +580,7 @@ impl Agent {
                 break;
             }
 
-            let mut messages = vec![ChatMessage::system(system_prompt.clone())];
+            let mut messages = vec![ChatMessage::system(system_prompt.to_string())];
             {
                 let sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get(&session_id) {
@@ -292,7 +591,7 @@ impl Agent {
 
             let tools = self.tools.lock().await.clone();
             let req = ChatRequest {
-                model: model.clone(),
+                model: model.to_string(),
                 messages,
                 tools: if tools.is_empty() { None } else { Some(tools) },
                 stream: Some(true),
@@ -313,7 +612,7 @@ impl Agent {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
                     let litellm = self.litellm.clone();
                     let req_clone = req.clone();
-                    tokio::spawn(async move {
+                    let stream_handle = tokio::spawn(async move {
                         litellm.chat_stream(req_clone, tx).await;
                     });
 
@@ -332,16 +631,19 @@ impl Agent {
                             StreamEvent::Error(e) => { attempt_error = Some(e); break; }
                         }
                     }
+                    // Always abort the stream task — either it finished naturally
+                    // (handle is already done) or we broke out due to cancel/error.
+                    stream_handle.abort();
 
                     if stream_result.is_some() {
                         let round_end = Instant::now();
                         match stream_first_delta {
                             Some(t_first) => {
-                                total_prefill_ms += t_first.duration_since(stream_round_start).as_millis() as u64;
-                                total_decode_ms += round_end.duration_since(t_first).as_millis() as u64;
+                                stats.total_prefill_ms += t_first.duration_since(stream_round_start).as_millis() as u64;
+                                stats.total_decode_ms += round_end.duration_since(t_first).as_millis() as u64;
                             }
                             None => {
-                                total_prefill_ms += round_end.duration_since(stream_round_start).as_millis() as u64;
+                                stats.total_prefill_ms += round_end.duration_since(stream_round_start).as_millis() as u64;
                             }
                         }
                         break;
@@ -382,9 +684,9 @@ impl Agent {
             if cancel_token.is_cancelled() { break; }
 
             if let Some(u) = &result.usage {
-                total_completion += u.completion_tokens;
-                total_prefill_tokens += u.prompt_tokens;
-                last_prompt_tokens = u.prompt_tokens;
+                stats.total_completion += u.completion_tokens;
+                stats.total_prefill_tokens += u.prompt_tokens;
+                stats.last_prompt_tokens = u.prompt_tokens;
             }
 
             if result.tool_calls.is_empty() {
@@ -465,49 +767,7 @@ impl Agent {
             }
         }
 
-        // Clean up cancellation token
-        self.cancel_tokens.lock().await.remove(&session_id);
-
-        // Store assistant reply in history + DB
-        if !final_content.is_empty() {
-            {
-                let mut sessions = self.sessions.lock().await;
-                if let Some(s) = sessions.get_mut(&session_id) {
-                    s.history.push(ChatMessage::assistant(Some(final_content.clone()), None));
-                }
-            }
-            let _ = self.memory.store_conversation(&ConversationEntry {
-                role: "user".into(), content: content.to_string(),
-                timestamp: chrono::Utc::now(), session_id, model_used: None,
-            }).await;
-            let _ = self.memory.store_conversation(&ConversationEntry {
-                role: "assistant".into(), content: final_content.clone(),
-                timestamp: chrono::Utc::now(), session_id,
-                model_used: Some(model.clone()),
-            }).await;
-        }
-
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let prefill_tps = if total_prefill_ms > 0 {
-            total_prefill_tokens as f64 / (total_prefill_ms as f64 / 1000.0)
-        } else { 0.0 };
-        let decode_tps = if total_decode_ms > 0 {
-            total_completion as f64 / (total_decode_ms as f64 / 1000.0)
-        } else { 0.0 };
-        emit(AgentEvent::Done(ChatStatsData {
-            model, prompt_tokens: last_prompt_tokens,
-            completion_tokens: total_completion, duration_ms,
-            context_length: last_prompt_tokens, prefill_tps, decode_tps,
-        }));
-    }
-
-    async fn rollback_last_user_message(&self, session_id: Uuid) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.get_mut(&session_id) {
-            if s.history.last().map(|m| m.role.as_str()) == Some("user") {
-                s.history.pop();
-            }
-        }
+        final_content
     }
 
     /// Build system prompt with personality, user memories, code rules, and CWD detection.
@@ -542,7 +802,7 @@ impl Agent {
         };
 
         // CWD-based project detection
-        let project_section = detect_project_context(cwd);
+        let project_section = detect_project_context(cwd).await;
 
         format!(
             "{personality}
@@ -551,8 +811,13 @@ You are renco, an agentic coding assistant running on {username}'s own hardware.
 You are talking to {username} right now.{user_section}{skills_section}
 
 ## Available tools
-You have tools for filesystem access, shell commands, web search/fetch, NixOS
-queries, arXiv, and library docs (context7). Use them when they help.
+You have tools for filesystem access, shell commands, persistent memory, web
+search/fetch, NixOS queries, arXiv, and library docs (context7). Use them when
+they help. Use `save_memory` to remember facts about the user, their
+preferences, ongoing projects, or anything worth recalling in future sessions.
+If this is the first time you're talking to {username} and you don't know them
+yet, ask a few brief questions (name, what they do, coding preferences, main
+projects) and use `save_memory` to store the answers.
 
 ## Code rules (hardcoded — always follow)
 - Prefer slightly verbose, self-explanatory code over terse code that needs comments.
@@ -663,7 +928,15 @@ queries, arXiv, and library docs (context7). Use them when they help.
                     let s = scope.lock().await;
                     s.cwd()
                 };
-                self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+
+                // Check if command is dangerous — always prompt, even in Yolo
+                if is_dangerous_command(command) {
+                    self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+                }
+                // Safe read-only commands skip the permission check entirely
+                if !is_safe_command(command) {
+                    self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+                }
 
                 let output = tokio::process::Command::new("sh")
                     .arg("-c")
@@ -685,6 +958,20 @@ queries, arXiv, and library docs (context7). Use them when they help.
                 Ok(out)
             }
 
+            "save_memory" => {
+                let key = args["key"].as_str().ok_or("missing key")?;
+                let value = args["value"].as_str().ok_or("missing value")?;
+                let username = {
+                    let sessions = self.sessions.lock().await;
+                    sessions.get(&session_id)
+                        .map(|s| s.username.clone())
+                        .unwrap_or_else(|| "global".into())
+                };
+                self.memory.set_memory(key, value, &username).await
+                    .map_err(|e| format!("save_memory: {e}"))?;
+                Ok(format!("Saved memory: {key} = {value}"))
+            }
+
             _ => self.mcp.call_tool(name, args).await,
         }
     }
@@ -699,7 +986,7 @@ queries, arXiv, and library docs (context7). Use them when they help.
     ) -> Result<(), String> {
         let verdict = {
             let s = scope.lock().await;
-            s.check_access(path, access).map(|_| ()).map_err(|p| p)
+            s.check_access(path, access).await
         };
 
         match verdict {
@@ -721,69 +1008,6 @@ queries, arXiv, and library docs (context7). Use them when they help.
                 }
             }
         }
-    }
-
-    /// Run the /initial onboarding flow. Asks questions, stores answers.
-    pub async fn run_onboarding(
-        &self,
-        session_id: Uuid,
-        emit: &(dyn Fn(AgentEvent) + Send + Sync),
-    ) {
-        let username = {
-            let sessions = self.sessions.lock().await;
-            match sessions.get(&session_id) {
-                Some(s) => s.username.clone(),
-                None => return,
-            }
-        };
-
-        let questions = vec![
-            ("name", "What's your name? (This helps me address you naturally.)"),
-            ("role", "What do you do? (e.g., physicist, software engineer, student)"),
-            ("preferences", "Any coding preferences I should know? (editor, language, style)"),
-            ("projects", "What are your main projects? (Brief — I'll learn the rest as we go.)"),
-        ];
-
-        for (key, question) in &questions {
-            emit(AgentEvent::OnboardingQuestion(question.to_string()));
-
-            // Wait for the user's response (which will arrive as a ChatInput
-            // and be stored in session history; the server loop handles this
-            // by calling process_onboarding_answer)
-            //
-            // For now, we use a simpler approach: the onboarding is driven
-            // by the client sending /initial, then each answer as a normal
-            // message tagged with a special prefix. The server detects this
-            // and routes to this function.
-            //
-            // Actually simplest: ask all questions at once, let the model
-            // conduct the conversation naturally, and have it store answers
-            // via a write_memory tool. But that's complex.
-            //
-            // Pragmatic approach: ask one question, the client displays it,
-            // the user's next message is the answer. The server intercepts
-            // and stores it. This requires the server to track onboarding
-            // state per session.
-            //
-            // For now, just ask all questions as a single message and let
-            // the model handle the conversation. The model will use
-            // set_memory tool calls (which we need to add) to store answers.
-            //
-            // This is a TODO — for now, we'll ask all questions at once
-            // and the model will store them using write_file to a known
-            // location, then the cron job picks them up.
-            //
-            // Actually, the cleanest implementation: just ask all questions
-            // in one go, and when the user answers, the model is instructed
-            // to use a "save_memory" tool to persist them.
-            let _ = (key, question);
-        }
-
-        // Mark as onboarded
-        let _ = self.memory.set_memory("onboarded", "true", &username).await;
-
-        // Generate a session title
-        self.generate_session_title(session_id).await;
     }
 
     /// Generate a short title for the session using the small model.
@@ -876,7 +1100,7 @@ queries, arXiv, and library docs (context7). Use them when they help.
         );
 
         let req = ChatRequest {
-            model: self.default_model.clone(),
+            model: self.models.default_model.clone(),
             messages: vec![ChatMessage::user(&prompt)],
             tools: None,
             stream: Some(false),
@@ -964,51 +1188,91 @@ fn local_tools() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "save_memory".into(),
+                description: "Save a key-value memory that persists across sessions. Use this to remember facts about the user, their preferences, ongoing projects, or anything worth recalling later.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Short identifier (e.g. 'name', 'preferred_editor', 'project_x')."},
+                        "value": {"type": "string", "description": "The value to remember."},
+                    },
+                    "required": ["key", "value"],
+                }),
+            },
+        },
     ]
 }
 
 /// Detect project type from CWD contents and return language-specific context.
-fn detect_project_context(cwd: &str) -> String {
+async fn detect_project_context(cwd: &str) -> String {
     let cwd_path = std::path::Path::new(cwd);
     let mut detected: Vec<String> = Vec::new();
 
     // Check for Rust
-    if cwd_path.join("Cargo.toml").exists() {
+    if tokio::fs::try_exists(cwd_path.join("Cargo.toml")).await.unwrap_or(false) {
         detected.push("Rust project detected (Cargo.toml found). Follow Rust conventions.".into());
     }
 
     // Check for Nix flake
-    if cwd_path.join("flake.nix").exists() {
+    if tokio::fs::try_exists(cwd_path.join("flake.nix")).await.unwrap_or(false) {
         detected.push("Nix flake detected. Use nix run/nix shell/nix build. Never nix-shell.".into());
     }
 
     // Check for ROOT/C++
-    if cwd_path.join("CMakeLists.txt").exists()
-        || std::fs::read_dir(cwd_path)
-            .map(|d| d.filter_map(|e| e.ok())
-                .any(|e| {
-                    let n = e.file_name().to_string_lossy().to_string();
-                    n.ends_with(".C") || n.ends_with(".cpp") || n.ends_with(".cxx")
-                }))
-            .unwrap_or(false)
-    {
+    let has_cpp = tokio::fs::try_exists(cwd_path.join("CMakeLists.txt")).await.unwrap_or(false);
+    let has_cpp_ext = if !has_cpp {
+        let mut entries = match tokio::fs::read_dir(cwd_path).await {
+            Ok(e) => Some(e),
+            Err(_) => None,
+        };
+        let mut found = false;
+        if let Some(entries) = entries.as_mut() {
+            while let Ok(Some(e)) = entries.next_entry().await {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.ends_with(".C") || n.ends_with(".cpp") || n.ends_with(".cxx") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        found
+    } else {
+        true
+    };
+    if has_cpp_ext {
         detected.push("ROOT/C++ project detected. Use ROOT types (Int_t, Double_t, etc.). No modern C++ (no auto, no smart pointers, no lambdas).".into());
     }
 
     // Check for Python
-    if cwd_path.join("pyproject.toml").exists()
-        || cwd_path.join("setup.py").exists()
-        || std::fs::read_dir(cwd_path)
-            .map(|d| d.filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().ends_with(".py"))
-            )
-            .unwrap_or(false)
-    {
+    let has_py = tokio::fs::try_exists(cwd_path.join("pyproject.toml")).await.unwrap_or(false)
+        || tokio::fs::try_exists(cwd_path.join("setup.py")).await.unwrap_or(false);
+    let has_py_ext = if !has_py {
+        let mut entries = match tokio::fs::read_dir(cwd_path).await {
+            Ok(e) => Some(e),
+            Err(_) => None,
+        };
+        let mut found = false;
+        if let Some(entries) = entries.as_mut() {
+            while let Ok(Some(e)) = entries.next_entry().await {
+                if e.file_name().to_string_lossy().ends_with(".py") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        found
+    } else {
+        true
+    };
+    if has_py_ext {
         detected.push("Python project detected.".into());
     }
 
-    // Try to read project name from Cargo.toml or flake.nix
-    if let Ok(content) = std::fs::read_to_string(cwd_path.join("Cargo.toml")) {
+    // Try to read project name from Cargo.toml
+    if let Ok(content) = tokio::fs::read_to_string(cwd_path.join("Cargo.toml")).await {
         for line in content.lines() {
             if let Some(name) = line.strip_prefix("name = ") {
                 detected.push(format!("Project name: {}", name.trim().trim_matches('"')));
@@ -1041,4 +1305,61 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…[truncated {} bytes]", &s[..max], s.len() - max)
     }
+}
+
+/// Read-only commands that are safe to run without prompting.
+const SAFE_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "fd", "tree",
+    "pwd", "whoami", "hostname", "uname", "date", "uptime",
+    "wc", "sort", "uniq", "diff", "cmp", "file", "stat", "du", "df",
+    "git", "cargo", "rustc", "nix", "nixos-version",
+    "python", "python3", "pip", "pip3",
+    "echo", "printf", "which", "type", "env", "printenv",
+    "test", "true", "false",
+    "head", "less", "more",
+    "man", "info",
+    "ps", "top", "htop", "free", "lspci", "lsusb", "lsblk",
+];
+
+/// Patterns that indicate a dangerous command — always prompt.
+const DANGEROUS_PATTERNS: &[&str] = &[
+    "rm -rf", "rm -fr", "rm -r /", "rm -rf /",
+    "mkfs", "dd if=", "dd of=/dev/",
+    "shutdown", "reboot", "halt", "poweroff",
+    ":(){", "fork bomb",
+    "> /dev/sd", "> /dev/nvme", "> /dev/mmc",
+    "chmod -R 777", "chmod 777",
+    "systemctl stop", "systemctl disable",
+    "kill -9", "killall",
+    "pkill", "kill -KILL",
+    "iptables -F", "ip6tables -F",
+    "mount", "umount",
+    "fdisk", "parted", "wipefs",
+    "shred", "scrub",
+    "git push --force", "git push -f",
+    "nix-collect-garbage -d",
+    "chmod", "chown",
+    "visudo",
+    "passwd",
+    "useradd", "userdel", "usermod",
+    "groupadd", "groupdel",
+];
+
+/// Returns true if the command is safe to run without a permission prompt.
+fn is_safe_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    // Get the first word (handle pipes/redirects by splitting on them)
+    let first_word = trimmed
+        .split(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == '&')
+        .next()
+        .unwrap_or("")
+        .trim();
+    SAFE_COMMANDS.iter().any(|&safe| first_word == safe)
+}
+
+/// Returns true if the command matches a dangerous pattern and should
+/// always prompt, even in Yolo mode.
+fn is_dangerous_command(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    DANGEROUS_PATTERNS.iter().any(|&pat| lower.contains(pat))
 }
