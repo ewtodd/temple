@@ -191,6 +191,8 @@ in
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
+
     users.users.temple = {
       isSystemUser = true;
       group = "temple";
