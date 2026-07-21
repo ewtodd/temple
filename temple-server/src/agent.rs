@@ -387,11 +387,12 @@ impl Agent {
                 );
                 match ssh.execute(&cmd).await {
                     Ok(pwd) => {
-                        let pwd = pwd.trim();
-                        if pwd.starts_with('/') {
-                            pwd.to_string()
-                        } else {
-                            cwd // unexpected output — keep home dir
+                        // ssh.execute never errs on non-zero exit (it
+                        // embeds "[exit N]"), and MOTD/banner noise can
+                        // surround the path — pick the path-looking line.
+                        match pwd.lines().map(str::trim).find(|l| l.starts_with('/')) {
+                            Some(p) => p.to_string(),
+                            None => cwd, // unexpected output — keep home dir
                         }
                     }
                     Err(_) => cwd, // ssh failed — keep home dir
