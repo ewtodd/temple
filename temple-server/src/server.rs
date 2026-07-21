@@ -377,6 +377,7 @@ async fn handle_connection(
                 if let Some(ref p) = permissions {
                     p.lock().await.set_mode(mode);
                 }
+                agent.set_session_mode(sid, mode).await;
                 let _ = tx.send(ServerMessage::ModeChanged { session_id: sid, mode });
             }
 

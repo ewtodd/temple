@@ -126,12 +126,14 @@ struct SessionCtx {
     /// SSH target name (e.g. "e-work@e-desktop") for persistence/display
     ssh_target_name: Option<String>,
     /// Person who owns this session (token username, e.g. "ethan").
-    /// Sessions are persisted and listed under this name.
     owner: String,
     /// Session title (generated after first exchange)
     title: Option<String>,
     /// Whether this session should be persisted to the DB
     persist: bool,
+    /// Permission mode, persisted and restored on resume.
+    /// SSH sessions can never be Yolo.
+    permission_mode: PermissionMode,
 }
 
 pub struct Agent {
@@ -283,6 +285,7 @@ impl Agent {
                 owner: username.to_string(),
                 title: None,
                 persist: false,
+                permission_mode: PermissionMode::Default,
             },
         );
     }
@@ -296,17 +299,24 @@ impl Agent {
         ssh_target: Option<&str>,
     ) -> Result<Uuid, String> {
         let session_id = Uuid::new_v4();
-        let (ssh, kind, cwd) = match ssh_target {
+        let (ssh, kind, cwd, full_name) = match ssh_target {
             Some(name) => {
-                let ssh = self.make_ssh(name)
-                    .ok_or_else(|| format!(
-                        "unknown ssh target: {name} (available: {})",
-                        self.ssh_target_names().join(", ")
-                    ))?;
+                // Prefix-match against configured targets (Signal strips @)
+                let target = self.ssh_targets.iter().find(|t| {
+                    t.name == name
+                        || t.name.starts_with(&format!("{name}@"))
+                        || t.account == name
+                }).cloned()
+                .ok_or_else(|| format!(
+                    "unknown ssh target: {name} (available: {})",
+                    self.ssh_target_names().join(", ")
+                ))?;
+                let ssh = self.make_ssh(&target.name)
+                    .ok_or_else(|| "ssh key not configured".to_string())?;
                 let cwd = ssh.home_dir().await.unwrap_or_else(|_| "~".into());
-                (Some(ssh), SessionKind::Coding, cwd)
+                (Some(ssh), SessionKind::Coding, cwd, target.name)
             }
-            None => (None, SessionKind::Quick, "/var/lib/temple".to_string()),
+            None => (None, SessionKind::Quick, "/var/lib/temple".to_string(), "quick".to_string()),
         };
 
         let mut sessions = self.sessions.lock().await;
@@ -320,10 +330,11 @@ impl Agent {
                 initialized: true,
                 kind,
                 ssh,
-                ssh_target_name: ssh_target.map(|s| s.to_string()),
+                ssh_target_name: Some(full_name),
                 owner: owner.to_string(),
                 title: None,
                 persist: true,
+                permission_mode: PermissionMode::Default,
             },
         );
         drop(sessions);
@@ -391,6 +402,7 @@ impl Agent {
                 owner: row.username,
                 title: row.title,
                 persist: true,
+                permission_mode: PermissionMode::Default,
             },
         );
 
@@ -411,7 +423,7 @@ impl Agent {
                 username: s.owner.clone(),
                 ssh_target: s.ssh_target_name.clone(),
                 cwd: s.cwd.clone(),
-                mode: "default".into(),
+                mode: format!("{:?}", s.permission_mode).to_lowercase(),
                 kind: match s.kind {
                     SessionKind::Coding => "coding".into(),
                     SessionKind::Quick => "quick".into(),
@@ -505,6 +517,29 @@ impl Agent {
         if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
             s.model = model.to_string();
         }
+    }
+
+    /// Set the permission mode for a session. SSH sessions cannot use
+    /// Yolo — silently downgraded. Persisted immediately if durable.
+    pub async fn set_session_mode(&self, session_id: Uuid, mode: PermissionMode) {
+        let effective = {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                let effective = if s.ssh.is_some() && mode == PermissionMode::Yolo {
+                    tracing::warn!("Yolo rejected for SSH session {session_id} — using default");
+                    PermissionMode::Default
+                } else {
+                    mode
+                };
+                s.permission_mode = effective;
+                effective
+            } else {
+                return;
+            }
+        };
+        // No need to re-read — we know it might be persistable
+        self.persist_session(session_id).await;
+        let _ = effective;
     }
 
     pub async fn session_model(&self, session_id: Uuid) -> String {

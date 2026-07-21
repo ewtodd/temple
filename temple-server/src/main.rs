@@ -180,6 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let active_sessions: Arc<Mutex<std::collections::HashMap<String, uuid::Uuid>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let active_for_handler = active_sessions.clone();
+            // Pending permission requests: sender → (request_id, session_id)
+            let pending_perms: Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid)>>> =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let perms_for_handler = pending_perms.clone();
             let handler = Arc::new(move |sender: String, message: String, timestamp: u64| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
@@ -187,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let memory = memory_for_handler.clone();
                 let token_file = token_file_for_handler.clone();
                 let active = active_for_handler.clone();
+                let perms = perms_for_handler.clone();
                 tokio::spawn(async move {
                     tracing::info!("signal inbound from {sender}: {message:.60}");
 
@@ -233,6 +238,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // ── Session commands ──
                     let trimmed = message.trim();
+
+                    // ── Pending permission reply (y/N) ──
+                    {
+                        let pending = perms.lock().await.get(&sender).copied();
+                        if let Some((request_id, _sid)) = pending {
+                            let lower = trimmed.to_lowercase();
+                            let granted = lower == "y" || lower == "yes" || lower == "allow";
+                            if granted || lower == "n" || lower == "no" || lower == "deny" {
+                                perms.lock().await.remove(&sender);
+                                agent.permissions.resolve(request_id, granted).await;
+                                signal.send(&sender,
+                                    if granted { "ok, proceeding" } else { "denied" }
+                                ).await.ok();
+                                return;
+                            }
+                        }
+                    }
 
                     if trimmed == "/help" {
                         signal.send(&sender,
@@ -371,11 +393,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
 
+                    let sender_for_emit = sender.clone();
+                    let signal_for_emit = signal.clone();
+                    let perms_for_emit = perms.clone();
                     let response = Arc::new(std::sync::Mutex::new(String::new()));
                     let resp = response.clone();
                     let emit = move |ev: agent::AgentEvent| {
-                        if let agent::AgentEvent::Delta(d) = ev {
-                            response.lock().unwrap().push_str(&d);
+                        match ev {
+                            agent::AgentEvent::PermissionNeeded(req) => {
+                                // Intercept — send a Signal prompt and store the
+                                // request so the reply resolves it.
+                                let path = req.path.chars().take(200).collect::<String>();
+                                tokio::spawn({
+                                    let signal = signal_for_emit.clone();
+                                    let sender = sender_for_emit.clone();
+                                    let perms = perms_for_emit.clone();
+                                    let request_id = req.request_id;
+                                    let session_id = req.session_id;
+                                    async move {
+                                        perms.lock().await.insert(
+                                            sender.clone(),
+                                            (request_id, session_id),
+                                        );
+                                        signal.send(&sender, &format!(
+                                            "Allow {path}? Reply y or N (300s timeout)"
+                                        )).await.ok();
+                                    }
+                                });
+                            }
+                            agent::AgentEvent::Delta(d) => {
+                                response.lock().unwrap().push_str(&d);
+                            }
+                            _ => {}
                         }
                     };
                     agent
