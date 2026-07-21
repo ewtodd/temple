@@ -292,25 +292,33 @@ async fn handle_connection(
                 let agent = agent.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let emit = move |ev: AgentEvent| {
-                        let msg = match ev {
-                            AgentEvent::Delta(d) => ServerMessage::ChatDelta {
+                let emit = move |ev: AgentEvent| {
+                    let msg = match ev {
+                        AgentEvent::Delta(d) => ServerMessage::ChatDelta {
+                            session_id: sid,
+                            delta: d,
+                            done: false,
+                        },
+                        AgentEvent::ToolEvent { name, status, detail } => {
+                            ServerMessage::ToolEvent {
                                 session_id: sid,
-                                delta: d,
-                                done: false,
-                            },
-                            AgentEvent::ToolEvent { name, status, detail } => {
-                                ServerMessage::ToolEvent {
-                                    session_id: sid,
-                                    name,
-                                    status,
-                                    detail,
-                                }
+                                name,
+                                status,
+                                detail,
                             }
-                            AgentEvent::PermissionNeeded(req) => {
-                                ServerMessage::PermissionRequired(req)
+                        }
+                        AgentEvent::PermissionNeeded(req) => {
+                            ServerMessage::PermissionRequired(req)
+                        }
+                        AgentEvent::ToolRequestNeeded { request_id, name, args_json } => {
+                            ServerMessage::ToolRequest {
+                                request_id,
+                                session_id: sid,
+                                name,
+                                args_json,
                             }
-                            AgentEvent::Done(stats) => {
+                        }
+                        AgentEvent::Done(stats) => {
                                 let _ = tx.send(ServerMessage::ChatDelta {
                                     session_id: sid,
                                     delta: String::new(),
@@ -343,6 +351,10 @@ async fn handle_connection(
 
             ClientMessage::PermissionReply { request_id, granted, .. } => {
                 agent.permissions.resolve(request_id, granted).await;
+            }
+
+            ClientMessage::ToolResult { request_id, result, .. } => {
+                agent.resolve_tool(request_id, result).await;
             }
 
             ClientMessage::ListModels => {

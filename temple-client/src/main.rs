@@ -70,6 +70,8 @@ struct AppState {
     permission: Option<(Uuid, Uuid, String)>,
     running: bool,
     editor_pending: bool,
+    /// Working directory for local tool execution
+    cwd: String,
     /// lines to scroll up from bottom (0 = follow tail)
     scroll: usize,
     /// mouse selection anchor (line, col) while dragging
@@ -125,10 +127,81 @@ fn spawn_ws(
             let s = state.clone();
             tokio::spawn(async move {
                 while let Some(msg) = conn.incoming.recv().await {
+                    // Handle ToolRequest outside the lock to avoid holding
+                    // std::sync::MutexGuard (which is !Send) across .await
+                    if let ServerMessage::ToolRequest { request_id, session_id, ref name, ref args_json } = msg {
+                        let cwd = { s.lock().unwrap().cwd.clone() };
+                        let tx_result = tx_session.clone();
+                        let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                        let result = match name.as_str() {
+                            "read_file" => {
+                                let path = args["path"].as_str().unwrap_or("");
+                                match tokio::fs::read_to_string(path).await {
+                                    Ok(content) => content,
+                                    Err(e) => format!("Error: {}", e),
+                                }
+                            }
+                            "write_file" => {
+                                let path = args["path"].as_str().unwrap_or("");
+                                let content = args["content"].as_str().unwrap_or("");
+                                if let Some(parent) = std::path::Path::new(path).parent() {
+                                    tokio::fs::create_dir_all(parent).await.ok();
+                                }
+                                match tokio::fs::write(path, content).await {
+                                    Ok(()) => format!("wrote {} ({} bytes)", path, content.len()),
+                                    Err(e) => format!("Error: {}", e),
+                                }
+                            }
+                            "list_dir" => {
+                                let path = args["path"].as_str().unwrap_or(".");
+                                match tokio::fs::read_dir(path).await {
+                                    Err(e) => format!("Error: {}", e),
+                                    Ok(mut entries) => {
+                                        let mut out = Vec::new();
+                                        while let Ok(Some(e)) = entries.next_entry().await {
+                                            let name = e.file_name().to_string_lossy().to_string();
+                                            let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                                            out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                                        }
+                                        out.join("\n")
+                                    }
+                                }
+                            }
+                            "execute_command" => {
+                                let command = args["command"].as_str().unwrap_or("");
+                                match tokio::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(command)
+                                    .current_dir(&cwd)
+                                    .output()
+                                    .await
+                                {
+                                    Err(e) => format!("Error: {}", e),
+                                    Ok(output) => {
+                                        let stdout = String::from_utf8_lossy(&output.stdout);
+                                        let stderr = String::from_utf8_lossy(&output.stderr);
+                                        let mut out = String::new();
+                                        if !stdout.is_empty() { out.push_str(&stdout); }
+                                        if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{}", stderr)); }
+                                        if !output.status.success() {
+                                            out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+                                        }
+                                        if out.is_empty() { out.push_str("(no output)"); }
+                                        out
+                                    }
+                                }
+                            }
+                            _ => format!("Error: unknown tool {}", name),
+                        };
+                        let _ = tx_result.send(ClientMessage::ToolResult { request_id, session_id, result });
+                        continue;
+                    }
+
                     let mut s = s.lock().unwrap();
                     match msg {
                         ServerMessage::SessionOpened { session_id, info } => {
                             s.session_id = session_id;
+                            s.cwd = info.cwd.clone();
                             s.entries.push(ChatEntry::System(format!(
                                 "session on {}", info.hostname
                             )));
@@ -273,7 +346,7 @@ fn spawn_ws(
                             }
                             s.scroll = 0;
                         }
-                        ServerMessage::Pong | ServerMessage::SessionClosed { .. } => {}
+                        ServerMessage::Pong | ServerMessage::SessionClosed { .. } | ServerMessage::ToolResult { .. } | ServerMessage::ToolRequest { .. } => {}
                     }
                 }
             });
@@ -961,6 +1034,7 @@ fn main() {
         permission: None,
         running: true,
         editor_pending: false,
+        cwd: ".".into(),
         scroll: 0,
         sel_anchor: None,
         selection: None,

@@ -86,6 +86,12 @@ pub enum ClientMessage {
     },
     /// Cancel an in-progress agent loop for this session
     CancelChat { session_id: Uuid },
+    /// Result of a tool execution requested by the server
+    ToolResult {
+        request_id: Uuid,
+        session_id: Uuid,
+        result: String,
+    },
     /// List persisted sessions for the authenticated user
     ListSessions,
     /// Resume a persisted session (loads history + SSH target)
@@ -149,6 +155,19 @@ pub enum ServerMessage {
         meta: SessionMeta,
         /// (role, content) pairs of prior user/assistant turns
         transcript: Vec<(String, String)>,
+    },
+    /// Server requests the client to execute a local tool.
+    ToolRequest {
+        request_id: Uuid,
+        session_id: Uuid,
+        name: String,
+        args_json: String,
+    },
+    /// Client response with the result of a tool execution.
+    ToolResult {
+        request_id: Uuid,
+        session_id: Uuid,
+        result: String, // Ok result or "Error: ..." prefix
     },
     /// Chat statistics (sent after final delta)
     ChatStats {

@@ -63,6 +63,12 @@ pub enum AgentEvent {
     PermissionNeeded(PermissionRequest),
     Done(ChatStatsData),
     Error(String),
+    /// Server requests the client to execute a local tool
+    ToolRequestNeeded {
+        request_id: Uuid,
+        name: String,
+        args_json: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +152,8 @@ pub struct Agent {
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
     /// Per-session cancellation tokens for in-progress agent loops
     cancel_tokens: Mutex<HashMap<Uuid, CancellationToken>>,
+    /// Pending tool requests: request_id → oneshot sender for the result
+    pending_tools: Mutex<HashMap<Uuid, oneshot::Sender<String>>>,
     pub models: ModelConfig,
     router_model: String,
     title_model: String,
@@ -172,6 +180,7 @@ impl Agent {
             permissions: Arc::new(PermissionResolver::new()),
             sessions: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
+            pending_tools: Mutex::new(HashMap::new()),
             router_model: "qwen3-4b-instruct".to_string(),
             title_model: "qwen3-4b-instruct".to_string(),
             models,
@@ -179,6 +188,22 @@ impl Agent {
             ssh_targets: Vec::new(),
             ssh_key_path: None,
             ssh_bastion: None,
+        }
+    }
+
+    /// Create a oneshot for a pending tool execution. The server sends a
+    /// ToolRequest to the client, who sends back a ToolResult which resolves
+    /// this channel.
+    pub async fn ask_tool(&self, request_id: Uuid) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_tools.lock().await.insert(request_id, tx);
+        rx
+    }
+
+    /// Resolve a pending tool request with the client's result.
+    pub async fn resolve_tool(&self, request_id: Uuid, result: String) {
+        if let Some(tx) = self.pending_tools.lock().await.remove(&request_id) {
+            let _ = tx.send(result);
         }
     }
 
@@ -1241,14 +1266,18 @@ You have filesystem access, shell commands, and persistent memory.
                     self.check_ssh_perm(session_id, &resolved, AccessKind::Read, ssh, emit).await?;
                     ssh.read_file(&resolved).await
                 } else {
-                    let resolved = {
-                        let s = scope.lock().await;
-                        s.resolve(std::path::Path::new(path))
-                    };
-                    self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit).await?;
-                    tokio::fs::read_to_string(&resolved)
-                        .await
-                        .map_err(|e| format!("read {}: {e}", resolved.display()))
+                    let request_id = Uuid::new_v4();
+                    let rx = self.ask_tool(request_id).await;
+                    emit(AgentEvent::ToolRequestNeeded {
+                        request_id,
+                        name: "read_file".to_string(),
+                        args_json: args_json.to_string(),
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(_)) => Err("tool request channel closed".into()),
+                        Err(_) => Err("tool request timed out".into()),
+                    }
                 }
             }
 
@@ -1260,18 +1289,18 @@ You have filesystem access, shell commands, and persistent memory.
                     self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
                     ssh.write_file(&resolved, content).await
                 } else {
-                    let resolved = {
-                        let s = scope.lock().await;
-                        s.resolve(std::path::Path::new(path))
-                    };
-                    self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
-                    if let Some(parent) = resolved.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
+                    let request_id = Uuid::new_v4();
+                    let rx = self.ask_tool(request_id).await;
+                    emit(AgentEvent::ToolRequestNeeded {
+                        request_id,
+                        name: "write_file".to_string(),
+                        args_json: args_json.to_string(),
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(_)) => Err("tool request channel closed".into()),
+                        Err(_) => Err("tool request timed out".into()),
                     }
-                    tokio::fs::write(&resolved, content)
-                        .await
-                        .map_err(|e| format!("write {}: {e}", resolved.display()))?;
-                    Ok(format!("wrote {} ({} bytes)", resolved.display(), content.len()))
                 }
             }
 
@@ -1282,21 +1311,18 @@ You have filesystem access, shell commands, and persistent memory.
                     self.check_ssh_perm(session_id, &resolved, AccessKind::ReadDir, ssh, emit).await?;
                     ssh.list_dir(&resolved).await
                 } else {
-                    let resolved = {
-                        let s = scope.lock().await;
-                        s.resolve(std::path::Path::new(path))
-                    };
-                    self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit).await?;
-                    let mut entries = tokio::fs::read_dir(&resolved)
-                        .await
-                        .map_err(|e| format!("readdir {}: {e}", resolved.display()))?;
-                    let mut out = Vec::new();
-                    while let Ok(Some(e)) = entries.next_entry().await {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                        out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                    let request_id = Uuid::new_v4();
+                    let rx = self.ask_tool(request_id).await;
+                    emit(AgentEvent::ToolRequestNeeded {
+                        request_id,
+                        name: "list_dir".to_string(),
+                        args_json: args_json.to_string(),
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(_)) => Err("tool request channel closed".into()),
+                        Err(_) => Err("tool request timed out".into()),
                     }
-                    Ok(out.join("\n"))
                 }
             }
 
@@ -1312,34 +1338,18 @@ You have filesystem access, shell commands, and persistent memory.
                     }
                     ssh.execute(command).await
                 } else {
-                    let cwd = {
-                        let s = scope.lock().await;
-                        s.cwd()
-                    };
-                    if is_dangerous_command(command) {
-                        self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+                    let request_id = Uuid::new_v4();
+                    let rx = self.ask_tool(request_id).await;
+                    emit(AgentEvent::ToolRequestNeeded {
+                        request_id,
+                        name: "execute_command".to_string(),
+                        args_json: args_json.to_string(),
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(_)) => Err("tool request channel closed".into()),
+                        Err(_) => Err("tool request timed out".into()),
                     }
-                    if !is_safe_command(command) {
-                        self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
-                    }
-                    let output = tokio::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(command)
-                        .current_dir(&cwd)
-                        .output()
-                        .await
-                        .map_err(|e| format!("spawn: {e}"))?;
-
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let mut out = String::new();
-                    if !stdout.is_empty() { out.push_str(&stdout); }
-                    if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{stderr}")); }
-                    if !output.status.success() {
-                        out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
-                    }
-                    if out.is_empty() { out.push_str("(no output)"); }
-                    Ok(out)
                 }
             }
 
