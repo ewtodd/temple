@@ -291,12 +291,12 @@ impl Agent {
     }
 
     /// Create a new persisted session for `owner`, optionally bound to an
-    /// SSH target. Returns the new session id, or Err if the target is
-    /// unknown.
+    /// SSH target and with an optional start directory (relative to $HOME).
     pub async fn new_persisted_session(
         &self,
         owner: &str,
         ssh_target: Option<&str>,
+        start_dir: Option<&str>,
     ) -> Result<Uuid, String> {
         let session_id = Uuid::new_v4();
         let (ssh, kind, cwd, full_name) = match ssh_target {
@@ -317,6 +317,21 @@ impl Agent {
                 (Some(ssh), SessionKind::Coding, cwd, target.name)
             }
             None => (None, SessionKind::Quick, "/var/lib/temple".to_string(), "quick".to_string()),
+        };
+
+        // If a start_dir was given and we have an SSH executor, cd into it
+        let cwd = if let (Some(ref ssh), Some(dir)) = (&ssh, start_dir) {
+            if dir.is_empty() {
+                cwd
+            } else {
+                let cmd = format!("cd ~/{} && pwd", shell_escape(dir));
+                match ssh.execute(&cmd).await {
+                    Ok(pwd) => pwd.trim().to_string(),
+                    Err(_) => cwd, // cd failed — keep home dir
+                }
+            }
+        } else {
+            cwd
         };
 
         let mut sessions = self.sessions.lock().await;
@@ -1665,6 +1680,11 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…[truncated {} bytes]", &s[..max], s.len() - max)
     }
+}
+
+/// Minimal shell escaping for directory paths in ssh commands.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 /// Read-only commands that are safe to run without prompting.

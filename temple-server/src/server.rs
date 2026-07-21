@@ -239,7 +239,7 @@ async fn handle_connection(
 
             ClientMessage::NewSession { ssh_target } => {
                 let owner = auth_owner.clone().unwrap_or_default();
-                match agent.new_persisted_session(&owner, ssh_target.as_deref()).await {
+                match agent.new_persisted_session(&owner, ssh_target.as_deref(), None).await {
                     Ok(sid) => {
                         session_id = sid;
                         if permissions.is_none() {

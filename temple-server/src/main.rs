@@ -347,15 +347,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if trimmed == "/new" || trimmed.starts_with("/new ") {
-                        let target = trimmed.strip_prefix("/new").unwrap().trim();
-                        let target_opt = if target.is_empty() { None } else { Some(target) };
-                        match agent.new_persisted_session(&username, target_opt).await {
+                        let rest = trimmed.strip_prefix("/new").unwrap().trim();
+                        let parts: Vec<&str> = rest.splitn(3, ' ').filter(|p| !p.is_empty()).collect();
+                        let target = parts.first().copied();
+                        let subdir = parts.get(1).copied();
+                        match agent.new_persisted_session(&username, target, subdir).await {
                             Ok(sid) => {
                                 active.lock().await.insert(sender.clone(), sid);
                                 let id8: String = sid.simple().to_string().chars().take(8).collect();
                                 signal.send(&sender, &format!(
-                                    "📋 new session {id8} · {}",
-                                    target_opt.unwrap_or("quick")
+                                    "📋 new session {id8} · {}{}",
+                                    target.unwrap_or("quick"),
+                                    subdir.map(|d| format!(" · {d}")).unwrap_or_default(),
                                 )).await.ok();
                             }
                             Err(e) => {
