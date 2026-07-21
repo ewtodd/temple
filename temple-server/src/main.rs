@@ -134,6 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.models.clone(),
     );
     agent.set_local_endpoint(&cfg.local_llama_url, &cfg.local_llama_model);
+    agent.set_ssh_config(
+        cfg.ssh_targets.clone(),
+        cfg.ssh_bastion.clone(),
+        cfg.ssh_key_path.clone(),
+    );
     let agent = Arc::new(agent);
 
     // Load tools (local + MCP)
@@ -171,12 +176,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let signal_for_handler = signal.clone();
             let memory_for_handler = memory_for_signal.clone();
             let token_file_for_handler = cfg2.auth_token_file.clone();
+            // Per-sender active session (session id chosen via /session, /new)
+            let active_sessions: Arc<Mutex<std::collections::HashMap<String, uuid::Uuid>>> =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let active_for_handler = active_sessions.clone();
             let handler = Arc::new(move |sender: String, message: String, timestamp: u64| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
                 let memory = memory_for_handler.clone();
                 let token_file = token_file_for_handler.clone();
+                let active = active_for_handler.clone();
                 tokio::spawn(async move {
                     tracing::info!("signal inbound from {sender}: {message:.60}");
 
@@ -221,6 +231,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = memory.set_signal_user_uuid(&username, &sender).await;
                     }
 
+                    // ── Session commands ──
+                    let trimmed = message.trim();
+
+                    if trimmed == "/help" {
+                        signal.send(&sender,
+                            "commands:\n\
+                             /sessions — list your recent sessions\n\
+                             /session <id-prefix> — resume a session\n\
+                             /new <target> — new coding session (e.g. /new e-work@e-desktop)\n\
+                             /new — new quick session\n\
+                             /quick — back to the default quick session\n\
+                             /targets — list ssh targets\n\
+                             /help — this"
+                        ).await.ok();
+                        return;
+                    }
+
+                    if trimmed == "/targets" {
+                        let names = agent.ssh_target_names();
+                        let body = if names.is_empty() {
+                            "no ssh targets configured".to_string()
+                        } else {
+                            names.join("\n")
+                        };
+                        signal.send(&sender, &body).await.ok();
+                        return;
+                    }
+
+                    if trimmed == "/sessions" {
+                        match memory.list_sessions(&username, 10).await {
+                            Ok(rows) if !rows.is_empty() => {
+                                let mut body = String::from("recent sessions:\n");
+                                for r in &rows {
+                                    let id8: String = r.id.simple().to_string().chars().take(8).collect();
+                                    let target = r.ssh_target.as_deref().unwrap_or("quick");
+                                    let title = r.title.as_deref().unwrap_or("(untitled)");
+                                    body.push_str(&format!("• {id8} · {target} · {title}\n"));
+                                }
+                                body.push_str("\nresume with /session <id-prefix>");
+                                signal.send(&sender, &body).await.ok();
+                            }
+                            Ok(_) => {
+                                signal.send(&sender, "no sessions yet — /new <target> to start one").await.ok();
+                            }
+                            Err(e) => {
+                                signal.send(&sender, &format!("error listing sessions: {e}")).await.ok();
+                            }
+                        }
+                        return;
+                    }
+
+                    if let Some(prefix) = trimmed.strip_prefix("/session ") {
+                        let prefix = prefix.trim().to_lowercase();
+                        match memory.list_sessions(&username, 50).await {
+                            Ok(rows) => {
+                                let found = rows.iter().find(|r| {
+                                    r.id.simple().to_string().starts_with(&prefix)
+                                });
+                                match found {
+                                    Some(r) => {
+                                        let sid = r.id;
+                                        // Load into memory if not already there
+                                        if !agent.has_session(sid).await {
+                                            if let Err(e) = agent.resume_session(sid, &username).await {
+                                                signal.send(&sender, &format!("resume failed: {e}")).await.ok();
+                                                return;
+                                            }
+                                        }
+                                        active.lock().await.insert(sender.clone(), sid);
+                                        let target = r.ssh_target.as_deref().unwrap_or("quick");
+                                        let title = r.title.as_deref().unwrap_or("(untitled)");
+                                        signal.send(&sender, &format!(
+                                            "📋 resumed {target} · {title}"
+                                        )).await.ok();
+                                    }
+                                    None => {
+                                        signal.send(&sender, "no session matching that prefix").await.ok();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                signal.send(&sender, &format!("error: {e}")).await.ok();
+                            }
+                        }
+                        return;
+                    }
+
+                    if trimmed == "/quick" {
+                        active.lock().await.remove(&sender);
+                        signal.send(&sender, "📋 back to quick session").await.ok();
+                        return;
+                    }
+
+                    if trimmed == "/new" || trimmed.starts_with("/new ") {
+                        let target = trimmed.strip_prefix("/new").unwrap().trim();
+                        let target_opt = if target.is_empty() { None } else { Some(target) };
+                        match agent.new_persisted_session(&username, target_opt).await {
+                            Ok(sid) => {
+                                active.lock().await.insert(sender.clone(), sid);
+                                let id8: String = sid.simple().to_string().chars().take(8).collect();
+                                signal.send(&sender, &format!(
+                                    "📋 new session {id8} · {}",
+                                    target_opt.unwrap_or("quick")
+                                )).await.ok();
+                            }
+                            Err(e) => {
+                                signal.send(&sender, &format!("error: {e}")).await.ok();
+                            }
+                        }
+                        return;
+                    }
+
+                    // ── Normal message → route to active or quick session ──
+                    let target_session = active.lock().await.get(&sender).copied()
+                        .unwrap_or(sys_session);
+
                     // Send typing indicator
                     if let Err(e) = signal.send_typing(&sender).await {
                         tracing::warn!("send_typing: {e}");
@@ -246,18 +372,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     let response = Arc::new(std::sync::Mutex::new(String::new()));
-                    let first_delta = Arc::new(std::sync::Mutex::new(true));
                     let resp = response.clone();
-                    let first = first_delta.clone();
                     let emit = move |ev: agent::AgentEvent| {
                         if let agent::AgentEvent::Delta(d) = ev {
-                            // First delta cancels the "consulting" message
-                            // (typing indicator continues)
                             response.lock().unwrap().push_str(&d);
                         }
                     };
                     agent
-                        .process_chat(sys_session, &message, scope, &emit)
+                        .process_chat(target_session, &message, scope, &emit)
                         .await;
 
                     // Stop the "still consulting" timer
@@ -265,7 +387,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let text = resp.lock().unwrap().clone();
                     if !text.trim().is_empty() {
-                        signal.send_multi(&sender, &text).await.ok();
+                        // Preamble for non-quick sessions
+                        let full = if target_session != sys_session {
+                            let (target, title) = agent.session_display(target_session)
+                                .await
+                                .unwrap_or((None, None));
+                            let id8: String = target_session.simple().to_string().chars().take(8).collect();
+                            format!(
+                                "📋 {} · {}{}\n\n{}",
+                                target.as_deref().unwrap_or("quick"),
+                                id8,
+                                title.map(|t| format!(" · {t}")).unwrap_or_default(),
+                                text
+                            )
+                        } else {
+                            text
+                        };
+                        signal.send_multi(&sender, &full).await.ok();
                     }
                 });
             });

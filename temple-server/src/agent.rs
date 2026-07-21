@@ -123,6 +123,15 @@ struct SessionCtx {
     kind: SessionKind,
     /// SSH executor for remote tool execution (None = local tools only)
     ssh: Option<Arc<crate::ssh::SshExecutor>>,
+    /// SSH target name (e.g. "e-work@e-desktop") for persistence/display
+    ssh_target_name: Option<String>,
+    /// Person who owns this session (token username, e.g. "ethan").
+    /// Sessions are persisted and listed under this name.
+    owner: String,
+    /// Session title (generated after first exchange)
+    title: Option<String>,
+    /// Whether this session should be persisted to the DB
+    persist: bool,
 }
 
 pub struct Agent {
@@ -139,6 +148,10 @@ pub struct Agent {
     router_model: String,
     title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
+    /// SSH targets for remote tool execution (from config)
+    ssh_targets: Vec<crate::config::SshTarget>,
+    ssh_key_path: Option<std::path::PathBuf>,
+    ssh_bastion: Option<String>,
 }
 
 impl Agent {
@@ -161,6 +174,9 @@ impl Agent {
             title_model: "qwen3-4b-instruct".to_string(),
             models,
             tools: Mutex::new(Vec::new()),
+            ssh_targets: Vec::new(),
+            ssh_key_path: None,
+            ssh_bastion: None,
         }
     }
 
@@ -169,6 +185,36 @@ impl Agent {
         self.local = LiteLLM::new(url, "none");
         self.router_model = model.to_string();
         self.title_model = model.to_string();
+    }
+
+    /// Set the SSH execution config (called from main.rs with config)
+    pub fn set_ssh_config(
+        &mut self,
+        targets: Vec<crate::config::SshTarget>,
+        bastion: Option<String>,
+        key_path: Option<std::path::PathBuf>,
+    ) {
+        self.ssh_targets = targets;
+        self.ssh_bastion = bastion;
+        self.ssh_key_path = key_path;
+    }
+
+    /// List configured SSH target names.
+    pub fn ssh_target_names(&self) -> Vec<String> {
+        self.ssh_targets.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// Build an SSH executor for a named target. Returns None if the target
+    /// isn't configured or no key path is set.
+    pub fn make_ssh(&self, target_name: &str) -> Option<Arc<crate::ssh::SshExecutor>> {
+        let target = self.ssh_targets.iter().find(|t| t.name == target_name)?;
+        let key = self.ssh_key_path.clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/temple/ssh_key"));
+        Some(Arc::new(crate::ssh::SshExecutor::new(
+            target.clone(),
+            self.ssh_bastion.clone(),
+            key,
+        )))
     }
 
     /// Load tool definitions: local tools + MCP tools from litellm.
@@ -233,13 +279,218 @@ impl Agent {
                 initialized,
                 kind,
                 ssh,
+                ssh_target_name: None,
+                owner: username.to_string(),
+                title: None,
+                persist: false,
             },
         );
     }
 
+    /// Create a new persisted session for `owner`, optionally bound to an
+    /// SSH target. Returns the new session id, or Err if the target is
+    /// unknown.
+    pub async fn new_persisted_session(
+        &self,
+        owner: &str,
+        ssh_target: Option<&str>,
+    ) -> Result<Uuid, String> {
+        let session_id = Uuid::new_v4();
+        let (ssh, kind, cwd) = match ssh_target {
+            Some(name) => {
+                let ssh = self.make_ssh(name)
+                    .ok_or_else(|| format!(
+                        "unknown ssh target: {name} (available: {})",
+                        self.ssh_target_names().join(", ")
+                    ))?;
+                let cwd = ssh.home_dir().await.unwrap_or_else(|_| "~".into());
+                (Some(ssh), SessionKind::Coding, cwd)
+            }
+            None => (None, SessionKind::Quick, "/var/lib/temple".to_string()),
+        };
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(
+            session_id,
+            SessionCtx {
+                model: self.models.default_model.clone(),
+                history: Vec::new(),
+                username: owner.to_string(),
+                cwd,
+                initialized: true,
+                kind,
+                ssh,
+                ssh_target_name: ssh_target.map(|s| s.to_string()),
+                owner: owner.to_string(),
+                title: None,
+                persist: true,
+            },
+        );
+        drop(sessions);
+        self.persist_session(session_id).await;
+        Ok(session_id)
+    }
+
+    /// Resume a persisted session from the DB. Loads history and
+    /// reconstructs the SSH executor. Returns the transcript for replay.
+    pub async fn resume_session(
+        &self,
+        session_id: Uuid,
+        owner: &str,
+    ) -> Result<(temple_protocol::SessionMeta, Vec<(String, String)>), String> {
+        let row = self.memory.load_session(session_id).await
+            .map_err(|e| format!("load session: {e}"))?
+            .ok_or("session not found")?;
+
+        if row.username != owner {
+            return Err("session belongs to another user".into());
+        }
+
+        let history: Vec<ChatMessage> = serde_json::from_str(&row.history_json)
+            .unwrap_or_default();
+
+        let ssh = row.ssh_target.as_deref().and_then(|n| self.make_ssh(n));
+        let kind = if ssh.is_some() { SessionKind::Coding } else { SessionKind::Quick };
+
+        // Build transcript of user/assistant text turns for client replay
+        let transcript: Vec<(String, String)> = history.iter()
+            .filter_map(|m| {
+                let content = m.content.clone()?;
+                if (m.role == "user" || m.role == "assistant")
+                    && !content.is_empty()
+                    && m.tool_call_id.is_none()
+                {
+                    Some((m.role.clone(), content))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let meta = temple_protocol::SessionMeta {
+            id: session_id,
+            title: row.title.clone(),
+            ssh_target: row.ssh_target.clone(),
+            cwd: row.cwd.clone(),
+            mode: row.mode.clone(),
+            updated_at: String::new(),
+        };
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(
+            session_id,
+            SessionCtx {
+                model: self.models.default_model.clone(),
+                history,
+                username: row.username.clone(),
+                cwd: row.cwd,
+                initialized: true,
+                kind,
+                ssh,
+                ssh_target_name: row.ssh_target,
+                owner: row.username,
+                title: row.title,
+                persist: true,
+            },
+        );
+
+        Ok((meta, transcript))
+    }
+
+    /// Persist a session's current state to the DB (no-op for
+    /// non-persistent sessions like the raw TUI-connect default).
+    pub async fn persist_session(&self, session_id: Uuid) {
+        let row = {
+            let sessions = self.sessions.lock().await;
+            let Some(s) = sessions.get(&session_id) else { return };
+            if !s.persist {
+                return;
+            }
+            crate::memory::PersistedSession {
+                id: session_id,
+                username: s.owner.clone(),
+                ssh_target: s.ssh_target_name.clone(),
+                cwd: s.cwd.clone(),
+                mode: "default".into(),
+                kind: match s.kind {
+                    SessionKind::Coding => "coding".into(),
+                    SessionKind::Quick => "quick".into(),
+                    SessionKind::System => "system".into(),
+                },
+                title: s.title.clone(),
+                history_json: serde_json::to_string(&s.history).unwrap_or_else(|_| "[]".into()),
+            }
+        };
+        if let Err(e) = self.memory.save_session(&row).await {
+            tracing::warn!("persist session {session_id}: {e}");
+        }
+    }
+
+    /// Generate and store a title for a session if it doesn't have one yet.
+    pub async fn ensure_session_title(&self, session_id: Uuid) {
+        let needs_title = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id)
+                .map(|s| s.persist && s.title.is_none() && !s.history.is_empty())
+                .unwrap_or(false)
+        };
+        if !needs_title {
+            return;
+        }
+
+        let history = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id)
+                .map(|s| s.history.iter().take(4).cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+
+        let mut messages = vec![ChatMessage::system(
+            "Generate a 3-5 word title for this conversation. Just the title, no quotes, no punctuation at the end."
+        )];
+        messages.extend(history);
+
+        let req = ChatRequest {
+            model: self.title_model.clone(),
+            messages,
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(30),
+            temperature: Some(0.3),
+        };
+
+        if let Ok(resp) = self.local.chat(req).await {
+            if let Some(choice) = resp.choices.first() {
+                if let Some(content) = choice.message.content.as_deref() {
+                    let title = content.trim().to_string();
+                    if !title.is_empty() {
+                        let mut sessions = self.sessions.lock().await;
+                        if let Some(s) = sessions.get_mut(&session_id) {
+                            s.title = Some(title);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get display metadata for an in-memory session (for preambles).
+    pub async fn session_display(&self, session_id: Uuid) -> Option<(Option<String>, Option<String>)> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(&session_id)
+            .map(|s| (s.ssh_target_name.clone(), s.title.clone()))
+    }
+
+    /// Check whether a session is currently loaded in memory.
+    pub async fn has_session(&self, session_id: Uuid) -> bool {
+        self.sessions.lock().await.contains_key(&session_id)
+    }
+
     pub async fn close_session(&self, session_id: Uuid) {
-        // Cancel any in-progress loop
+        // Cancel any in-progress loop, persist state, then unload
         self.cancel_chat(session_id).await;
+        self.persist_session(session_id).await;
         self.sessions.lock().await.remove(&session_id);
     }
 
@@ -353,6 +604,10 @@ impl Agent {
                 model_used: Some(model_for_stats.clone()),
             }).await;
         }
+
+        // Persist the session (history + title) after each turn
+        self.ensure_session_title(session_id).await;
+        self.persist_session(session_id).await;
 
         let duration_ms = started.elapsed().as_millis() as u64;
         emit(AgentEvent::Done(ChatStatsData {
@@ -1122,51 +1377,6 @@ You have filesystem access, shell commands, and persistent memory.
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err(format!("permission denied: {target}")),
             _ => Err("permission request timed out".into()),
-        }
-    }
-
-    /// Generate a short title for the session using the small model.
-    pub async fn generate_session_title(&self, session_id: Uuid) {
-        let history = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id)
-                .map(|s| s.history.iter().take(4).cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-
-        if history.is_empty() {
-            return;
-        }
-
-        let mut messages = vec![ChatMessage::system(
-            "Generate a 3-5 word title for this conversation. Just the title, no quotes, no punctuation at the end."
-        )];
-        messages.extend(history);
-
-        let req = ChatRequest {
-            model: self.title_model.clone(),
-            messages,
-            tools: None,
-            stream: Some(false),
-            stream_options: None,
-            max_tokens: Some(30),
-            temperature: Some(0.3),
-        };
-
-        if let Ok(resp) = self.local.chat(req).await {
-            if let Some(choice) = resp.choices.first() {
-                let title = choice.message.content
-                    .as_deref()
-                    .unwrap_or("untitled")
-                    .trim()
-                    .to_string();
-                tracing::info!("Session title: {title}");
-                let _ = self.memory.set_memory(
-                    &format!("session_title_{}", session_id),
-                    &title,
-                    "system",
-                ).await;
-            }
         }
     }
 

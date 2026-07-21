@@ -77,6 +77,14 @@ struct AppState {
     last_lines: Vec<String>,
     /// transient banner text (e.g. "copied 142 chars")
     banner: Option<(String, std::time::Instant)>,
+    /// previously sent prompts, recalled with Up/Down
+    input_history: Vec<String>,
+    /// position while cycling input history (None = editing new prompt)
+    history_pos: Option<usize>,
+    /// stashed in-progress prompt while cycling history
+    history_stash: String,
+    /// last session listing (for /session <n> selection)
+    last_sessions: Vec<SessionMeta>,
 }
 
 // ── Background WebSocket thread ──
@@ -198,6 +206,50 @@ fn spawn_ws(
                         }
                         ServerMessage::ChatCancelled { .. } => {
                             s.entries.push(ChatEntry::System("(cancelled by user)".into()));
+                        }
+                        ServerMessage::SessionList { sessions } => {
+                            if sessions.is_empty() {
+                                s.entries.push(ChatEntry::System(
+                                    "no sessions — /new [target] to start one".into(),
+                                ));
+                            } else {
+                                s.entries.push(ChatEntry::System(format!(
+                                    "sessions ({}):", sessions.len()
+                                )));
+                                for (i, m) in sessions.iter().enumerate() {
+                                    let id8: String = m.id.simple().to_string()
+                                        .chars().take(8).collect();
+                                    let target = m.ssh_target.as_deref().unwrap_or("quick");
+                                    let title = m.title.as_deref().unwrap_or("(untitled)");
+                                    s.entries.push(ChatEntry::System(format!(
+                                        "  [{i}] {id8} · {target} · {title}"
+                                    )));
+                                }
+                                s.entries.push(ChatEntry::System(
+                                    "  resume: /session <n>".into(),
+                                ));
+                            }
+                            s.last_sessions = sessions;
+                        }
+                        ServerMessage::SessionResumed { session_id, meta, transcript } => {
+                            s.session_id = session_id;
+                            let target = meta.ssh_target.as_deref().unwrap_or("quick");
+                            let title = meta.title.as_deref().unwrap_or("(untitled)");
+                            s.entries.clear();
+                            s.entries.push(ChatEntry::System(format!(
+                                "📋 session {target} · {title}"
+                            )));
+                            for (role, content) in transcript {
+                                if role == "user" {
+                                    s.entries.push(ChatEntry::User(content));
+                                } else {
+                                    s.entries.push(ChatEntry::Assistant {
+                                        content,
+                                        stats: None,
+                                    });
+                                }
+                            }
+                            s.scroll = 0;
                         }
                         ServerMessage::Pong | ServerMessage::SessionClosed { .. } => {}
                     }
@@ -525,21 +577,60 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.scroll = s.scroll.saturating_sub(10);
                 }
-                Up => { s.scroll = s.scroll.saturating_add(1); }
-                Down => { s.scroll = s.scroll.saturating_sub(1); }
+                Up => {
+                    // Recall previous prompt (input history)
+                    if s.input_history.is_empty() { return; }
+                    match s.history_pos {
+                        None => {
+                            s.history_stash = s.prompt.clone();
+                            s.history_pos = Some(s.input_history.len() - 1);
+                        }
+                        Some(0) => {}
+                        Some(p) => { s.history_pos = Some(p - 1); }
+                    }
+                    if let Some(p) = s.history_pos {
+                        s.prompt = s.input_history[p].clone();
+                    }
+                }
+                Down => {
+                    // Cycle forward in input history / restore stash
+                    match s.history_pos {
+                        None => {}
+                        Some(p) if p + 1 < s.input_history.len() => {
+                            s.history_pos = Some(p + 1);
+                            s.prompt = s.input_history[p + 1].clone();
+                        }
+                        Some(_) => {
+                            s.history_pos = None;
+                            s.prompt = std::mem::take(&mut s.history_stash);
+                        }
+                    }
+                }
                 PageUp => { s.scroll = s.scroll.saturating_add(10); }
                 PageDown => { s.scroll = s.scroll.saturating_sub(10); }
                 Enter => {
                     let content = std::mem::take(&mut s.prompt);
                     s.scroll = 0;
+                    s.history_pos = None;
                     if content.trim().is_empty() { return; }
+                    if s.input_history.last() != Some(&content) {
+                        s.input_history.push(content.clone());
+                    }
                     match content.as_str() {
                         ":q" | ":quit" => { s.running = false; }
                         "/models" => { cmd_h.send(ClientMessage::ListModels).ok(); return; }
                         "/quit" | "/exit" => { s.running = false; }
+                        "/sessions" => {
+                            cmd_h.send(ClientMessage::ListSessions).ok();
+                            return;
+                        }
+                        "/new" => {
+                            cmd_h.send(ClientMessage::NewSession { ssh_target: None }).ok();
+                            return;
+                        }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/models · /model X · /mode X · /initial · /help · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
@@ -547,6 +638,37 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             if let Some(m) = content.strip_prefix("/model ") {
                                 cmd_h.send(ClientMessage::SetModel {
                                     session_id: s.session_id, model: m.trim().into(),
+                                }).ok();
+                                return;
+                            }
+                            if let Some(arg) = content.strip_prefix("/session ") {
+                                let arg = arg.trim();
+                                // Accept an index from the last /sessions listing
+                                // or a raw id prefix
+                                let sid = if let Ok(n) = arg.parse::<usize>() {
+                                    s.last_sessions.get(n).map(|m| m.id)
+                                } else {
+                                    s.last_sessions.iter()
+                                        .find(|m| m.id.simple().to_string().starts_with(arg))
+                                        .map(|m| m.id)
+                                };
+                                match sid {
+                                    Some(id) => {
+                                        cmd_h.send(ClientMessage::ResumeSession {
+                                            session_id: id,
+                                        }).ok();
+                                    }
+                                    None => {
+                                        s.entries.push(ChatEntry::System(
+                                            "no matching session — run /sessions first".into(),
+                                        ));
+                                    }
+                                }
+                                return;
+                            }
+                            if let Some(target) = content.strip_prefix("/new ") {
+                                cmd_h.send(ClientMessage::NewSession {
+                                    ssh_target: Some(target.trim().to_string()),
                                 }).ok();
                                 return;
                             }
@@ -822,6 +944,10 @@ fn main() {
         selection: None,
         last_lines: Vec::new(),
         banner: None,
+        input_history: Vec::new(),
+        history_pos: None,
+        history_stash: String::new(),
+        last_sessions: Vec::new(),
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();

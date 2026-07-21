@@ -86,6 +86,13 @@ pub enum ClientMessage {
     },
     /// Cancel an in-progress agent loop for this session
     CancelChat { session_id: Uuid },
+    /// List persisted sessions for the authenticated user
+    ListSessions,
+    /// Resume a persisted session (loads history + SSH target)
+    ResumeSession { session_id: Uuid },
+    /// Create a new session, optionally bound to an SSH target
+    /// (e.g. "e-work@e-desktop"). No target = local/quick session.
+    NewSession { ssh_target: Option<String> },
     Ping,
 }
 
@@ -132,6 +139,17 @@ pub enum ServerMessage {
     ChatCancelled { session_id: Uuid },
     /// Server is shutting down
     Shutdown,
+    /// Persisted sessions for the authenticated user
+    SessionList {
+        sessions: Vec<SessionMeta>,
+    },
+    /// A session was resumed — includes replayed history for display
+    SessionResumed {
+        session_id: Uuid,
+        meta: SessionMeta,
+        /// (role, content) pairs of prior user/assistant turns
+        transcript: Vec<(String, String)>,
+    },
     /// Chat statistics (sent after final delta)
     ChatStats {
         session_id: Uuid,
@@ -147,6 +165,17 @@ pub enum ServerMessage {
         /// generation speed (approx: first token → stream end)
         decode_tps: f64,
     },
+}
+
+/// Summary of a persisted session (for listing and resuming).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub ssh_target: Option<String>,
+    pub cwd: String,
+    pub mode: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
