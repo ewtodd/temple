@@ -479,6 +479,29 @@ impl Agent {
         }
     }
 
+    /// Attach an SSH executor to an existing session.
+    pub async fn attach_ssh(&self, session_id: Uuid, target_name: &str) -> Result<(), String> {
+        let ssh = self.make_ssh(target_name)
+            .ok_or_else(|| format!("unknown ssh target: {target_name}"))?;
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(&session_id) {
+            s.ssh = Some(ssh);
+            s.ssh_target_name = Some(target_name.to_string());
+            s.kind = SessionKind::Coding;
+            Ok(())
+        } else {
+            Err("session not found".into())
+        }
+    }
+
+    /// Check whether a session has an SSH executor attached.
+    pub async fn has_ssh(&self, session_id: Uuid) -> bool {
+        self.sessions.lock().await
+            .get(&session_id)
+            .map(|s| s.ssh.is_some())
+            .unwrap_or(false)
+    }
+
     /// Generate and store a title for a session if it doesn't have one yet.
     pub async fn ensure_session_title(&self, session_id: Uuid) {
         let needs_title = {

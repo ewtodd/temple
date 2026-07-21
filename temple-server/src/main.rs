@@ -322,6 +322,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         active.lock().await.insert(sender.clone(), sid);
+                                        // Auto-attach SSH if needed — Signal sessions
+                                        // need SSH to execute tools (no TUI client).
+                                        if !agent.has_ssh(sid).await {
+                                            if let Some(t) = agent.ssh_targets.iter()
+                                                .find(|t| t.owner == username)
+                                            {
+                                                if let Err(e) = agent.attach_ssh(sid, &t.name).await {
+                                                    tracing::warn!("attach_ssh for {sid}: {e}");
+                                                } else {
+                                                    tracing::info!("auto-attached SSH {} to session {sid}", t.name);
+                                                }
+                                            }
+                                        }
                                         let target = r.ssh_target.as_deref().unwrap_or("quick");
                                         let title = r.title.as_deref().unwrap_or("(untitled)");
                                         signal.send(&sender, &format!(
