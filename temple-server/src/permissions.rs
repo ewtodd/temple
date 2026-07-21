@@ -41,7 +41,9 @@ impl PermissionScope {
     async fn is_in_cwd(&self, path: &Path) -> bool {
         let canonical = match fs::canonicalize(path).await {
             Ok(p) => p,
-            Err(_) => return path.starts_with(&self.cwd),
+            // New file (nothing to canonicalize) — normalize lexically so
+            // `..` can't escape the cwd prefix check.
+            Err(_) => return normalize_path(path).starts_with(&self.cwd),
         };
         canonical.starts_with(&self.cwd)
     }
@@ -101,4 +103,21 @@ impl PermissionScope {
             self.cwd.join(path)
         }
     }
+}
+
+/// Lexically resolve `.`/`..` without touching the filesystem (for paths
+/// that don't exist yet, where canonicalize fails).
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
 }

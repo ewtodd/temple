@@ -155,7 +155,7 @@ fn parse_sse_json(text: &str) -> Result<Value, String> {
     if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
         return Ok(v);
     }
-    Err(format!("MCP: unparseable response: {}", &text[..text.len().min(200)]))
+    Err(format!("MCP: unparseable response: {}", text.chars().take(200).collect::<String>()))
 }
 
 /// Extract human-readable text from an MCP tool result.

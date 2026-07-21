@@ -72,9 +72,12 @@ impl SshExecutor {
             String::new()
         };
 
-        // Use a heredoc to avoid quoting issues
+        // Heredoc with a random delimiter — a fixed one could be matched
+        // by a line in the file content, truncating the write and
+        // executing the remainder as shell commands.
+        let eof = format!("TEMPLE_EOF_{}", uuid::Uuid::new_v4().simple());
         let cmd = format!(
-            "{mkdir_cmd}cat > {} << 'TEMPLE_EOF'\n{}\nTEMPLE_EOF\nwc -c < {}",
+            "{mkdir_cmd}cat > {} << '{eof}'\n{}\n{eof}\nwc -c < {}",
             shell_quote(path),
             content,
             shell_quote(path),
@@ -105,31 +108,36 @@ impl SshExecutor {
     }
 
     /// Resolve a path relative to the remote home directory.
+    /// Normalized lexically so `..` can't escape the $HOME prefix check.
     pub async fn resolve_path(&self, path: &str) -> Result<String, String> {
-        if path.starts_with('/') {
-            return Ok(path.to_string());
-        }
-        if path.starts_with("~/") {
+        let resolved = if path.starts_with('/') {
+            path.to_string()
+        } else if path.starts_with("~/") {
             let home = self.home_dir().await?;
-            return Ok(format!("{}{}", home, &path[1..]));
-        }
-        if path == "~" {
-            return self.home_dir().await;
-        }
-        // Relative paths resolve from $HOME (not CWD, since each SSH call is fresh)
-        let home = self.home_dir().await?;
-        Ok(format!("{home}/{path}"))
+            format!("{}{}", home, &path[1..])
+        } else if path == "~" {
+            self.home_dir().await?
+        } else {
+            // Relative paths resolve from $HOME (not CWD, since each SSH call is fresh)
+            let home = self.home_dir().await?;
+            format!("{home}/{path}")
+        };
+        Ok(normalize_lexical(&resolved))
     }
 
     /// Check if a path is within the allowed directories.
     pub fn is_path_allowed(&self, abs_path: &str, home: &str) -> bool {
+        let path = normalize_lexical(abs_path);
+        let home = normalize_lexical(home);
+        // Component-boundary match: /home/e must not match /home/eve
+        let within = |dir: &str| path == dir || path.starts_with(&format!("{dir}/"));
         // Always allow $HOME and /tmp
-        if abs_path.starts_with(home) || abs_path.starts_with("/tmp/") || abs_path == "/tmp" {
+        if within(&home) || within("/tmp") {
             return true;
         }
         // Check configured allowed_dirs
         for dir in &self.target.allowed_dirs {
-            if abs_path.starts_with(dir) {
+            if within(&normalize_lexical(dir)) {
                 return true;
             }
         }
@@ -146,4 +154,21 @@ impl SshExecutor {
 fn shell_quote(s: &str) -> String {
     // Single-quote and escape any embedded single quotes
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Lexically resolve `.` and `..` without touching the filesystem —
+/// `..` past the root clamps to root. Prevents `/home/u/../../etc`
+/// from passing the $HOME prefix check while resolving to /etc remotely.
+fn normalize_lexical(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }

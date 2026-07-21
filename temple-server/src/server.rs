@@ -280,6 +280,16 @@ async fn handle_connection(
             }
 
             ClientMessage::ClearSessions { account } => {
+                // /clear can wipe other users' sessions — admin only
+                let owner = auth_owner.clone().unwrap_or_default();
+                let is_admin = memory.is_admin_username(&owner).await.unwrap_or(false);
+                if !is_admin {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: "admin only".into(),
+                    });
+                    continue;
+                }
                 match memory.clear_sessions(&account).await {
                     Ok(n) => {
                         let _ = tx.send(ServerMessage::ChatDelta {
@@ -371,7 +381,7 @@ async fn handle_connection(
                         let _ = tx.send(msg);
                     };
                     agent
-                        .process_chat(sid, &content, scope, &emit)
+                        .process_chat(sid, &content, scope, &emit, None)
                         .await;
                 });
             }

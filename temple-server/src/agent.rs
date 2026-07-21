@@ -668,12 +668,15 @@ impl Agent {
 
     /// The full agent loop for one user message. Routes the query, then
     /// either runs a direct tool loop or a planner→executor→reviewer pipeline.
+    /// `priority_user` overrides who the queue priority is attributed to
+    /// (Signal group chats: the sender, not the shared group session).
     pub async fn process_chat(
         &self,
         session_id: Uuid,
         content: &str,
         scope: Arc<Mutex<PermissionScope>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        priority_user: Option<&str>,
     ) {
         let started = Instant::now();
 
@@ -705,13 +708,20 @@ impl Agent {
         // One agent loop at a time across all sessions; higher-priority
         // users (lower number: 0 ethan, 1 valarie, -1 default) jump ahead
         // of whatever is queued. The permit is held until this fn returns.
-        let priority = self.memory.get_user_priority(&username).await.unwrap_or(-1);
+        let priority = self.memory.get_user_priority(priority_user.unwrap_or(&username)).await.unwrap_or(-1);
         let (_queue_permit, queued) = self.queue.acquire(priority).await;
+        if cancel_token.is_cancelled() {
+            // Cancelled while waiting in the queue — bail before doing any
+            // work (routing, prompts, title generation all cost time the
+            // queue could spend on requests that weren't cancelled).
+            self.cancel_tokens.lock().await.remove(&session_id);
+            return;
+        }
         if queued {
             emit(AgentEvent::ToolEvent {
                 name: "queue".into(),
                 status: ToolStatus::Finished,
-                detail: format!("waited for higher-priority work (priority {priority})"),
+                detail: format!("queued behind another request (priority {priority})"),
             });
         }
 
@@ -1017,7 +1027,14 @@ impl Agent {
             {
                 let sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get(&session_id) {
-                    let start = s.history.len().saturating_sub(MAX_HISTORY);
+                    let mut start = s.history.len().saturating_sub(MAX_HISTORY);
+                    // Never start mid-tool-exchange: a leading tool result
+                    // whose assistant/tool_calls parent was cut makes the
+                    // API reject every request with a 400 — the session
+                    // dies in a retry loop.
+                    while start < s.history.len() && s.history[start].tool_call_id.is_some() {
+                        start += 1;
+                    }
                     messages.extend(s.history[start..].iter().cloned());
                 }
             }
@@ -1094,7 +1111,7 @@ impl Agent {
                             emit(AgentEvent::StreamReset);
                         }
                         emit(AgentEvent::ToolEvent {
-                            name: "system".into(), status: ToolStatus::Started,
+                            name: "system".into(), status: ToolStatus::Finished,
                             detail: format!("retry {}/{} after stream error", attempt+1, MAX_STREAM_RETRIES),
                         });
                         tokio::time::sleep(delay).await;
@@ -1104,9 +1121,20 @@ impl Agent {
                 match stream_result {
                     Some(r) => r,
                     None => {
-                        // All retries failed — inject error context and let
-                        // the model try a different approach
+                        if cancel_token.is_cancelled() {
+                            // Cancelled, not failed — don't pollute history
+                            // with error turns or burn more rounds.
+                            break;
+                        }
                         tracing::error!("All {} stream retries failed: {}", MAX_STREAM_RETRIES, last_err);
+                        if round == MAX_TOOL_ROUNDS - 1 {
+                            // Out of rounds — surface the failure instead of
+                            // looping error junk back into history forever.
+                            final_content = format!("(stream error: {last_err})");
+                            break;
+                        }
+                        // Inject error context and let the model try a
+                        // different approach.
                         let mut sessions = self.sessions.lock().await;
                         if let Some(s) = sessions.get_mut(&session_id) {
                             s.history.push(ChatMessage::assistant(
@@ -1382,8 +1410,7 @@ Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
                     // SSH sessions: Yolo is never allowed, dangerous commands always prompt
                     if is_dangerous_command(command) {
                         self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
-                    }
-                    if !is_safe_command(command) {
+                    } else if !is_safe_command(command) {
                         self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
                     }
                     ssh.execute(command).await
@@ -1519,7 +1546,7 @@ Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
                 "[{}] {}: {}\n",
                 entry.timestamp.format("%m-%d %H:%M"),
                 entry.role,
-                &entry.content[..entry.content.len().min(200)]
+                entry.content.chars().take(200).collect::<String>()
             ));
         }
 
@@ -1738,7 +1765,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…[truncated {} bytes]", &s[..max], s.len() - max)
+        // Byte-slicing (&s[..max]) panics on multi-byte UTF-8 boundaries —
+        // tool output is arbitrary file content, so cut by chars instead.
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…[truncated {} bytes]", s.len() - cut.len())
     }
 }
 
@@ -1775,12 +1805,12 @@ fn format_code_rules(project_section: &str) -> String {
 }
 
 /// Read-only commands that are safe to run without prompting.
+/// Interpreters (python etc.) are NOT here — they run arbitrary code.
 const SAFE_COMMANDS: &[&str] = &[
     "ls", "cat", "head", "tail", "grep", "rg", "find", "fd", "tree",
     "pwd", "whoami", "hostname", "uname", "date", "uptime",
     "wc", "sort", "uniq", "diff", "cmp", "file", "stat", "du", "df",
     "git", "cargo", "rustc", "nix", "nixos-version",
-    "python", "python3", "pip", "pip3",
     "echo", "printf", "which", "type", "env", "printenv",
     "test", "true", "false",
     "head", "less", "more",
@@ -1813,15 +1843,26 @@ const DANGEROUS_PATTERNS: &[&str] = &[
 ];
 
 /// Returns true if the command is safe to run without a permission prompt.
+/// Every pipeline/chain segment must start with a safe command — checking
+/// only the first word lets `ls && rm -r ~` or `cat x | sh` through.
+/// Redirection, substitution, and multi-line commands always prompt.
 fn is_safe_command(command: &str) -> bool {
     let trimmed = command.trim();
-    // Get the first word (handle pipes/redirects by splitting on them)
-    let first_word = trimmed
-        .split(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == '&')
-        .next()
-        .unwrap_or("")
-        .trim();
-    SAFE_COMMANDS.iter().any(|&safe| first_word == safe)
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(['>', '<', '`', '\n'])
+        || trimmed.contains("$(")
+        || trimmed.contains("${")
+    {
+        return false;
+    }
+    let segments: Vec<&str> = trimmed
+        .split(['|', ';', '&'])
+        .filter_map(|seg| seg.trim().split_whitespace().next())
+        .filter(|first| !first.is_empty())
+        .collect();
+    !segments.is_empty() && segments.iter().all(|first| SAFE_COMMANDS.contains(first))
 }
 
 /// Returns true if the command matches a dangerous pattern and should

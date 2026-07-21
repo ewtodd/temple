@@ -57,7 +57,9 @@ impl Memory {
                 username TEXT PRIMARY KEY,
                 phone TEXT NOT NULL,
                 uuid TEXT,
-                verified_at TEXT
+                verified_at TEXT,
+                admin TEXT NOT NULL DEFAULT 'no',
+                priority INTEGER NOT NULL DEFAULT -1
             );
             CREATE INDEX IF NOT EXISTS idx_signal_users_uuid ON signal_users(uuid);
             CREATE TABLE IF NOT EXISTS sessions (
@@ -312,6 +314,19 @@ impl Memory {
             .flatten()
             .unwrap_or(-1);
         Ok(priority)
+    }
+
+    /// Whether a token-file user is an admin (for /clear, /broadcast).
+    pub async fn is_admin_username(&self, username: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().await;
+        let admin: Option<String> = conn
+            .query_row(
+                "SELECT admin FROM signal_users WHERE username = ?1",
+                params![username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(admin.as_deref() == Some("yes"))
     }
 
     /// Record a verified UUID for a signal user.

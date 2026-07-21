@@ -234,7 +234,7 @@ impl LiteLLM {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("litellm {status}: {}", &body[..body.len().min(500)]));
+            return Err(format!("litellm {status}: {}", body.chars().take(500).collect::<String>()));
         }
         resp.json::<ChatResponse>()
             .await
@@ -276,7 +276,7 @@ impl LiteLLM {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("litellm {status}: {}", &body[..body.len().min(500)]));
+            return Err(format!("litellm {status}: {}", body.chars().take(500).collect::<String>()));
         }
 
         let mut content = String::new();
@@ -286,17 +286,20 @@ impl LiteLLM {
         let mut tool_accum: std::collections::BTreeMap<usize, (String, String, String)> =
             std::collections::BTreeMap::new();
 
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("stream read: {e}"))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.extend_from_slice(&bytes);
 
-            // Process complete SSE events (separated by \n\n)
-            while let Some(end) = buffer.find("\n\n") {
-                let event_text = buffer[..end].to_string();
-                buffer = buffer[end + 2..].to_string();
+            // Process complete SSE events (separated by \n\n). Split on raw
+            // bytes — decoding each chunk with from_utf8_lossy corrupts
+            // multi-byte UTF-8 that straddles a chunk boundary (which also
+            // breaks tool-call argument JSON).
+            while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
+                let event_bytes: Vec<u8> = buffer.drain(..end + 2).collect();
+                let event_text = String::from_utf8_lossy(&event_bytes);
 
                 for line in event_text.lines() {
                     let Some(data) = line.strip_prefix("data: ") else {

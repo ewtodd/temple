@@ -115,7 +115,7 @@ impl CronScheduler {
                 "[{}] {}: {}\n",
                 entry.timestamp.format("%m-%d %H:%M"),
                 entry.role,
-                &entry.content[..entry.content.len().min(300)]
+                entry.content.chars().take(300).collect::<String>()
             ));
         }
 
