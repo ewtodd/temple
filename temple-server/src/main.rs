@@ -543,7 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Keep the typing bubble alive (expires after 15s) and
-                    // send a "still consulting" note every 2 minutes.
+                    // send a "still consulting" note every 5 minutes.
                     let signal_for_timer = signal.clone();
                     let sender_for_timer = sender.clone();
                     let group_for_timer = group_id.clone();
@@ -556,7 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Some(g) => { signal_for_timer.send_typing_group(g).await.ok(); }
                                 None => { signal_for_timer.send_typing(&sender_for_timer).await.ok(); }
                             }
-                            if ticks % 12 == 0 {
+                            if ticks % 30 == 0 {
                                 send_conv(
                                     &signal_for_timer,
                                     &sender_for_timer,
