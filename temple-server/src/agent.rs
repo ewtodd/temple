@@ -286,13 +286,11 @@ impl Agent {
             (s.username.clone(), s.cwd.clone(), s.initialized, s.model.clone())
         };
 
-        // Route the query
+        // Route the query — heuristics only (skip local model call for speed)
         let route = if content.starts_with('/') || content.starts_with(':') {
             Route::Direct { model: session_model }
         } else {
-            let complexity = Router::classify_with_model(
-                &self.local, &self.router_model, content
-            ).await.unwrap_or_else(|| Router::classify(content));
+            let complexity = Router::classify(content);
             tracing::info!("Router: {complexity:?}");
             Router::route(complexity, &self.models)
         };
