@@ -725,7 +725,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/sessions · /session N · /new [target] · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] [dir] · /clear <account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
@@ -759,6 +759,12 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                         ));
                                     }
                                 }
+                                return;
+                            }
+                            if let Some(account) = content.strip_prefix("/clear ") {
+                                cmd_h.send(ClientMessage::ClearSessions {
+                                    account: account.trim().to_string(),
+                                }).ok();
                                 return;
                             }
                             if let Some(target) = content.strip_prefix("/new ") {

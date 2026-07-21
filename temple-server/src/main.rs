@@ -261,12 +261,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "commands:\n\
                              /sessions — list your recent sessions\n\
                              /session <id-prefix> — resume a session\n\
-                             /new <target> — new coding session (e.g. /new e-work@e-desktop)\n\
-                             /new — new quick session\n\
-                             /quick — back to the default quick session\n\
+                             /new <target> [dir] — new coding session\n\
+                             /new — new session\n\
+                             /quick — back to the default session\n\
+                             /clear <account> — delete all sessions for an account (e.g. /clear e-play)\n\
                              /targets — list ssh targets\n\
                              /help — this"
                         ).await.ok();
+                        return;
+                    }
+
+                    if let Some(account) = trimmed.strip_prefix("/clear ") {
+                        let account = account.trim();
+                        if account.is_empty() {
+                            signal.send(&sender, "usage: /clear <account> (e.g. /clear e-play)").await.ok();
+                        } else {
+                            match memory.clear_sessions(account).await {
+                                Ok(n) => {
+                                    signal.send(&sender, &format!("deleted {n} sessions for {account}")).await.ok();
+                                }
+                                Err(e) => {
+                                    signal.send(&sender, &format!("error: {e}")).await.ok();
+                                }
+                            }
+                        }
                         return;
                     }
 
@@ -364,7 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let parts: Vec<&str> = rest.splitn(3, ' ').filter(|p| !p.is_empty()).collect();
                         let target = parts.first().copied();
                         let subdir = parts.get(1).copied();
-                        match agent.new_persisted_session(&username, target, subdir).await {
+                        match agent.new_persisted_session(&username, target, subdir, None).await {
                             Ok(sid) => {
                                 active.lock().await.insert(sender.clone(), sid);
                                 let id8: String = sid.simple().to_string().chars().take(8).collect();

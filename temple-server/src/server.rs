@@ -166,6 +166,7 @@ async fn handle_connection(
                     auth_owner.as_deref().unwrap_or(&open.username),
                     None,
                     None,
+                    Some(&open.username),
                 ).await {
                     Ok(sid) => { session_id = sid; }
                     Err(e) => {
@@ -251,7 +252,7 @@ async fn handle_connection(
 
             ClientMessage::NewSession { ssh_target } => {
                 let owner = auth_owner.clone().unwrap_or_default();
-                match agent.new_persisted_session(&owner, ssh_target.as_deref(), None).await {
+                match agent.new_persisted_session(&owner, ssh_target.as_deref(), None, None).await {
                     Ok(sid) => {
                         session_id = sid;
                         if permissions.is_none() {
@@ -280,6 +281,24 @@ async fn handle_connection(
                         let _ = tx.send(ServerMessage::ChatError {
                             session_id,
                             error: format!("new session: {e}"),
+                        });
+                    }
+                }
+            }
+
+            ClientMessage::ClearSessions { account } => {
+                match memory.clear_sessions(&account).await {
+                    Ok(n) => {
+                        let _ = tx.send(ServerMessage::ChatDelta {
+                            session_id,
+                            delta: format!("deleted {n} sessions for {account}\n"),
+                            done: true,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("clear sessions: {e}"),
                         });
                     }
                 }

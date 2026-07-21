@@ -59,18 +59,22 @@ impl Memory {
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
                 ssh_target TEXT,
+                account TEXT,
                 cwd TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'default',
-                kind TEXT NOT NULL DEFAULT 'quick',
+                kind TEXT NOT NULL DEFAULT 'interactive',
                 title TEXT,
                 history TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
+            CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             ",
         )?;
+        // Migration: account column (added after initial deploy)
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN account TEXT");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -350,10 +354,11 @@ impl Memory {
     pub async fn save_session(&self, s: &PersistedSession) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO sessions (id, username, ssh_target, cwd, mode, kind, title, history, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
+            "INSERT INTO sessions (id, username, ssh_target, account, cwd, mode, kind, title, history, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10) \
              ON CONFLICT(id) DO UPDATE SET \
                ssh_target = EXCLUDED.ssh_target, \
+               account = EXCLUDED.account, \
                cwd = EXCLUDED.cwd, \
                mode = EXCLUDED.mode, \
                title = EXCLUDED.title, \
@@ -363,6 +368,7 @@ impl Memory {
                 s.id.to_string(),
                 s.username,
                 s.ssh_target,
+                s.account,
                 s.cwd,
                 s.mode,
                 s.kind,
@@ -378,7 +384,7 @@ impl Memory {
     pub async fn load_session(&self, id: Uuid) -> rusqlite::Result<Option<PersistedSession>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, username, ssh_target, cwd, mode, kind, title, history FROM sessions WHERE id = ?1",
+            "SELECT id, username, ssh_target, account, cwd, mode, kind, title, history FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.to_string()])?;
         match rows.next()? {
@@ -386,11 +392,12 @@ impl Memory {
                 id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                 username: row.get(1)?,
                 ssh_target: row.get(2)?,
-                cwd: row.get(3)?,
-                mode: row.get(4)?,
-                kind: row.get(5)?,
-                title: row.get(6)?,
-                history_json: row.get(7)?,
+                account: row.get(3)?,
+                cwd: row.get(4)?,
+                mode: row.get(5)?,
+                kind: row.get(6)?,
+                title: row.get(7)?,
+                history_json: row.get(8)?,
             })),
             None => Ok(None),
         }
@@ -404,7 +411,7 @@ impl Memory {
     ) -> rusqlite::Result<Vec<SessionSummary>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, username, ssh_target, cwd, mode, title, updated_at FROM sessions \
+            "SELECT id, username, ssh_target, account, cwd, mode, title, updated_at FROM sessions \
              WHERE username = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![username, limit], |row| {
@@ -412,10 +419,11 @@ impl Memory {
                 id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                 username: row.get(1)?,
                 ssh_target: row.get(2)?,
-                cwd: row.get(3)?,
-                mode: row.get(4)?,
-                title: row.get(5)?,
-                updated_at: row.get(6)?,
+                account: row.get(3)?,
+                cwd: row.get(4)?,
+                mode: row.get(5)?,
+                title: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
         let mut results = Vec::new();
@@ -426,6 +434,16 @@ impl Memory {
         }
         Ok(results)
     }
+
+    /// Delete all sessions for a specific account (e.g. "e-play").
+    pub async fn clear_sessions(&self, account: &str) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "DELETE FROM sessions WHERE account = ?1",
+            params![account],
+        )?;
+        Ok(n)
+    }
 }
 
 /// A session persisted to the DB — survives server restarts, shared
@@ -435,6 +453,7 @@ pub struct PersistedSession {
     pub id: Uuid,
     pub username: String,
     pub ssh_target: Option<String>,
+    pub account: Option<String>,
     pub cwd: String,
     pub mode: String,
     pub kind: String,
@@ -448,6 +467,7 @@ pub struct SessionSummary {
     pub id: Uuid,
     pub username: String,
     pub ssh_target: Option<String>,
+    pub account: Option<String>,
     pub cwd: String,
     pub mode: String,
     pub title: Option<String>,

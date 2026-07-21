@@ -99,6 +99,8 @@ pub enum ClientMessage {
     /// Create a new session, optionally bound to an SSH target
     /// (e.g. "e-work@e-desktop"). No target = local/quick session.
     NewSession { ssh_target: Option<String> },
+    /// Clear all sessions for a specific account (e.g. "e-play")
+    ClearSessions { account: String },
     Ping,
 }
 

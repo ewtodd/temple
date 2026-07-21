@@ -131,6 +131,8 @@ struct SessionCtx {
     ssh: Option<Arc<crate::ssh::SshExecutor>>,
     /// SSH target name (e.g. "e-work@e-desktop") for persistence/display
     ssh_target_name: Option<String>,
+    /// Client account name (e.g. "e-play") for per-account session clearing
+    account: Option<String>,
     /// Person who owns this session (token username, e.g. "ethan").
     owner: String,
     /// Session title (generated after first exchange)
@@ -308,9 +310,10 @@ impl Agent {
                 kind,
                 ssh,
                 ssh_target_name: None,
+                account: None,
                 owner: username.to_string(),
                 title: None,
-                persist: false,
+                persist: true,
                 permission_mode: PermissionMode::Default,
             },
         );
@@ -323,12 +326,12 @@ impl Agent {
         owner: &str,
         ssh_target: Option<&str>,
         start_dir: Option<&str>,
+        account: Option<&str>,
     ) -> Result<Uuid, String> {
         let session_id = Uuid::new_v4();
-        let (ssh, kind, cwd, full_name) = match ssh_target {
+        let (ssh, kind, cwd, full_name, account_name) = match ssh_target {
             Some(name) => {
-                // Prefix-match against configured targets (Signal strips @)
-                let target = self.ssh_targets.iter().find(|t| {
+                let t = self.ssh_targets.iter().find(|t| {
                     t.name == name
                         || t.name.starts_with(&format!("{name}@"))
                         || t.account == name
@@ -337,12 +340,18 @@ impl Agent {
                     "unknown ssh target: {name} (available: {})",
                     self.ssh_target_names().join(", ")
                 ))?;
-                let ssh = self.make_ssh(&target.name)
+                let ssh = self.make_ssh(&t.name)
                     .ok_or_else(|| "ssh key not configured".to_string())?;
                 let cwd = ssh.home_dir().await.unwrap_or_else(|_| "~".into());
-                (Some(ssh), SessionKind::Interactive, cwd, target.name)
+                (Some(ssh), SessionKind::Interactive, cwd, t.name, Some(t.account))
             }
-            None => (None, SessionKind::Interactive, "/var/lib/temple".to_string(), "temple".to_string()),
+            None => (
+                None,
+                SessionKind::Interactive,
+                "/var/lib/temple".to_string(),
+                "temple".to_string(),
+                account.map(|a| a.to_string()),
+            ),
         };
 
         // If a start_dir was given and we have an SSH executor, cd into it
@@ -372,6 +381,7 @@ impl Agent {
                 kind,
                 ssh,
                 ssh_target_name: Some(full_name),
+                account: account_name,
                 owner: owner.to_string(),
                 title: None,
                 persist: true,
@@ -440,6 +450,7 @@ impl Agent {
                 kind,
                 ssh,
                 ssh_target_name: row.ssh_target,
+                account: row.account,
                 owner: row.username,
                 title: row.title,
                 persist: true,
@@ -463,6 +474,7 @@ impl Agent {
                 id: session_id,
                 username: s.owner.clone(),
                 ssh_target: s.ssh_target_name.clone(),
+                account: s.account.clone(),
                 cwd: s.cwd.clone(),
                 mode: format!("{:?}", s.permission_mode).to_lowercase(),
                 kind: match s.kind {
