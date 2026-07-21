@@ -267,6 +267,10 @@ in
       environment.RUST_LOG = "temple_server=info";
       environment.HOME = "/var/lib/temple";
 
+      # ssh must be in PATH — SshExecutor spawns `ssh` (and the generated
+      # config's ProxyCommand spawns another `ssh`) for remote tool execution.
+      path = [ pkgs.openssh ];
+
       serviceConfig = {
         Type = "simple";
         User = "temple";
