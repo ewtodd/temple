@@ -492,6 +492,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // ── Normal message → route to active or personal session ──
+
+                    // Pure acks need no queue slot and no model — instant
+                    // canned reply. (Skipped in groups: acks would spam
+                    // everyone.)
+                    if group_id.is_none() {
+                        let norm = trimmed.trim_end_matches(['.', '!']).to_lowercase();
+                        const ACKS: &[&str] = &[
+                            "ok", "k", "kk", "okay", "thanks", "thank you", "thx", "ty",
+                            "lol", "nice", "cool", "got it", "bet", "word", "👍", "❤️",
+                        ];
+                        if ACKS.contains(&norm.as_str()) {
+                            send_conv(&signal, &sender, &group_id, "👍").await;
+                            return;
+                        }
+                    }
+
                     // Group chats share one session owned by "group"; DMs get
                     // a per-user session. The lock is held across the
                     // get-or-create so rapid consecutive messages can't
@@ -608,6 +624,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Partial response from a failed stream
                                 // attempt — drop it, a retry follows.
                                 response.lock().unwrap().clear();
+                            }
+                            agent::AgentEvent::ToolEvent { name, detail, .. }
+                                if name == "routing" || name == "queue" =>
+                            {
+                                // Immediate status: model + queue-position
+                                // ack, and the "your turn" notice.
+                                tokio::spawn({
+                                    let signal = signal_for_emit.clone();
+                                    let sender = sender_for_emit.clone();
+                                    let group = group_for_emit.clone();
+                                    async move {
+                                        send_conv(&signal, &sender, &group, &detail).await;
+                                    }
+                                });
                             }
                             _ => {}
                         }
@@ -806,9 +836,11 @@ async fn send_conv(
     group_id: &Option<String>,
     text: &str,
 ) {
+    // Signal doesn't render markdown — convert to its inline formatting
+    let text = crate::signal::markdown_to_signal(text);
     let result = match group_id {
-        Some(g) => signal.send_multi_group(g, text).await,
-        None => signal.send_multi(sender, text).await,
+        Some(g) => signal.send_multi_group(g, &text).await,
+        None => signal.send_multi(sender, &text).await,
     };
     if let Err(e) = result {
         tracing::warn!("signal send_conv to {}: {e}", group_id.as_deref().unwrap_or(sender));

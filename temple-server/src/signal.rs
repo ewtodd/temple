@@ -329,3 +329,66 @@ impl Signal {
 
 /// Shared signal client wrapped in a Mutex for concurrent access.
 pub type SharedSignal = Arc<Mutex<Signal>>;
+
+/// Convert common markdown to Signal's inline formatting. Signal renders
+/// *bold*, _italic_, ~strikethrough~ and `code` — not markdown **bold**,
+/// ~~strike~~, headers, links, or fenced code blocks.
+pub fn markdown_to_signal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue; // drop the fence line, keep the code
+        }
+        if in_code {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // ## Header → *Header*
+        let mut is_header = false;
+        let mut l = line;
+        if trimmed.starts_with('#') {
+            let after = trimmed.trim_start_matches('#');
+            if after.starts_with(' ') && !after.trim().is_empty() {
+                is_header = true;
+                l = after.trim();
+            }
+        }
+
+        let l = convert_links(l);
+        let l = l.replace("**", "*").replace("~~", "~");
+        if is_header {
+            out.push_str(&format!("*{}*\n", l.trim_matches('*')));
+        } else {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+    let trimmed_len = out.trim_end_matches('\n').len();
+    out.truncate(trimmed_len);
+    out
+}
+
+/// [text](url) → text (url)
+fn convert_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('[') {
+        let Some(mid) = rest[start..].find("](") else { break };
+        let Some(end) = rest[start + mid + 2..].find(')') else { break };
+        let text = &rest[start + 1..start + mid];
+        let url = &rest[start + mid + 2..start + mid + 2 + end];
+        out.push_str(&rest[..start]);
+        out.push_str(text);
+        out.push_str(" (");
+        out.push_str(url);
+        out.push(')');
+        rest = &rest[start + mid + 2 + end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
