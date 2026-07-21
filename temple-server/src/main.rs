@@ -641,11 +641,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Check if user hasn't verified yet (no UUID)
                     if let Ok(Some((_, _, uuid))) = memory.find_signal_user(&u.phone).await {
                         if uuid.is_none() {
+                            // First-contact sends to a number get rate
+                            // limited by Signal (24h) — respect the backoff
+                            // instead of extending it on every restart.
+                            let retry_at = memory.get_memory("welcome_retry_after", &u.username)
+                                .await
+                                .unwrap_or(None)
+                                .and_then(|s| s.parse::<i64>().ok());
+                            if let Some(ts) = retry_at {
+                                if chrono::Utc::now().timestamp() < ts {
+                                    tracing::info!(
+                                        "welcome to {} skipped — Signal rate limit until {ts}",
+                                        u.username
+                                    );
+                                    continue;
+                                }
+                            }
                             if let Err(e) = signal.send(
                                 &u.phone,
                                 "You've been added to renco! Send /verify to complete setup.",
                             ).await {
                                 tracing::warn!("welcome message to {} failed: {e}", u.phone);
+                                if let Some(secs) = parse_retry_after(&e) {
+                                    let deadline = chrono::Utc::now().timestamp() + secs;
+                                    let _ = memory.set_memory(
+                                        "welcome_retry_after",
+                                        &deadline.to_string(),
+                                        &u.username,
+                                    ).await;
+                                }
+                            } else {
+                                let _ = memory.set_memory("welcome_retry_after", "0", &u.username).await;
                             }
                         }
                     }
@@ -769,6 +795,17 @@ async fn send_conv(
     if let Err(e) = result {
         tracing::warn!("signal send_conv to {}: {e}", group_id.as_deref().unwrap_or(sender));
     }
+}
+
+/// Extract `retryAfterSeconds` from a signal-cli rate-limit error.
+fn parse_retry_after(err: &str) -> Option<i64> {
+    let key = "\"retryAfterSeconds\":";
+    let start = err.find(key)? + key.len();
+    let digits: String = err[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {    match memory.get_admins().await {
