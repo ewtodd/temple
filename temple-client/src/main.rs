@@ -9,9 +9,13 @@ use clap_complete::{self, Generator, Shell};
 use iocraft::prelude::*;
 use crossterm::event::MouseButton;
 use temple_protocol::*;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 const TEMPLE_ART: &str = include_str!("../../assets/temple.asc");
+
+/// Braille spinner frames for the working indicator.
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 #[derive(Parser)]
 #[command(name = "temple", about = "renco TUI client")]
@@ -90,6 +94,12 @@ struct AppState {
     history_stash: String,
     /// last session listing (for /session <n> selection)
     last_sessions: Vec<SessionMeta>,
+    /// an agent loop is in flight (set on send, cleared on stats/error)
+    working: bool,
+    /// when the current agent loop started (for the elapsed indicator)
+    work_started: Option<std::time::Instant>,
+    /// total display lines at last render (scroll anchoring)
+    last_total: usize,
 }
 
 // ── Background WebSocket thread ──
@@ -126,6 +136,7 @@ fn spawn_ws(
             // Reader: server → shared state
             let s = state.clone();
             tokio::spawn(async move {
+                let mut do_continue = do_continue;
                 while let Some(msg) = conn.incoming.recv().await {
                     // Handle ToolRequest outside the lock to avoid holding
                     // std::sync::MutexGuard (which is !Send) across .await
@@ -226,6 +237,8 @@ fn spawn_ws(
                             }
                         }
                         ServerMessage::ChatError { error, .. } => {
+                            s.working = false;
+                            s.work_started = None;
                             s.entries.push(ChatEntry::System(format!("error: {error}")));
                         }
                         ServerMessage::ChatStats {
@@ -248,15 +261,38 @@ fn spawn_ws(
                                 duration_ms as f64 / 1000.0,
                             );
                             if let Some(ChatEntry::Assistant { stats: st, .. }) =
-                                s.entries.last_mut()
+                                s.entries.iter_mut().rev()
+                                    .find(|e| matches!(e, ChatEntry::Assistant { .. }))
                             {
                                 *st = Some(stats);
                             }
                             s.model = model;
+                            s.working = false;
+                            s.work_started = None;
                         }
                         ServerMessage::ToolEvent { name, status, detail, .. } => {
-                            // Merge with previous tool entry if same tool in progress
-                            s.entries.push(ChatEntry::Tool { name, status, detail });
+                            // A Started entry is updated in place when its
+                            // tool finishes — one line per tool call.
+                            let can_merge = status != ToolStatus::Started && matches!(
+                                s.entries.last(),
+                                Some(ChatEntry::Tool {
+                                    name: ref n,
+                                    status: ToolStatus::Started,
+                                    ..
+                                }) if *n == name
+                            );
+                            if can_merge {
+                                if let Some(ChatEntry::Tool { status: st, detail: d, .. }) =
+                                    s.entries.last_mut()
+                                {
+                                    *st = status;
+                                    if !detail.is_empty() {
+                                        *d = detail;
+                                    }
+                                }
+                            } else {
+                                s.entries.push(ChatEntry::Tool { name, status, detail });
+                            }
                         }
                         ServerMessage::ModelList { models } => {
                             s.entries.push(ChatEntry::System(format!(
@@ -283,54 +319,87 @@ fn spawn_ws(
                             s.entries.push(ChatEntry::System(format!("mode → {mode:?}")));
                         }
                         ServerMessage::Shutdown => {
+                            s.working = false;
+                            s.work_started = None;
                             s.entries.push(ChatEntry::System("server shutdown".into()));
                             s.running = false;
                         }
                         ServerMessage::ChatCancelled { .. } => {
+                            s.working = false;
+                            s.work_started = None;
                             s.entries.push(ChatEntry::System("(cancelled by user)".into()));
                         }
+                        ServerMessage::ChatReset { .. } => {
+                            // Server is regenerating a message that failed
+                            // mid-stream — drop the partial assistant entry.
+                            if matches!(s.entries.last(), Some(ChatEntry::Assistant { .. })) {
+                                s.entries.pop();
+                            }
+                        }
                         ServerMessage::SessionList { sessions } => {
-                            if sessions.is_empty() {
+                            if do_continue {
+                                do_continue = false;
+                                // OpenSession already created a fresh (empty)
+                                // session which tops the recency list — skip
+                                // it and resume the most recent real one.
+                                match sessions.iter().find(|m| m.id != s.session_id) {
+                                    Some(prev) => {
+                                        let id = prev.id;
+                                        let target = prev.ssh_target.as_deref()
+                                            .unwrap_or("quick").to_string();
+                                        let title = prev.title.as_deref()
+                                            .unwrap_or("(untitled)").to_string();
+                                        s.entries.push(ChatEntry::System(format!(
+                                            "resuming most recent: {target} · {title}"
+                                        )));
+                                        let _ = tx_session.send(ClientMessage::ResumeSession {
+                                            session_id: id,
+                                        });
+                                    }
+                                    None => {
+                                        s.entries.push(ChatEntry::System(
+                                            "no previous sessions — fresh start".into(),
+                                        ));
+                                    }
+                                }
+                            } else if sessions.is_empty() {
                                 s.entries.push(ChatEntry::System(
                                     "no sessions — /new [target] to start one".into(),
                                 ));
                             } else {
-                                // Auto-resume the most recent if --continue
-                                if do_continue {
-                                    let first = sessions[0].id;
-                                    let target = sessions[0].ssh_target.as_deref().unwrap_or("quick");
-                                    let title = sessions[0].title.as_deref().unwrap_or("(untitled)");
+                                s.entries.push(ChatEntry::System(format!(
+                                    "sessions ({}):", sessions.len()
+                                )));
+                                for (i, m) in sessions.iter().enumerate() {
+                                    let id8: String = m.id.simple().to_string()
+                                        .chars().take(8).collect();
+                                    let target = m.ssh_target.as_deref().unwrap_or("quick");
+                                    let title = m.title.as_deref().unwrap_or("(untitled)");
                                     s.entries.push(ChatEntry::System(format!(
-                                        "resuming most recent: {target} · {title}"
+                                        "  [{i}] {id8} · {target} · {title}"
                                     )));
-                                    let _ = tx_session.send(ClientMessage::ResumeSession {
-                                        session_id: first,
-                                    });
-                                } else {
-                                    s.entries.push(ChatEntry::System(format!(
-                                        "sessions ({}):", sessions.len()
-                                    )));
-                                    for (i, m) in sessions.iter().enumerate() {
-                                        let id8: String = m.id.simple().to_string()
-                                            .chars().take(8).collect();
-                                        let target = m.ssh_target.as_deref().unwrap_or("quick");
-                                        let title = m.title.as_deref().unwrap_or("(untitled)");
-                                        s.entries.push(ChatEntry::System(format!(
-                                            "  [{i}] {id8} · {target} · {title}"
-                                        )));
-                                    }
-                                    s.entries.push(ChatEntry::System(
-                                        "  resume: /session <n>".into(),
-                                    ));
                                 }
+                                s.entries.push(ChatEntry::System(
+                                    "  resume: /session <n>".into(),
+                                ));
                             }
                             s.last_sessions = sessions;
                         }
                         ServerMessage::SessionResumed { session_id, meta, transcript } => {
                             s.session_id = session_id;
+                            s.working = false;
+                            s.work_started = None;
+                            // Restore input history so ↑ recalls prompts
+                            // typed in the resumed session.
+                            s.input_history = transcript.iter()
+                                .filter(|(role, _)| role == "user")
+                                .map(|(_, content)| content.clone())
+                                .collect();
+                            s.history_pos = None;
                             let target = meta.ssh_target.as_deref().unwrap_or("quick");
                             let title = meta.title.as_deref().unwrap_or("(untitled)");
                             s.entries.clear();
+                            s.last_total = 0;
                             s.entries.push(ChatEntry::System(format!(
                                 "📋 session {target} · {title}"
                             )));
@@ -428,6 +497,39 @@ fn osc52_copy(text: &str) {
 
 // ── Text wrapping & markdown-lite rendering ──
 
+/// Strip terminal-hostile characters from streamed content: tabs become
+/// spaces, C0/C1 control chars (except \n) are dropped. Raw control bytes
+/// desync iocraft's canvas model from the real terminal (row corruption).
+fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() && c != '\n' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Truncate to at most `max` display columns (wide chars count double).
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
 struct StyledLine {
     text: String,
     kind: LineKind,
@@ -464,15 +566,11 @@ fn render_markdown_lite(content: &str, width: usize) -> Vec<StyledLine> {
 
         if in_code {
             // code lines: indent, no wrap processing (truncate if needed)
-            let display = format!("  {raw_line}");
-            if display.chars().count() <= width {
-                out.push(StyledLine { text: display, kind: LineKind::Code });
-            } else {
-                out.push(StyledLine {
-                    text: display.chars().take(width).collect(),
-                    kind: LineKind::Code,
-                });
-            }
+            let display = sanitize(&format!("  {raw_line}"));
+            out.push(StyledLine {
+                text: truncate_to_width(&display, width),
+                kind: LineKind::Code,
+            });
         } else {
             // normal text: word-wrap
             for chunk in wrap_text(raw_line, width.max(10)) {
@@ -487,15 +585,27 @@ fn render_markdown_lite(content: &str, width: usize) -> Vec<StyledLine> {
     out
 }
 
-fn wrap_text(line: &str, width: usize) -> Vec<String> {
-    if line.chars().count() <= width {
+/// Wrap text to `width` display columns. Handles embedded newlines and
+/// strips control characters — every display path funnels through here.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for piece in text.split('\n') {
+        out.extend(wrap_piece(&sanitize(piece), width));
+    }
+    out
+}
+
+/// Word-wrap a single sanitized line by display width (not char count —
+/// wide chars like emoji/CJK must match iocraft's own width math).
+fn wrap_piece(line: &str, width: usize) -> Vec<String> {
+    if line.width() <= width {
         return vec![line.to_string()];
     }
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut current_w = 0usize;
     for word in line.split(' ') {
-        let wlen = word.chars().count();
+        let wlen = word.width();
         let need = if current.is_empty() { wlen } else { wlen + 1 };
         if current_w + need > width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
@@ -505,16 +615,19 @@ fn wrap_text(line: &str, width: usize) -> Vec<String> {
             current.push(' ');
             current_w += 1;
         }
-        // hard-split very long words
+        // hard-split very long words by display columns
         if wlen > width {
-            let mut rest = word;
-            while rest.chars().count() > width {
-                let cut: String = rest.chars().take(width).collect();
-                lines.push(cut.clone());
-                rest = &rest[cut.len()..];
+            let mut chunk_w = 0usize;
+            for ch in word.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if chunk_w + cw > width {
+                    lines.push(std::mem::take(&mut current));
+                    chunk_w = 0;
+                }
+                current.push(ch);
+                chunk_w += cw;
             }
-            current.push_str(rest);
-            current_w = rest.chars().count();
+            current_w = chunk_w;
         } else {
             current.push_str(word);
             current_w += wlen;
@@ -657,6 +770,8 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     cmd_h.send(ClientMessage::CancelChat {
                         session_id: s.session_id,
                     }).ok();
+                    s.working = false;
+                    s.work_started = None;
                     s.entries.push(ChatEntry::System("(cancelled)".into()));
                 }
                 Char('g') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -665,6 +780,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.entries.clear();
                     s.scroll = 0;
+                    s.last_total = 0;
                 }
                 Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.scroll = s.scroll.saturating_add(10);
@@ -796,6 +912,8 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                     }
                     s.entries.push(ChatEntry::User(content.clone()));
+                    s.working = true;
+                    s.work_started = Some(std::time::Instant::now());
                     cmd_h.send(ClientMessage::ChatInput {
                         session_id: s.session_id, content,
                     }).ok();
@@ -811,7 +929,8 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     });
 
     // ── Render ──
-    let s = state.lock().unwrap();
+    let tick_val = tick.get();
+    let mut s = state.lock().unwrap();
     let w = width.max(20) as usize;
     let h = height.max(5) as usize;
 
@@ -899,22 +1018,30 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let view_h = h.saturating_sub(prompt_h + status_h + art_lines);
     let total = lines.len();
     let max_scroll = total.saturating_sub(view_h);
-    let scroll = s.scroll.min(max_scroll);
+    // While scrolled up reading, pin the view to the same content: lines
+    // arriving below bump the offset instead of sliding the window.
+    let mut scroll = s.scroll.min(max_scroll);
+    if scroll > 0 && total > s.last_total {
+        scroll = (scroll + (total - s.last_total)).min(max_scroll);
+    }
+    s.scroll = scroll;
+    s.last_total = total;
     let start = max_scroll.saturating_sub(scroll);
     let visible: Vec<StyledLine> = lines
         .into_iter()
         .skip(start)
-        .take(view_h.max(1))
+        .take(view_h)
         .collect();
 
     // Store plain text of visible lines for mouse hit-testing.
-    let mut s = s;
     s.last_lines = visible.iter().map(|l| l.text.clone()).collect();
     let selection = s.selection;
     let s_model = s.model.clone();
     let s_status = s.status.clone();
     let s_prompt = s.prompt.clone();
     let s_permission = s.permission.clone();
+    let s_working = s.working;
+    let s_work_started = s.work_started;
     let banner = match &s.banner {
         Some((text, at)) if at.elapsed() < std::time::Duration::from_secs(3) => {
             Some(text.clone())
@@ -928,7 +1055,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     if show_art {
         for line in TEMPLE_ART.lines() {
             children.push(element! {
-                View(height: 1u16) {
+                View(height: 1u16, overflow: Overflow::Hidden) {
                     Text(content: line.to_string())
                 }
             }.into());
@@ -938,13 +1065,21 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Status line (banner takes over briefly)
     let status_text = if let Some(b) = banner {
         format!(" {b}")
+    } else if s_permission.is_some() {
+        " permission? (y/N)".to_string()
     } else {
         let model_info = if s_model.is_empty() { String::new() } else { format!(" · {s_model}") };
         let scroll_info = if scroll > 0 { format!(" · ↑{scroll}") } else { String::new() };
-        format!(" {s_status}{model_info}{scroll_info}")
+        if s_working {
+            let frame = SPINNER[(tick_val as usize / 2) % SPINNER.len()];
+            let secs = s_work_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            format!(" {frame} working… {secs}s{model_info}{scroll_info}")
+        } else {
+            format!(" {s_status}{model_info}{scroll_info}")
+        }
     };
     children.push(element! {
-        View(height: 1u16) {
+        View(height: 1u16, overflow: Overflow::Hidden) {
             Text(content: status_text)
         }
     }.into());
@@ -967,22 +1102,22 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         };
         let elem = match (color, in_sel) {
             (Some(c), true) => element! {
-                View(key: i as u64, height: 1u16, background_color: Color::DarkGrey) {
+                View(key: i as u64, height: 1u16, overflow: Overflow::Hidden, background_color: Color::DarkGrey) {
                     Text(content: l.text.clone(), color: Color::Black)
                 }
             },
             (Some(c), false) => element! {
-                View(key: i as u64, height: 1u16) {
+                View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
                     Text(content: l.text.clone(), color: c)
                 }
             },
             (None, true) => element! {
-                View(key: i as u64, height: 1u16, background_color: Color::DarkGrey) {
+                View(key: i as u64, height: 1u16, overflow: Overflow::Hidden, background_color: Color::DarkGrey) {
                     Text(content: l.text.clone(), color: Color::Black)
                 }
             },
             (None, false) => element! {
-                View(key: i as u64, height: 1u16) {
+                View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
                     Text(content: l.text.clone())
                 }
             },
@@ -1003,6 +1138,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     children.push(element! {
         View(
             height: 3u16,
+            overflow: Overflow::Hidden,
             border_style: BorderStyle::Round,
             border_color: Color::DarkGrey,
             background_color: Color::Black,
@@ -1050,6 +1186,9 @@ fn main() {
         history_pos: None,
         history_stash: String::new(),
         last_sessions: Vec::new(),
+        working: false,
+        work_started: None,
+        last_total: 0,
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();
