@@ -237,7 +237,11 @@ fn spawn_ws(
                                 s.entries.last_mut()
                             {
                                 content.push_str(&delta);
-                            } else {
+                            } else if !delta.trim().is_empty() {
+                                // Don't open an assistant bubble for
+                                // whitespace-only deltas — tool-call-only
+                                // rounds emit stray newlines, leaving empty
+                                // "renco ·" headers all over the scrollback.
                                 s.entries.push(ChatEntry::Assistant {
                                     content: delta,
                                     stats: None,
@@ -1102,10 +1106,17 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             }
             ChatEntry::Assistant { content, stats } => {
                 let model_tag = s.model.as_str();
-                lines.push(StyledLine {
-                    text: format!(" renco · {model_tag}"),
-                    kind: LineKind::AgentHeader,
-                });
+                if model_tag.is_empty() {
+                    lines.push(StyledLine {
+                        text: " renco".into(),
+                        kind: LineKind::AgentHeader,
+                    });
+                } else {
+                    lines.push(StyledLine {
+                        text: format!(" renco · {model_tag}"),
+                        kind: LineKind::AgentHeader,
+                    });
+                }
                 let body = render_markdown_lite(content, content_width.saturating_sub(2));
                 for l in body.iter() {
                     lines.push(StyledLine {
