@@ -20,7 +20,7 @@ impl Memory {
         // Use PRAGMA user_version to track schema migrations so we don't
         // run ALTER TABLE blindly every startup (which logs spurious errors
         // when columns already exist).
-        let user_version: i32 = conn
+        let mut user_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or(0);
 
@@ -80,6 +80,34 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             ",
         )?;
+
+        // Detect columns that already exist (pre-migration-version databases
+        // may have had blind ALTER TABLE on every startup). If a column
+        // exists at its target version, bump user_version past that migration.
+        let has_column = |table: &str, col: &str| -> bool {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).ok();
+            stmt.as_mut().map_or(false, |s| {
+                s.query_map([], |row| row.get::<_, String>(1))
+                    .ok()
+                    .map_or(false, |rows| {
+                        rows.filter_map(|r| r.ok()).any(|name| name == col)
+                    })
+            })
+        };
+
+        if has_column("sessions", "account") && user_version < 1 {
+            // Index may also already exist — create it idempotently
+            let _ = conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account)");
+            user_version = user_version.max(1);
+        }
+        if (has_column("signal_users", "admin") || has_column("signal_users", "priority")) && user_version < 2 {
+            user_version = user_version.max(2);
+        }
+
+        // Persist the detected starting point
+        if user_version > 0 {
+            let _ = conn.execute_batch(&format!("PRAGMA user_version = {user_version}"));
+        }
 
         // ── Incremental migrations (only run once) ──
         let migrate = |ver: i32, sql: &str| -> rusqlite::Result<()> {
