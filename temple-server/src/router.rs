@@ -2,6 +2,15 @@ use temple_protocol::ComplexityClass;
 use crate::litellm::{ChatMessage, ChatRequest, LiteLLM};
 use crate::config::ModelConfig;
 
+/// Session kind — determines system prompt tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// TUI or Signal session — full model routing + code rules
+    Interactive,
+    /// Cron job — minimal prompt, default model only
+    Headless,
+}
+
 /// Request router. Uses heuristics first, falls back to local small model
 /// for ambiguous cases. Maps complexity classes to configured fleet models.
 pub struct Router;
@@ -17,17 +26,6 @@ pub enum Route {
         executor: String,
         reviewer: String,
     },
-}
-
-/// What kind of session this is — determines system prompt tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionKind {
-    /// Quick question via Signal — no CWD, no coding rules
-    Quick,
-    /// Coding session with SSH/TUI access to a workstation
-    Coding,
-    /// Cron job — operates on oracle's local filesystem
-    System,
 }
 
 impl Router {
@@ -114,44 +112,27 @@ impl Router {
         }
     }
 
-    /// Map a complexity class to a concrete route using configured models.
-    /// The session kind influences which models are appropriate.
+    /// Map a complexity class to a concrete route.
     pub fn route(complexity: ComplexityClass, models: &ModelConfig, kind: SessionKind) -> Route {
-        match (complexity, kind) {
-            // Quick sessions (Signal): route to researcher for lookups,
-            // deepseek for complex, never the pipeline (no file access)
-            (ComplexityClass::Simple, SessionKind::Quick) => Route::Direct {
-                model: models.researcher_model.clone(),
-            },
-            (ComplexityClass::Medium, SessionKind::Quick) => Route::Direct {
-                model: models.researcher_model.clone(),
-            },
-            (ComplexityClass::Complex, SessionKind::Quick) => Route::Direct {
+        match kind {
+            SessionKind::Headless => Route::Direct {
                 model: models.default_model.clone(),
             },
-            (ComplexityClass::Critical, SessionKind::Quick) => Route::Direct {
-                model: models.critical_model.clone(),
-            },
-
-            // Coding sessions (TUI/SSH): full pipeline available
-            (ComplexityClass::Simple, SessionKind::Coding) => Route::Direct {
-                model: models.simple_model.clone(),
-            },
-            (ComplexityClass::Medium, SessionKind::Coding) => Route::Direct {
-                model: models.default_model.clone(),
-            },
-            (ComplexityClass::Complex, SessionKind::Coding) => Route::Pipeline {
-                planner: models.planner_model.clone(),
-                executor: models.executor_model.clone(),
-                reviewer: models.reviewer_model.clone(),
-            },
-            (ComplexityClass::Critical, SessionKind::Coding) => Route::Direct {
-                model: models.critical_model.clone(),
-            },
-
-            // System sessions (cron): always default model, no pipeline
-            (_, SessionKind::System) => Route::Direct {
-                model: models.default_model.clone(),
+            SessionKind::Interactive => match complexity {
+                ComplexityClass::Simple => Route::Direct {
+                    model: models.simple_model.clone(),
+                },
+                ComplexityClass::Medium => Route::Direct {
+                    model: models.default_model.clone(),
+                },
+                ComplexityClass::Complex => Route::Pipeline {
+                    planner: models.planner_model.clone(),
+                    executor: models.executor_model.clone(),
+                    reviewer: models.reviewer_model.clone(),
+                },
+                ComplexityClass::Critical => Route::Direct {
+                    model: models.critical_model.clone(),
+                },
             },
         }
     }

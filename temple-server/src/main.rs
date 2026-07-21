@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sys_session,
                 "signal",
                 &cfg2.data_dir_workspace(),
-                router::SessionKind::Quick,
+                router::SessionKind::Interactive,
                 None,
             ).await;
             let scope = Arc::new(Mutex::new(

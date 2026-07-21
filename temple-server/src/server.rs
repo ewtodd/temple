@@ -174,7 +174,7 @@ async fn handle_connection(
                             session_id,
                             auth_owner.as_deref().unwrap_or(&open.username),
                             &open.cwd,
-                            crate::router::SessionKind::Coding,
+                            crate::router::SessionKind::Interactive,
                             None,
                         ).await;
                     }

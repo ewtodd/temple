@@ -340,9 +340,9 @@ impl Agent {
                 let ssh = self.make_ssh(&target.name)
                     .ok_or_else(|| "ssh key not configured".to_string())?;
                 let cwd = ssh.home_dir().await.unwrap_or_else(|_| "~".into());
-                (Some(ssh), SessionKind::Coding, cwd, target.name)
+                (Some(ssh), SessionKind::Interactive, cwd, target.name)
             }
-            None => (None, SessionKind::Quick, "/var/lib/temple".to_string(), "quick".to_string()),
+            None => (None, SessionKind::Interactive, "/var/lib/temple".to_string(), "temple".to_string()),
         };
 
         // If a start_dir was given and we have an SSH executor, cd into it
@@ -402,7 +402,7 @@ impl Agent {
             .unwrap_or_default();
 
         let ssh = row.ssh_target.as_deref().and_then(|n| self.make_ssh(n));
-        let kind = if ssh.is_some() { SessionKind::Coding } else { SessionKind::Quick };
+        let kind = SessionKind::Interactive;
 
         // Build transcript of user/assistant text turns for client replay
         let transcript: Vec<(String, String)> = history.iter()
@@ -466,9 +466,8 @@ impl Agent {
                 cwd: s.cwd.clone(),
                 mode: format!("{:?}", s.permission_mode).to_lowercase(),
                 kind: match s.kind {
-                    SessionKind::Coding => "coding".into(),
-                    SessionKind::Quick => "quick".into(),
-                    SessionKind::System => "system".into(),
+                    SessionKind::Interactive => "interactive".into(),
+                    SessionKind::Headless => "headless".into(),
                 },
                 title: s.title.clone(),
                 history_json: serde_json::to_string(&s.history).unwrap_or_else(|_| "[]".into()),
@@ -487,7 +486,7 @@ impl Agent {
         if let Some(s) = sessions.get_mut(&session_id) {
             s.ssh = Some(ssh);
             s.ssh_target_name = Some(target_name.to_string());
-            s.kind = SessionKind::Coding;
+            s.kind = SessionKind::Interactive;
             Ok(())
         } else {
             Err("session not found".into())
@@ -1151,7 +1150,6 @@ impl Agent {
         let personality = self.memory.get_personality().await.unwrap_or_default();
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
-        // User-specific memories (always included)
         let user_memories = self.memory.get_all_memory(username).await.unwrap_or_default();
         let user_section = if user_memories.is_empty() {
             String::new()
@@ -1163,7 +1161,6 @@ impl Agent {
             s
         };
 
-        // Skills (always included — they're useful in any context)
         let skills = self.memory.get_all_skills().await.unwrap_or_default();
         let skills_section = if skills.is_empty() {
             String::new()
@@ -1179,34 +1176,24 @@ impl Agent {
         };
 
         match kind {
-            SessionKind::Quick => {
-                // Minimal prompt for Signal quick questions / research.
-                // No coding rules, no project context, no filesystem tools.
-                format!(
-                    "{personality}
-
-You are renco, an agentic assistant running on temple harness.
-You are talking to {username} right now.
-Current date: {now}{user_section}{skills_section}
-
-## Available tools
-You have tools for web search/fetch, NixOS queries, arXiv paper search,
-library docs (context7), and persistent memory (save_memory). Use them
-when they help. Use `save_memory` to remember facts about the user,
-their preferences, or anything worth recalling in future sessions.
-
-## Guidelines
-- Be direct and concise. No filler.
-- For factual questions, use web_search to get current information.
-- For library/framework questions, use context7.
-- For NixOS questions, use the nixos tool.
-- For research questions, use arxiv search.
-"
-                )
-            }
-            SessionKind::Coding => {
-                // Full prompt for coding sessions (TUI/SSH with filesystem access).
+            SessionKind::Interactive => {
                 let project_section = detect_project_context(cwd).await;
+                let has_code = !project_section.is_empty();
+                let code_rules = if has_code {
+                    // Include rules matching detected project types only
+                    let project_section_plus = detect_project_context(cwd).await;
+                    format!(
+                        "\n## Code rules (hardcoded — always follow)\n\
+                         - Prefer slightly verbose, self-explanatory code over terse code that needs comments.\n\
+                         - Keep comments to only what explains something non-obvious.\n\
+                         - Never embed a literal \\n inside a string. A line break is always its own statement.\n\
+                         {}\n",
+                        format_code_rules(&project_section_plus)
+                    )
+                } else {
+                    String::new()
+                };
+
                 format!(
                     "{personality}
 
@@ -1215,63 +1202,25 @@ You are talking to {username} right now.
 Current date: {now}{user_section}{skills_section}
 
 ## Available tools
-You have tools for filesystem access, shell commands, persistent memory, web
+You have filesystem access, shell commands, persistent memory, web
 search/fetch, NixOS queries, arXiv, and library docs (context7). Use them when
 they help. Use `save_memory` to remember facts about the user, their
 preferences, ongoing projects, or anything worth recalling in future sessions.
-
-## Code rules (hardcoded — always follow)
-- Prefer slightly verbose, self-explanatory code over terse code that needs comments.
-- Keep comments to only what explains something non-obvious.
-- Never embed a literal \\n inside a string. A line break is always its own statement.
-  In C++/ROOT, use std::cout << ... << std::endl. In Python, use separate print() calls.
-
-### Nix
-- Always use flakes and flake-based commands (nix run, nix shell, etc.).
-  Never use the old nix-shell approach.
-- If you are confused, stop and ask for help.
-- Follow the existing style of the surrounding modules.
-
-### C++ / ROOT
-- Use ROOT data types: Int_t for ordinary ints, Long64_t for entry counts and
-  64-bit values, Double_t for floating point, TString for string convenience.
-  Match width and signedness the code actually requires.
-- Do not use modern C++ features: no auto, no smart pointers, no range-based
-  iteration, no lambdas. Use explicit types and classic indexed/iterator loops.
-- In performance-critical code, gate logging behind a toggle so it can be disabled.
-
-### Python
-- In Python that uses ROOT, never use matplotlib. Look at nearby files for the
-  established plotting approach, or ask which is preferred.
-
-### Rust
-- Follow the existing style of the surrounding code.
-- Prefer explicit types where it aids readability.
-- Handle errors properly — no .unwrap() in production paths.
-
-### Explanations
-- For non-trivial changes, explain thoroughly what changed and why.
-  Do not over-summarize or truncate reasoning. Trivial edits stay terse.
+{code_rules}
 {project_section}
 
 ## Guidelines
 - Be direct and technical. No filler.
 - Prefer reading files over guessing their contents.
 - Use execute_command for builds/tests; check errors and fix them.
-- The working directory is the user's project root; relative paths resolve there.
 "
                 )
             }
-            SessionKind::System => {
-                // System prompt for cron jobs — operates on oracle's local FS.
+            SessionKind::Headless => {
                 format!(
                     "{personality}
-
 You are renco, running a scheduled maintenance task on temple harness.
-Current date: {now}
-
-## Available tools
-You have filesystem access, shell commands, and persistent memory.
+Current date: {now}. Filesystem access and shell commands are available.
 "
                 )
             }
@@ -1727,6 +1676,33 @@ fn truncate(s: &str, max: usize) -> String {
 /// Minimal shell escaping for directory paths in ssh commands.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Generate code rules that only cover the languages detected in the project
+/// section. If no specific language is detected, returns an empty string —
+/// no code rules are needed.
+fn format_code_rules(project_section: &str) -> String {
+    let mut rules = Vec::new();
+    let hay = project_section.to_lowercase();
+
+    if hay.contains("rust") {
+        rules.push("### Rust\n- Follow the existing style of the surrounding code.\n- Handle errors properly — no .unwrap() in production paths.");
+    }
+    if hay.contains("nix") {
+        rules.push("### Nix\n- Always use flakes and flake-based commands (nix run, nix shell, etc.).\n- Follow the existing style of the surrounding modules.");
+    }
+    if hay.contains("root/c++") || hay.contains("c++") || hay.contains("root") {
+        rules.push("### C++ / ROOT\n- Use ROOT data types. No modern C++ (no auto, no smart pointers, no lambdas).");
+    }
+    if hay.contains("python") {
+        rules.push("### Python\n- In Python that uses ROOT, never use matplotlib.");
+    }
+
+    if rules.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", rules.join("\n\n"))
+    }
 }
 
 /// Read-only commands that are safe to run without prompting.
