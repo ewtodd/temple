@@ -1151,8 +1151,25 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         }
     }
 
+    // Prompt box content — wrapped so the box can expand as you type.
+    // Inner width: borders (2) + "│ " prefix (2).
+    let prompt_inner_w = w.saturating_sub(4).max(1);
+    let prompt_lines: Vec<String> = if let Some((_, _, ref path, _)) = &s.permission {
+        wrap_text(&format!("Allow {}? (y/N)", sanitize(path)), prompt_inner_w)
+    } else if s.prompt.is_empty() {
+        vec![String::new()]
+    } else {
+        wrap_text(&sanitize(&s.prompt), prompt_inner_w)
+    };
+    // Grow up to 4 content rows, then scroll — the tail (cursor end)
+    // stays visible.
+    const MAX_PROMPT_ROWS: usize = 4;
+    let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
+    let prompt_h = shown_rows + 2; // + border rows
+    let prompt_window: Vec<String> =
+        prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
+
     // Scroll window
-    let prompt_h = 3usize;
     let status_h = 1usize;
     let view_h = h.saturating_sub(prompt_h + status_h + art_lines);
     let total = lines.len();
@@ -1179,7 +1196,6 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let selection = s.selection;
     let s_model = s.model.clone();
     let s_status = s.status.clone();
-    let s_prompt = s.prompt.clone();
     let s_permission = s.permission.clone();
     let s_working = s.working;
     let s_work_started = s.work_started;
@@ -1242,7 +1258,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             LineKind::Stats => Some(Color::DarkGrey),
         };
         let elem = match (color, in_sel) {
-            (Some(c), true) => element! {
+            (Some(_), true) => element! {
                 View(key: i as u64, height: 1u16, overflow: Overflow::Hidden, background_color: Color::DarkGrey) {
                     Text(content: l.text.clone(), color: Color::Black)
                 }
@@ -1266,25 +1282,20 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         children.push(elem.into());
     }
 
-    // Prompt box — bordered, subtle background, like opencode
-    let prompt_text = if let Some((_, _, ref path, _)) = s_permission {
-        format!("Allow {}? (y/N)", sanitize(path))
-    } else {
-        if s_prompt.is_empty() {
-            "│ ".into()
-        } else {
-            format!("│ {}", sanitize(&s_prompt))
-        }
-    };
+    // Prompt box — bordered, expands up to MAX_PROMPT_ROWS then scrolls
     children.push(element! {
         View(
-            height: 3u16,
+            height: prompt_h as u16,
             overflow: Overflow::Hidden,
             border_style: BorderStyle::Round,
             border_color: Color::DarkGrey,
             background_color: Color::Black,
         ) {
-            Text(content: prompt_text)
+            #(prompt_window.iter().enumerate().map(|(i, l)| element! {
+                View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
+                    Text(content: format!("│ {}", l))
+                }
+            }.into()).collect::<Vec<AnyElement<'static>>>().into_iter())
         }
     }.into());
 
