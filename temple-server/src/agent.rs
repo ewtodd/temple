@@ -162,6 +162,8 @@ pub struct Agent {
     pub models: ModelConfig,
     /// Global priority queue — one agent loop at a time across all sessions
     pub queue: crate::queue::RequestQueue,
+    /// Last time a real request started (keep-warm skips while this is fresh)
+    last_request: std::sync::Mutex<Instant>,
     router_model: String,
     title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
@@ -193,6 +195,7 @@ impl Agent {
             title_model: "qwen3-4b-instruct".to_string(),
             models,
             queue: crate::queue::RequestQueue::new(),
+            last_request: std::sync::Mutex::new(Instant::now() - std::time::Duration::from_secs(3600)),
             tools: Mutex::new(Vec::new()),
             ssh_targets: Vec::new(),
             ssh_key_path: None,
@@ -271,7 +274,15 @@ impl Agent {
     /// Ensure the brain model stays loaded in llamaswap.
     /// Does NOT send "ping" (that corrupts KV cache). Instead sends
     /// a minimal request that llama.cpp's prefix cache handles gracefully.
+    /// Skipped when real traffic recently hit the model — those requests
+    /// keep it resident on their own.
     pub async fn keep_warm(&self) {
+        {
+            let last = self.last_request.lock().unwrap();
+            if last.elapsed() < std::time::Duration::from_secs(300) {
+                return;
+            }
+        }
         // A 1-token completion with the same system prompt prefix as real
         // requests — llama.cpp caches the prefix, so this is cheap and
         // doesn't displace the real conversation cache.
@@ -365,10 +376,25 @@ impl Agent {
             if dir.is_empty() {
                 cwd
             } else {
-                let cmd = format!("cd ~/{} && pwd", shell_escape(dir));
+                // mkdir -p so /new target DIR works for dirs that don't
+                // exist yet. ssh.execute never errs on non-zero exit (it
+                // embeds "[exit N]" in the output), so validate that pwd
+                // actually returned a path.
+                let cmd = format!(
+                    "mkdir -p -- ~/{} && cd ~/{} && pwd",
+                    shell_escape(dir),
+                    shell_escape(dir)
+                );
                 match ssh.execute(&cmd).await {
-                    Ok(pwd) => pwd.trim().to_string(),
-                    Err(_) => cwd, // cd failed — keep home dir
+                    Ok(pwd) => {
+                        let pwd = pwd.trim();
+                        if pwd.starts_with('/') {
+                            pwd.to_string()
+                        } else {
+                            cwd // unexpected output — keep home dir
+                        }
+                    }
+                    Err(_) => cwd, // ssh failed — keep home dir
                 }
             }
         } else {
@@ -533,6 +559,19 @@ impl Agent {
                 s.history.iter()
                     .find(|m| m.role == "user")
                     .and_then(|m| m.content.clone())
+                    .map(|content| {
+                        // Group messages are stored as "sender: text" —
+                        // don't let the sender prefix leak into titles.
+                        if s.username == "group" {
+                            content
+                                .splitn(2, ": ")
+                                .nth(1)
+                                .unwrap_or(&content)
+                                .to_string()
+                        } else {
+                            content
+                        }
+                    })
             })
         };
         let Some(first_user_msg) = first_user_msg else {
@@ -704,33 +743,12 @@ impl Agent {
             )
         };
 
-        // ── Global priority queue ──
-        // One agent loop at a time across all sessions; higher-priority
-        // users (lower number: 0 ethan, 1 valarie, -1 default) jump ahead
-        // of whatever is queued. The permit is held until this fn returns.
-        let priority = self.memory.get_user_priority(priority_user.unwrap_or(&username)).await.unwrap_or(-1);
-        let queue_start = Instant::now();
-        let (_queue_permit, queued) = self.queue.acquire(priority).await;
-        if cancel_token.is_cancelled() {
-            // Cancelled while waiting in the queue — bail before doing any
-            // work (routing, prompts, title generation all cost time the
-            // queue could spend on requests that weren't cancelled).
-            self.cancel_tokens.lock().await.remove(&session_id);
-            return;
-        }
-        if queued {
-            tracing::info!(
-                "session {session_id} waited {:?} in queue (priority {priority})",
-                queue_start.elapsed()
-            );
-            emit(AgentEvent::ToolEvent {
-                name: "queue".into(),
-                status: ToolStatus::Finished,
-                detail: format!("queued behind another request (priority {priority})"),
-            });
-        }
-
-        // Route the query — heuristics only (skip local model call for speed)
+        // ── Per-model priority queue ──
+        // Route first (heuristics only, no LLM) so the queue lane is the
+        // target model: requests to different backends run in parallel,
+        // same-model requests serialize by priority (lower number first:
+        // 0 ethan, 1 valarie, -1 default). The permit is held until this
+        // fn returns.
         let route = if content.starts_with('/') || content.starts_with(':') {
             Route::Direct { model: session_model }
         } else {
@@ -738,6 +756,57 @@ impl Agent {
             tracing::info!("Router: {complexity:?} (kind={session_kind:?})");
             Router::route(complexity, &self.models, session_kind)
         };
+        let lane = match &route {
+            Route::Direct { model } => model.clone(),
+            Route::Pipeline { executor, .. } => executor.clone(),
+        };
+
+        // Immediate ack — before any queue wait — so the user knows their
+        // message is being worked on, what model(s), and how deep the line is.
+        {
+            let model_desc = match &route {
+                Route::Direct { model } => model.clone(),
+                Route::Pipeline { planner, executor, reviewer } => {
+                    format!("pipeline: {planner} → {executor} → {reviewer}")
+                }
+            };
+            let (busy, waiting) = self.queue.lane_status(&lane);
+            let ahead = waiting + busy as usize;
+            let detail = if ahead == 0 {
+                format!("⚡ {model_desc}")
+            } else {
+                format!("⏳ {model_desc} · ~{ahead} ahead")
+            };
+            emit(AgentEvent::ToolEvent {
+                name: "routing".into(),
+                status: ToolStatus::Finished,
+                detail,
+            });
+        }
+
+        let priority = self.memory.get_user_priority(priority_user.unwrap_or(&username)).await.unwrap_or(-1);
+        let queue_start = Instant::now();
+        let (_queue_permit, queued) = self.queue.acquire(&lane, priority).await;
+        if cancel_token.is_cancelled() {
+            // Cancelled while waiting in the queue — bail before doing any
+            // work (prompt building, title generation all cost time the
+            // lane could spend on requests that weren't cancelled).
+            self.cancel_tokens.lock().await.remove(&session_id);
+            return;
+        }
+        if queued {
+            let waited = queue_start.elapsed();
+            tracing::info!(
+                "session {session_id} waited {:?} in queue (lane {lane}, priority {priority})",
+                waited
+            );
+            emit(AgentEvent::ToolEvent {
+                name: "queue".into(),
+                status: ToolStatus::Finished,
+                detail: format!("your turn now (waited {}s)", waited.as_secs()),
+            });
+        }
+        *self.last_request.lock().unwrap() = Instant::now();
 
         let base_system_prompt = self.build_system_prompt(&username, &cwd, session_kind).await;
 
@@ -1290,14 +1359,13 @@ impl Agent {
                 let has_code = !project_section.is_empty();
                 let code_rules = if has_code {
                     // Include rules matching detected project types only
-                    let project_section_plus = detect_project_context(cwd).await;
                     format!(
                         "\n## Code rules (hardcoded — always follow)\n\
                          - Prefer slightly verbose, self-explanatory code over terse code that needs comments.\n\
                          - Keep comments to only what explains something non-obvious.\n\
                          - Never embed a literal \\n inside a string. A line break is always its own statement.\n\
                          {}\n",
-                        format_code_rules(&project_section_plus)
+                        format_code_rules(&project_section)
                     )
                 } else {
                     String::new()
@@ -1352,11 +1420,32 @@ Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
         let args = LiteLLM::recover_tool_call(args_json)
             .ok_or_else(|| format!("cannot parse arguments for {name}"))?;
 
+        // SSH sessions: resolve relative paths against the session's working
+        // directory (each ssh call starts in $HOME otherwise — /new target
+        // DIR would silently operate on ~).
+        let session_cwd = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id).map(|s| s.cwd.clone())
+        };
+        let in_cwd = |path: &str| -> String {
+            match &session_cwd {
+                Some(cwd)
+                    if ssh.is_some()
+                        && cwd.starts_with('/')
+                        && !path.starts_with('/')
+                        && !path.starts_with('~') =>
+                {
+                    format!("{}/{}", cwd.trim_end_matches('/'), path)
+                }
+                _ => path.to_string(),
+            }
+        };
+
         match name {
             "read_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
                 if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(path).await?;
+                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
                     self.check_ssh_perm(session_id, &resolved, AccessKind::Read, ssh, emit).await?;
                     ssh.read_file(&resolved).await
                 } else {
@@ -1379,7 +1468,7 @@ Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
                 let path = args["path"].as_str().ok_or("missing path")?;
                 let content = args["content"].as_str().ok_or("missing content")?;
                 if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(path).await?;
+                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
                     self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
                     ssh.write_file(&resolved, content).await
                 } else {
@@ -1401,7 +1490,7 @@ Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
             "list_dir" => {
                 let path = args["path"].as_str().unwrap_or(".");
                 if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(path).await?;
+                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
                     self.check_ssh_perm(session_id, &resolved, AccessKind::ReadDir, ssh, emit).await?;
                     ssh.list_dir(&resolved).await
                 } else {
@@ -1429,7 +1518,15 @@ Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
                     } else if !is_safe_command(command) {
                         self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
                     }
-                    ssh.execute(command).await
+                    // Run inside the session's working directory — each
+                    // ssh call starts fresh in $HOME otherwise.
+                    let command = match &session_cwd {
+                        Some(cwd) if cwd.starts_with('/') => {
+                            format!("cd -- {} && {}", shell_escape(cwd), command)
+                        }
+                        _ => command.to_string(),
+                    };
+                    ssh.execute(&command).await
                 } else {
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;

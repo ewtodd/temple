@@ -1,14 +1,17 @@
-//! Global priority request queue.
+//! Priority request queues, one lane per model.
 //!
-//! Exactly one agent loop runs at a time (the fleet behind litellm is the
-//! scarce resource). Queued requests are dequeued by priority — lower value
-//! first (0 = ethan, 1 = valarie, -1 = default for everyone else). Named
-//! tiers (priority >= 0) are FIFO so a user's consecutive messages keep
-//! their send order; the default tier shuffles so nobody is systematically
-//! last. Non-preemptive: a running request always finishes first.
+//! Requests to the same model/backend are serialized (the GPU host behind
+//! it is the scarce resource), but requests to DIFFERENT models run in
+//! parallel — a gemma chat on anton never blocks a deepseek agentic loop
+//! on son-of-anton. Within a lane, requests dequeue by priority — lower
+//! value first (0 = ethan, 1 = valarie, -1 = default for everyone else).
+//! Named tiers (priority >= 0) are FIFO so a user's consecutive messages
+//! keep their send order; the default tier shuffles so nobody is
+//! systematically last. Non-preemptive: a running request always finishes
+//! first.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use tokio::sync::oneshot;
@@ -44,14 +47,15 @@ impl Ord for Waiter {
     }
 }
 
-pub struct RequestQueue {
-    inner: Mutex<Inner>,
-    seq: AtomicU64,
-}
-
-struct Inner {
+#[derive(Default)]
+struct Lane {
     waiters: BinaryHeap<Waiter>,
     running: bool,
+}
+
+pub struct RequestQueue {
+    lanes: Mutex<HashMap<String, Lane>>,
+    seq: AtomicU64,
 }
 
 impl Default for RequestQueue {
@@ -63,22 +67,38 @@ impl Default for RequestQueue {
 impl RequestQueue {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                waiters: BinaryHeap::new(),
-                running: false,
-            }),
+            lanes: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
         }
     }
 
-    /// Take a place in line. Returns a permit to hold for the duration of
-    /// the request, and whether any waiting was required.
-    pub async fn acquire(&self, priority: i32) -> (QueuePermit<'_>, bool) {
+    /// Snapshot of a lane for user feedback: (a request is running, how
+    /// many are waiting). Approximate by nature — it's a status hint, not
+    /// a contract.
+    pub fn lane_status(&self, lane: &str) -> (bool, usize) {
+        let lanes = self.lanes.lock().unwrap();
+        match lanes.get(lane) {
+            Some(l) => (l.running, l.waiters.len()),
+            None => (false, 0),
+        }
+    }
+
+    /// Take a place in line for `lane` (typically the target model).
+    /// Returns a permit to hold for the duration of the request, and
+    /// whether any waiting was required.
+    pub async fn acquire(&self, lane: &str, priority: i32) -> (QueuePermit<'_>, bool) {
         let rx = {
-            let mut inner = self.inner.lock().unwrap();
-            if !inner.running && inner.waiters.is_empty() {
-                inner.running = true;
-                return (QueuePermit { queue: self }, false);
+            let mut lanes = self.lanes.lock().unwrap();
+            let lane_state = lanes.entry(lane.to_string()).or_default();
+            if !lane_state.running && lane_state.waiters.is_empty() {
+                lane_state.running = true;
+                return (
+                    QueuePermit {
+                        queue: self,
+                        lane: lane.to_string(),
+                    },
+                    false,
+                );
             }
             let (tx, rx) = oneshot::channel();
             let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
@@ -87,7 +107,7 @@ impl RequestQueue {
             } else {
                 rand::random()
             };
-            inner.waiters.push(Waiter {
+            lane_state.waiters.push(Waiter {
                 priority,
                 tiebreak,
                 ready: tx,
@@ -97,26 +117,37 @@ impl RequestQueue {
         // A dropped sender only means the queue itself is gone — proceed
         // rather than block forever.
         let _ = rx.await;
-        (QueuePermit { queue: self }, true)
+        (
+            QueuePermit {
+                queue: self,
+                lane: lane.to_string(),
+            },
+            true,
+        )
     }
 }
 
-/// While held, no other request starts. Dropping hands off to the
-/// highest-priority waiter.
+/// While held, no other request starts in this lane. Dropping hands off
+/// to the highest-priority waiter in the lane.
 pub struct QueuePermit<'a> {
     queue: &'a RequestQueue,
+    lane: String,
 }
 
 impl Drop for QueuePermit<'_> {
     fn drop(&mut self) {
-        let mut inner = self.queue.inner.lock().unwrap();
-        while let Some(w) = inner.waiters.pop() {
+        let mut lanes = self.queue.lanes.lock().unwrap();
+        let lane_state = match lanes.get_mut(&self.lane) {
+            Some(l) => l,
+            None => return,
+        };
+        while let Some(w) = lane_state.waiters.pop() {
             if w.ready.send(()).is_ok() {
                 // `running` stays true — ownership transferred to the waiter.
                 return;
             }
             // Waiter went away without collecting — try the next one.
         }
-        inner.running = false;
+        lane_state.running = false;
     }
 }
