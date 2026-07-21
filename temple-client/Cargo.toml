@@ -14,7 +14,7 @@ crossterm = "0.29"
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-dirs = "5"
+dirs = "6"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["full"] }
