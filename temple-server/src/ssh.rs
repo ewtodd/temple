@@ -19,31 +19,17 @@ impl SshExecutor {
         }
     }
 
-    /// Build the SSH command prefix (ssh -i key -p port [-J bastion] account@host)
+    /// Build the SSH args. All connection details (host, port, user, key,
+    /// bastion/relay) live in the generated ssh_config — we just use the
+    /// per-target Host alias (name with @ → -).
     fn ssh_args(&self, remote_command: &str) -> Vec<String> {
-        let mut args = vec![
+        let alias = self.target.name.replace('@', "-");
+        vec![
             "-F".into(),
             "/var/lib/temple/.ssh/config".into(),
-            "-i".into(),
-            self.key_path.display().to_string(),
-            "-p".into(),
-            self.target.port.to_string(),
-            "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
-            "-o".into(),
-            "ConnectTimeout=10".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-        ];
-
-        if let Some(ref bastion) = self.bastion {
-            args.push("-J".into());
-            args.push(bastion.clone());
-        }
-
-        args.push(format!("{}@{}", self.target.account, self.target.host));
-        args.push(remote_command.into());
-        args
+            alias,
+            remote_command.into(),
+        ]
     }
 
     /// Execute a command on the remote host.

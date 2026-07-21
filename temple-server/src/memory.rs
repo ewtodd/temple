@@ -55,6 +55,20 @@ impl Memory {
                 verified_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_signal_users_uuid ON signal_users(uuid);
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                ssh_target TEXT,
+                cwd TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'default',
+                kind TEXT NOT NULL DEFAULT 'quick',
+                title TEXT,
+                history TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             ",
         )?;
         Ok(Self {
@@ -329,4 +343,113 @@ impl Memory {
             None => Ok(None),
         }
     }
+
+    // ── Persistent sessions ──
+
+    /// Create or update a session row.
+    pub async fn save_session(&self, s: &PersistedSession) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sessions (id, username, ssh_target, cwd, mode, kind, title, history, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
+             ON CONFLICT(id) DO UPDATE SET \
+               ssh_target = EXCLUDED.ssh_target, \
+               cwd = EXCLUDED.cwd, \
+               mode = EXCLUDED.mode, \
+               title = EXCLUDED.title, \
+               history = EXCLUDED.history, \
+               updated_at = EXCLUDED.updated_at",
+            params![
+                s.id.to_string(),
+                s.username,
+                s.ssh_target,
+                s.cwd,
+                s.mode,
+                s.kind,
+                s.title,
+                s.history_json,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a session by id.
+    pub async fn load_session(&self, id: Uuid) -> rusqlite::Result<Option<PersistedSession>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, username, ssh_target, cwd, mode, kind, title, history FROM sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id.to_string()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(PersistedSession {
+                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                username: row.get(1)?,
+                ssh_target: row.get(2)?,
+                cwd: row.get(3)?,
+                mode: row.get(4)?,
+                kind: row.get(5)?,
+                title: row.get(6)?,
+                history_json: row.get(7)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// List recent sessions for a user (most recent first).
+    pub async fn list_sessions(
+        &self,
+        username: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<SessionSummary>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, username, ssh_target, cwd, mode, title, updated_at FROM sessions \
+             WHERE username = ?1 ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![username, limit], |row| {
+            Ok(SessionSummary {
+                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                username: row.get(1)?,
+                ssh_target: row.get(2)?,
+                cwd: row.get(3)?,
+                mode: row.get(4)?,
+                title: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            if let Ok(r) = row {
+                results.push(r);
+            }
+        }
+        Ok(results)
+    }
+}
+
+/// A session persisted to the DB — survives server restarts, shared
+/// between TUI and Signal.
+#[derive(Debug, Clone)]
+pub struct PersistedSession {
+    pub id: Uuid,
+    pub username: String,
+    pub ssh_target: Option<String>,
+    pub cwd: String,
+    pub mode: String,
+    pub kind: String,
+    pub title: Option<String>,
+    pub history_json: String,
+}
+
+/// Summary for session listing.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub username: String,
+    pub ssh_target: Option<String>,
+    pub cwd: String,
+    pub mode: String,
+    pub title: Option<String>,
+    pub updated_at: String,
 }

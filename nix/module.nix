@@ -131,6 +131,12 @@ in
           port = mkOption { type = types.port; default = 2222; description = "SSH port."; };
           owner = mkOption { type = types.str; description = "Temple username who owns this account."; };
           allowedDirs = mkOption { type = types.listOf types.str; default = [ ]; description = "Extra allowed dirs (beyond $HOME and /tmp)."; };
+          proxyCommand = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "ssh -F /var/lib/temple/.ssh/config bastion wake-and-relay-e-desktop";
+            description = "ProxyCommand for reaching this target (e.g. a wake-on-LAN relay on the bastion). Overrides ProxyJump.";
+          };
         };
       });
       default = [ ];
@@ -286,17 +292,45 @@ in
       });
     };
 
-    # SSH config for the temple user — defines the bastion alias
-    # used by ProxyJump to reach LAN workstations.
-    environment.etc."temple/ssh_config".text = ''
-      Host bastion
-        HostName 10.0.0.2
-        Port 2222
-        User deploy
-        IdentityFile /var/lib/temple/ssh_key
-        StrictHostKeyChecking accept-new
-    '';
-    # Temple reads this via SSH_OPTIONS or ~/.ssh/config
+    # SSH config for the temple user. One Host alias per target
+    # (name with @ replaced by -, e.g. e-work@e-desktop → e-work-e-desktop)
+    # plus the bastion. Targets with a proxyCommand (wake-on-LAN relay)
+    # use it; others ProxyJump through the bastion.
+    environment.etc."temple/ssh_config".text =
+      let
+        sanitize = name: builtins.replaceStrings [ "@" ] [ "-" ] name;
+        targetBlock = t: ''
+          Host ${sanitize t.name}
+            HostName ${t.host}
+            Port ${toString t.port}
+            User ${t.account}
+            IdentityFile ${if cfg.sshKeyPath != null then cfg.sshKeyPath else "/var/lib/temple/ssh_key"}
+            UserKnownHostsFile /var/lib/temple/.ssh/known_hosts
+            StrictHostKeyChecking accept-new
+            BatchMode yes
+            ConnectTimeout 15
+          ${if t.proxyCommand != null then
+            "  ProxyCommand ${t.proxyCommand}"
+          else if cfg.sshBastion != null then
+            "  ProxyJump ${cfg.sshBastion}"
+          else ""}
+        '';
+      in
+      ''
+        Host bastion
+          HostName 10.0.0.2
+          Port 2222
+          User deploy
+          IdentityFile ${if cfg.sshKeyPath != null then cfg.sshKeyPath else "/var/lib/temple/ssh_key"}
+          UserKnownHostsFile /var/lib/temple/.ssh/known_hosts
+          StrictHostKeyChecking accept-new
+          BatchMode yes
+          ControlMaster auto
+          ControlPath /var/lib/temple/.ssh/control-%r@%h-%p
+          ControlPersist 5m
+
+        ${concatStringsSep "\n" (map targetBlock cfg.sshTargets)}
+      '';
     systemd.tmpfiles.rules = [
       "d /var/lib/temple/.ssh 0700 temple temple - -"
       "L+ /var/lib/temple/.ssh/config - - - - /etc/temple/ssh_config"
