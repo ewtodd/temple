@@ -743,18 +743,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Notify all signal users that renco is online
+    // Notify admins that renco is online (not all users — restart spam)
     if cfg.signal.enabled {
-        match memory.get_signal_users().await {
-            Ok(users) => {
-                for (username, phone, uuid) in &users {
-                    let recipient = uuid.as_deref().unwrap_or(phone.as_str());
-                    signal.notify_recipient(recipient, "renco", "Temple server started, renco is online.")
-                        .await.ok();
-                }
-            }
-            Err(e) => tracing::warn!("get signal users for startup notify: {e}"),
-        }
+        notify_admins(&signal, &memory, "Temple server started, renco is online.").await;
     }
 
     // Run the WebSocket server
