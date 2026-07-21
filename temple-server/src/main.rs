@@ -222,17 +222,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Send typing indicator
-                    signal.send_typing(&sender).await.ok();
+                    if let Err(e) = signal.send_typing(&sender).await {
+                        tracing::warn!("send_typing: {e}");
+                    }
 
-                    // Start "still consulting" timer — sends a status message
-                    // every 2 minutes while the agent is still working.
+                    // Keep the typing bubble alive (expires after 15s) and
+                    // send a "still consulting" note every 2 minutes.
                     let signal_for_timer = signal.clone();
                     let sender_for_timer = sender.clone();
                     let timer_handle = tokio::spawn(async move {
+                        let mut ticks: u32 = 0;
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                            signal_for_timer.send(&sender_for_timer, "still consulting the oracle...").await.ok();
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            ticks += 1;
                             signal_for_timer.send_typing(&sender_for_timer).await.ok();
+                            if ticks % 12 == 0 {
+                                signal_for_timer
+                                    .send(&sender_for_timer, "still consulting the oracle...")
+                                    .await
+                                    .ok();
+                            }
                         }
                     });
 

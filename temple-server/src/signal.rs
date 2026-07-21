@@ -42,10 +42,11 @@ impl Signal {
 
         let req = json!({
             "jsonrpc": "2.0",
-            "method": "sendReadReceipt",
+            "method": "sendReceipt",
             "params": {
-                "recipient": [recipient],
-                "timestamps": [timestamp],
+                "recipient": recipient,
+                "targetTimestamp": [timestamp],
+                "type": "read",
             },
             "id": 1,
         });
@@ -60,10 +61,16 @@ impl Signal {
             .await
             .map_err(|e| format!("signal read: {e}"))?;
 
+        if let Ok(resp) = serde_json::from_str::<Value>(&response_line) {
+            if let Some(err) = resp.get("error") {
+                return Err(format!("sendReceipt error: {err}"));
+            }
+        }
         Ok(())
     }
 
-    /// Send a typing indicator to a recipient.
+    /// Send a typing indicator. Shows the typing bubble for ~15 seconds;
+    /// re-send periodically to keep it alive during long generations.
     pub async fn send_typing(&self, recipient: &str) -> Result<(), String> {
         if !self.config.enabled {
             return Ok(());
@@ -75,7 +82,7 @@ impl Signal {
 
         let req = json!({
             "jsonrpc": "2.0",
-            "method": "sendTypingMessage",
+            "method": "sendTyping",
             "params": {
                 "recipient": [recipient],
             },
@@ -86,7 +93,17 @@ impl Signal {
             .await
             .map_err(|e| format!("signal write: {e}"))?;
 
-        // Don't bother reading response — fire and forget
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line)
+            .await
+            .map_err(|e| format!("signal read: {e}"))?;
+
+        if let Ok(resp) = serde_json::from_str::<Value>(&response_line) {
+            if let Some(err) = resp.get("error") {
+                return Err(format!("sendTyping error: {err}"));
+            }
+        }
         Ok(())
     }
 
