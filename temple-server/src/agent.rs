@@ -158,8 +158,9 @@ pub struct Agent {
     router_model: String,
     title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
-    /// SSH targets for remote tool execution (from config)
-    ssh_targets: Vec<crate::config::SshTarget>,
+    /// SSH targets for remote tool execution (from config) — read by server
+    /// to auto-match client hostnames during OpenSession.
+    pub ssh_targets: Vec<crate::config::SshTarget>,
     ssh_key_path: Option<std::path::PathBuf>,
     ssh_bastion: Option<String>,
 }

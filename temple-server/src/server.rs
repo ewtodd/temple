@@ -157,8 +157,49 @@ async fn handle_connection(
             ClientMessage::OpenSession(open) => {
                 session_id = Uuid::new_v4();
                 if auth_owner.is_none() {
-                    // No token auth (LAN mode) — fall back to system username
                     auth_owner = Some(open.username.clone());
+                }
+                // Auto-match the client's hostname + username to an SSH target.
+                // e-work on e-desktop → finds e-work@e-desktop target → Coding session
+                // This means every `temple` invocation gets working tools immediately.
+                let ssh_target = agent.ssh_targets.iter().find(|t| {
+                    t.host == open.hostname && t.account == open.username
+                });
+                if let Some(target) = ssh_target {
+                    tracing::info!(
+                        "Auto-matched session to {} for {}@{}",
+                        target.name, open.username, open.hostname
+                    );
+                    // Create a persisted Coding session with SSH
+                    match agent.new_persisted_session(
+                        auth_owner.as_deref().unwrap_or(&open.username),
+                        Some(&target.name),
+                        None,
+                    ).await {
+                        Ok(sid) => {
+                            session_id = sid;
+                            // Also open the session in memory (it's already done by new_persisted_session)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Auto-match session failed: {e} — falling back to Quick");
+                            agent.open_session(
+                                session_id,
+                                auth_owner.as_deref().unwrap_or(&open.username),
+                                &open.cwd,
+                                crate::router::SessionKind::Quick,
+                                None,
+                            ).await;
+                        }
+                    }
+                } else {
+                    // No matching SSH target — plain Quick session (client-side tools only)
+                    agent.open_session(
+                        session_id,
+                        auth_owner.as_deref().unwrap_or(&open.username),
+                        &open.cwd,
+                        crate::router::SessionKind::Quick,
+                        None,
+                    ).await;
                 }
                 let scope = PermissionScope::new(
                     std::path::Path::new(&open.cwd),
@@ -167,13 +208,6 @@ async fn handle_connection(
                 )
                 .await;
                 permissions = Some(Arc::new(Mutex::new(scope)));
-                agent.open_session(
-                    session_id,
-                    auth_owner.as_deref().unwrap_or(&open.username),
-                    &open.cwd,
-                    crate::router::SessionKind::Quick,
-                    None,
-                ).await;
                 let info = SessionInfo {
                     session_id,
                     client_id: open.client_id.clone(),
