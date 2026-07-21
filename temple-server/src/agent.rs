@@ -522,31 +522,39 @@ impl Agent {
         };
 
         let mut messages = vec![ChatMessage::system(
-            "Generate a 3-5 word title for this conversation. Just the title, no quotes, no punctuation at the end."
+            "Generate a short title (2-6 words) for this conversation. \
+             Just the title. No quotes, no punctuation, no preamble."
         )];
         messages.extend(history);
 
+        // Use litellm proxy (fast), not the local oracle model (slow, unreliable)
         let req = ChatRequest {
-            model: self.title_model.clone(),
+            model: self.models.researcher_model.clone(), // gemma-4-31b on anton
             messages,
             tools: None,
             stream: Some(false),
             stream_options: None,
-            max_tokens: Some(30),
-            temperature: Some(0.3),
+            max_tokens: Some(20),
+            temperature: Some(0.2),
         };
 
-        if let Ok(resp) = self.local.chat(req).await {
-            if let Some(choice) = resp.choices.first() {
-                if let Some(content) = choice.message.content.as_deref() {
-                    let title = content.trim().to_string();
-                    if !title.is_empty() {
-                        let mut sessions = self.sessions.lock().await;
-                        if let Some(s) = sessions.get_mut(&session_id) {
-                            s.title = Some(title);
+        match self.litellm.chat(req).await {
+            Ok(resp) => {
+                if let Some(choice) = resp.choices.first() {
+                    if let Some(content) = choice.message.content.as_deref() {
+                        let title = content.trim().to_string();
+                        if !title.is_empty() && title.len() > 2 {
+                            let mut sessions = self.sessions.lock().await;
+                            if let Some(s) = sessions.get_mut(&session_id) {
+                                s.title = Some(title.clone());
+                            }
+                            tracing::info!("Session {session_id} title: {title}");
                         }
                     }
                 }
+            }
+            Err(e) => {
+                tracing::warn!("Title generation for {session_id} failed: {e}");
             }
         }
     }
