@@ -42,10 +42,14 @@ struct Cli {
     generate_completions: Option<Shell>,
 
     /// Generate a new auth token for a user.
-    /// Usage: --generate-token USERNAME PHONE
-    /// Writes `token:username:phone` to the auth_token_file and prints the token.
+    /// Usage: --generate-token USERNAME PHONE [--admin]
+    /// Writes `token:username:phone[:yes]` to the auth_token_file and prints the token.
     #[arg(long, num_args = 2, value_names = ["USERNAME", "PHONE"])]
     generate_token: Option<Vec<String>>,
+
+    /// Mark the generated user as an admin
+    #[arg(long)]
+    admin: bool,
 }
 
 impl Cli {
@@ -93,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(args) = &cli.generate_token {
         let username = &args[0];
         let phone = &args[1];
-        let token = generate_and_save_token(&cfg, username, phone)?;
+        let token = generate_and_save_token(&cfg, username, phone, cli.admin)?;
         println!("{token}");
         return Ok(());
     }
@@ -155,14 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let memory_for_signal = memory.clone();
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
-            let sys_session = uuid::Uuid::nil();
-            agent.open_session(
-                sys_session,
-                "signal",
-                &cfg2.data_dir_workspace(),
-                router::SessionKind::Interactive,
-                None,
-            ).await;
             let scope = Arc::new(Mutex::new(
                 permissions::PermissionScope::new(
                     std::path::Path::new(&cfg2.data_dir_workspace()),
@@ -175,7 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scope_for_handler = scope.clone();
             let signal_for_handler = signal.clone();
             let memory_for_handler = memory_for_signal.clone();
-            let token_file_for_handler = cfg2.auth_token_file.clone();
+            let auth_token_file = cfg2.auth_token_file.clone();
+            let data_dir_workspace = cfg2.data_dir_workspace();
             // Per-sender active session (session id chosen via /session, /new)
             let active_sessions: Arc<Mutex<std::collections::HashMap<String, uuid::Uuid>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -189,7 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
                 let memory = memory_for_handler.clone();
-                let token_file = token_file_for_handler.clone();
+                let token_file = auth_token_file.clone();
+                let workspace = data_dir_workspace.clone();
                 let active = active_for_handler.clone();
                 let perms = perms_for_handler.clone();
                 tokio::spawn(async move {
@@ -217,12 +215,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             &sender,
                                         ).await;
                                         signal.send(&sender, &format!(
-                                            "Verified! You are now registered as {}. You can send messages to renco.",
+                                            "Verified! You are now registered as {}.",
                                             auth_user.username
                                         )).await.ok();
+                                        notify_admins(&signal, &memory, &format!(
+                                            "{} (+{}...) just verified on Signal.",
+                                            auth_user.username, &auth_user.phone[..auth_user.phone.len().min(6)]
+                                        )).await;
                                         return;
                                     }
                                 }
+                                signal.send(&sender, "token not recognized — check with Ethan and try again.").await.ok();
+                                notify_admins(&signal, &memory, &format!(
+                                    "Someone from {sender} tried /verify with an invalid token."
+                                )).await;
+                                return;
                             }
                             tracing::warn!(
                                 "signal: ignoring message from unknown sender: {sender}"
@@ -236,8 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = memory.set_signal_user_uuid(&username, &sender).await;
                     }
 
-                    // ── Session commands ──
                     let trimmed = message.trim();
+
+                    // ── Session commands ──
 
                     // ── Pending permission reply (y/N) ──
                     {
@@ -254,6 +262,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             }
                         }
+                    }
+
+                    if let Some(msg) = trimmed.strip_prefix("/broadcast ") {
+                        let body = msg.trim();
+                        if body.is_empty() {
+                            signal.send(&sender, "usage: /broadcast <message>").await.ok();
+                            return;
+                        }
+                        // Admin check: sender must be in the admin list
+                        let admins = memory.get_admins().await.unwrap_or_default();
+                        let is_admin = admins.iter().any(|(phone, uuid)| {
+                            phone == &sender || uuid.as_deref() == Some(&sender)
+                        });
+                        if !is_admin {
+                            signal.send(&sender, "admin only").await.ok();
+                            return;
+                        }
+                        match memory.get_signal_users().await {
+                            Ok(users) => {
+                                let mut count = 0;
+                                for (_, phone, uuid) in &users {
+                                    let recipient = uuid.as_deref().unwrap_or(phone);
+                                    if signal.send(recipient, &format!("📢 renco: {body}")).await.is_ok() {
+                                        count += 1;
+                                    }
+                                }
+                                signal.send(&sender, &format!("sent to {count} users")).await.ok();
+                            }
+                            Err(e) => { signal.send(&sender, &format!("error: {e}")).await.ok(); }
+                        }
+                        return;
                     }
 
                     if trimmed == "/help" {
@@ -373,7 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if trimmed == "/quick" {
                         active.lock().await.remove(&sender);
-                        signal.send(&sender, "📋 back to quick session").await.ok();
+                        signal.send(&sender, "📋 back to default session").await.ok();
                         return;
                     }
 
@@ -399,9 +438,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
 
-                    // ── Normal message → route to active or quick session ──
-                    let target_session = active.lock().await.get(&sender).copied()
-                        .unwrap_or(sys_session);
+                    // ── Normal message → route to active or personal session ──
+                    let target_session = {
+                        let active_id = active.lock().await.get(&sender).copied();
+                        match active_id {
+                            Some(id) => id,
+                            None => {
+                                // Create a per-user session with the correct username
+                                // (not the shared sys_session with "signal" as username)
+                                let new_id = uuid::Uuid::new_v4();
+                                agent.open_session(
+                                    new_id,
+                                    &username,
+                                    &workspace,
+                                    router::SessionKind::Interactive,
+                                    None,
+                                ).await;
+                                active.lock().await.insert(sender.clone(), new_id);
+                                new_id
+                            }
+                        }
+                    };
 
                     // Send typing indicator
                     if let Err(e) = signal.send_typing(&sender).await {
@@ -471,20 +528,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let text = resp.lock().unwrap().clone();
                     if !text.trim().is_empty() {
                         // Preamble for non-quick sessions
-                        let full = if target_session != sys_session {
+                        let full = {
                             let (target, title) = agent.session_display(target_session)
                                 .await
                                 .unwrap_or((None, None));
                             let id8: String = target_session.simple().to_string().chars().take(8).collect();
                             format!(
                                 "📋 {} · {}{}\n\n{}",
-                                target.as_deref().unwrap_or("quick"),
+                                target.as_deref().unwrap_or("temple"),
                                 id8,
                                 title.map(|t| format!(" · {t}")).unwrap_or_default(),
                                 text
                             )
-                        } else {
-                            text
                         };
                         signal.send_multi(&sender, &full).await.ok();
                     }
@@ -504,10 +559,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Check if user hasn't verified yet (no UUID)
                     if let Ok(Some((_, _, uuid))) = memory.find_signal_user(&u.phone).await {
                         if uuid.is_none() {
-                    signal.send(
-                        &u.phone,
-                        "You've been added to renco! Send /verify to complete setup.",
-                    ).await.ok();
+                            signal.send(
+                                &u.phone,
+                                "You've been added to renco! Send /verify to complete setup.",
+                            ).await.ok();
                         }
                     }
                 }
@@ -555,6 +610,7 @@ fn generate_and_save_token(
     cfg: &config::Config,
     username: &str,
     phone: &str,
+    admin: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use rand::Rng;
     let token: String = (0..32)
@@ -577,7 +633,11 @@ fn generate_and_save_token(
         std::fs::create_dir_all(parent)?;
     }
 
-    let line = format!("{token}:{username}:{phone}\n");
+    let line = if admin {
+        format!("{token}:{username}:{phone}:yes\n")
+    } else {
+        format!("{token}:{username}:{phone}\n")
+    };
     let mut existing = std::fs::read_to_string(token_file).unwrap_or_default();
     // Remove any existing line for this username (re-generating replaces)
     existing.retain(|c| c != '\n' && c != '\r');
@@ -595,4 +655,21 @@ fn generate_and_save_token(
     std::fs::write(token_file, new_content)?;
 
     Ok(token)
+}
+
+async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {
+    match memory.get_admins().await {
+        Ok(admins) if !admins.is_empty() => {
+            for (phone, uuid) in &admins {
+                let recipient = uuid.as_deref().unwrap_or(phone);
+                signal.send(recipient, message).await.ok();
+            }
+        }
+        Ok(_) => {
+            tracing::warn!("notify_admins: no admins configured");
+        }
+        Err(e) => {
+            tracing::warn!("notify_admins: {e}");
+        }
+    }
 }

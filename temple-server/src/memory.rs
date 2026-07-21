@@ -20,6 +20,7 @@ impl Memory {
         // Run migrations without lock — we own the connection
         // 1. Run ALTER TABLE first (column must exist before indexes reference it)
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN account TEXT");
+        let _ = conn.execute_batch("ALTER TABLE signal_users ADD COLUMN admin TEXT DEFAULT 'no'");
         // 2. Run schema creation
         conn.execute_batch(
             "
@@ -283,12 +284,13 @@ impl Memory {
         &self,
         username: &str,
         phone: &str,
+        admin: bool,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO signal_users (username, phone) VALUES (?1, ?2) \
-             ON CONFLICT(username) DO UPDATE SET phone = EXCLUDED.phone",
-            params![username, phone],
+            "INSERT INTO signal_users (username, phone, admin) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(username) DO UPDATE SET phone = EXCLUDED.phone, admin = EXCLUDED.admin",
+            params![username, phone, if admin { "yes" } else { "no" }],
         )?;
         Ok(())
     }
@@ -444,6 +446,24 @@ impl Memory {
             params![account],
         )?;
         Ok(n)
+    }
+
+    /// Get all admin users' phone numbers + UUIDs.
+    pub async fn get_admins(&self) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT phone, uuid FROM signal_users WHERE admin = 'yes'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            if let Ok(r) = row {
+                results.push(r);
+            }
+        }
+        Ok(results)
     }
 }
 
