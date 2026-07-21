@@ -250,6 +250,11 @@ in
       isSystemUser = true;
       group = "temple";
       description = "temple renco agent";
+      home = "/var/lib/temple";
+      # A real shell is required: ssh executes ProxyCommand via the user's
+      # login shell, and nologin breaks the wake-and-relay proxy with
+      # "This account is currently not available." as the SSH banner.
+      shell = pkgs.bash;
     };
     users.groups.temple = { };
 
