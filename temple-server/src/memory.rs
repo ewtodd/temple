@@ -18,6 +18,9 @@ impl Memory {
         }
         let conn = Connection::open(path)?;
         // Run migrations without lock — we own the connection
+        // 1. Run ALTER TABLE first (column must exist before indexes reference it)
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN account TEXT");
+        // 2. Run schema creation
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS conversations (
@@ -73,8 +76,6 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             ",
         )?;
-        // Migration: account column (added after initial deploy)
-        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN account TEXT");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })

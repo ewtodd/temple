@@ -504,15 +504,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Check if user hasn't verified yet (no UUID)
                     if let Ok(Some((_, _, uuid))) = memory.find_signal_user(&u.phone).await {
                         if uuid.is_none() {
-                            signal.send(
-                                &u.phone,
-                                &format!(
-                                    "Welcome to renco! You've been added by Ethan.\n\n\
-                                     Send this to verify your account:\n\
-                                     /verify {}",
-                                    u.token,
-                                ),
-                            ).await.ok();
+                    signal.send(
+                        &u.phone,
+                        "You've been added to renco! Send /verify to complete setup.",
+                    ).await.ok();
                         }
                     }
                 }
