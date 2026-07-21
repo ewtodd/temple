@@ -1225,7 +1225,8 @@ preferences, ongoing projects, or anything worth recalling in future sessions.
 - Be direct and technical. No filler.
 - Prefer reading files over guessing their contents.
 - Use execute_command for builds/tests; check errors and fix them.
-"
+- When committing code changes, do NOT add a Co-authored-by trailer. The
+  git author is always the human user."
                 )
             }
             SessionKind::Headless => {
@@ -1233,6 +1234,9 @@ preferences, ongoing projects, or anything worth recalling in future sessions.
                     "{personality}
 You are renco, running a scheduled maintenance task on temple harness.
 Current date: {now}. Filesystem access and shell commands are available.
+When committing changes (flake update, code review, etc.), always add
+this line to the commit message:
+Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
 "
                 )
             }
