@@ -472,11 +472,14 @@ impl Memory {
         Ok(results)
     }
 
-    /// Delete all sessions for a specific account (e.g. "e-play").
+    /// Delete all sessions for a user — matches the token identity
+    /// (username, e.g. "ethan") OR a machine account (e.g. "e-play").
+    /// Signal-created sessions have account NULL, so matching only the
+    /// account column silently deletes nothing for them.
     pub async fn clear_sessions(&self, account: &str) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().await;
         let n = conn.execute(
-            "DELETE FROM sessions WHERE account = ?1",
+            "DELETE FROM sessions WHERE account = ?1 OR username = ?1",
             params![account],
         )?;
         Ok(n)

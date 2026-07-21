@@ -318,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              /quick — back to the default session\n\
                              /stop — interrupt the running request\n\
                              /reset — cancel ALL in-flight requests (admin)\n\
-                             /clear <account> — delete all sessions for an account (admin)\n\
+                             /clear <user|account> — delete sessions for a user (admin)\n\
                              /targets — list ssh targets\n\
                              /help — this"
                         ).await;

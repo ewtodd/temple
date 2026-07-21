@@ -960,7 +960,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/sessions · /session N · /new [target] [dir] · /stop · /clear <account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] [dir] · /stop · /clear <user|account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }

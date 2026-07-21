@@ -752,6 +752,14 @@ impl Agent {
         // fn returns.
         let route = if content.starts_with('/') || content.starts_with(':') {
             Route::Direct { model: session_model }
+        } else if content.to_lowercase().contains("pipeline") {
+            // Explicit ask: "use the pipeline" forces planner→executor→reviewer
+            tracing::info!("Router: explicit pipeline request");
+            Route::Pipeline {
+                planner: self.models.planner_model.clone(),
+                executor: self.models.executor_model.clone(),
+                reviewer: self.models.reviewer_model.clone(),
+            }
         } else {
             let complexity = Router::classify(content);
             tracing::info!("Router: {complexity:?} (kind={session_kind:?})");
@@ -993,7 +1001,7 @@ impl Agent {
         &self,
         model: &str,
         user_prompt: &str,
-        _cancel_token: &CancellationToken,
+        cancel_token: &CancellationToken,
     ) -> String {
         let req = ChatRequest {
             model: model.to_string(),
@@ -1017,19 +1025,24 @@ impl Agent {
             temperature: Some(0.3),
         };
 
-        match self.litellm.chat(req).await {
-            Ok(resp) => {
-                if let Some(choice) = resp.choices.first() {
-                    if let Some(content) = choice.message.content.as_deref() {
-                        return content.trim().to_string();
+        tokio::select! {
+            resp = self.litellm.chat(req) => {
+                match resp {
+                    Ok(resp) => {
+                        if let Some(choice) = resp.choices.first() {
+                            if let Some(content) = choice.message.content.as_deref() {
+                                return content.trim().to_string();
+                            }
+                        }
+                        "No plan generated — proceed directly.".into()
+                    }
+                    Err(e) => {
+                        tracing::warn!("Planner call failed: {e}");
+                        format!("(planner error: {e} — proceed directly)")
                     }
                 }
-                "No plan generated — proceed directly.".into()
             }
-            Err(e) => {
-                tracing::warn!("Planner call failed: {e}");
-                format!("(planner error: {e} — proceed directly)")
-            }
+            _ = cancel_token.cancelled() => "(cancelled)".into(),
         }
     }
 
@@ -1040,7 +1053,7 @@ impl Agent {
         model: &str,
         user_prompt: &str,
         executor_output: &str,
-        _cancel_token: &CancellationToken,
+        cancel_token: &CancellationToken,
     ) -> (bool, String) {
         let req = ChatRequest {
             model: model.to_string(),
@@ -1065,27 +1078,32 @@ impl Agent {
             temperature: Some(0.2),
         };
 
-        match self.litellm.chat(req).await {
-            Ok(resp) => {
-                if let Some(choice) = resp.choices.first() {
-                    if let Some(content) = choice.message.content.as_deref() {
-                        let trimmed = content.trim();
-                        if trimmed.to_uppercase().starts_with("APPROVED") {
-                            return (true, String::new());
+        tokio::select! {
+            resp = self.litellm.chat(req) => {
+                match resp {
+                    Ok(resp) => {
+                        if let Some(choice) = resp.choices.first() {
+                            if let Some(content) = choice.message.content.as_deref() {
+                                let trimmed = content.trim();
+                                if trimmed.to_uppercase().starts_with("APPROVED") {
+                                    return (true, String::new());
+                                }
+                                if let Some(feedback) = trimmed.strip_prefix("REVISE:") {
+                                    return (false, feedback.trim().to_string());
+                                }
+                                // Unexpected format — treat as revision request
+                                return (false, trimmed.to_string());
+                            }
                         }
-                        if let Some(feedback) = trimmed.strip_prefix("REVISE:") {
-                            return (false, feedback.trim().to_string());
-                        }
-                        // Unexpected format — treat as revision request
-                        return (false, trimmed.to_string());
+                        (true, String::new())
+                    }
+                    Err(e) => {
+                        tracing::warn!("Reviewer call failed: {e}");
+                        (true, String::new())
                     }
                 }
-                (true, String::new())
             }
-            Err(e) => {
-                tracing::warn!("Reviewer call failed: {e}");
-                (true, String::new())
-            }
+            _ = cancel_token.cancelled() => (true, String::new()),
         }
     }
 
@@ -1158,7 +1176,17 @@ impl Agent {
                     let mut attempt_error: Option<String> = None;
                     let mut attempt_had_output = false;
                     stream_first_delta = None;
-                    while let Some(ev) = rx.recv().await {
+                    loop {
+                        // select! on cancellation — a hung stream produces no
+                        // events, so a recv-only loop never notices /reset
+                        // or /stop until the idle timeout fires.
+                        let ev = tokio::select! {
+                            ev = rx.recv() => match ev {
+                                Some(ev) => ev,
+                                None => break,
+                            },
+                            _ = cancel_token.cancelled() => break,
+                        };
                         if cancel_token.is_cancelled() { break; }
                         match ev {
                             StreamEvent::Delta(d) => {
