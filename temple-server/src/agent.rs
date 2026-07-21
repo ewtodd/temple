@@ -1403,9 +1403,14 @@ preferences, ongoing projects, or anything worth recalling in future sessions.
                     "{personality}
 You are renco, running a scheduled maintenance task on temple harness.
 Current date: {now}. Filesystem access and shell commands are available.
-When committing changes (flake update, code review, etc.), always add
-this line to the commit message:
-Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
+
+Git conventions:
+- In the temple repo: commit as renco-bot, no Co-authored-by trailer:
+  git -c user.name=renco-bot -c user.email=307402699+renco-bot@users.noreply.github.com commit -m \"...\"
+  and push with his key:
+  git -c core.sshCommand=\"ssh -i /var/lib/temple/renco_bot_github -o IdentitiesOnly=yes\" push
+- In /etc/nixos: commit normally (human author) and add this trailer:
+  Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
 "
                 )
             }
