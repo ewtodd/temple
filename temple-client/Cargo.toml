@@ -22,7 +22,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { version = "0.3", features = ["sink"] }
 chrono = { version = "0.4" }
 smol = "2"
-whoami = "1"
+whoami = "2"
 tracing = "0.1"
 base64 = "0.22"
 native-tls = "0.2"
