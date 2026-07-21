@@ -29,9 +29,9 @@ impl Signal {
         self.config.enabled
     }
 
-    /// Send a read receipt for a message timestamp. This marks the message
-    /// as "read" on the sender's phone.
-    pub async fn send_read_receipt(&self, recipient: &str, timestamp: u64) -> Result<(), String> {
+    /// One JSON-RPC call over a fresh TCP connection: write the request
+    /// line, read the response line, surface any error field.
+    async fn rpc_call(&self, method: &str, params: Value) -> Result<(), String> {
         if !self.config.enabled {
             return Ok(());
         }
@@ -42,12 +42,8 @@ impl Signal {
 
         let req = json!({
             "jsonrpc": "2.0",
-            "method": "sendReceipt",
-            "params": {
-                "recipient": recipient,
-                "targetTimestamp": [timestamp],
-                "type": "read",
-            },
+            "method": method,
+            "params": params,
             "id": 1,
         });
         let line = format!("{}\n", req.to_string());
@@ -63,94 +59,66 @@ impl Signal {
 
         if let Ok(resp) = serde_json::from_str::<Value>(&response_line) {
             if let Some(err) = resp.get("error") {
-                return Err(format!("sendReceipt error: {err}"));
+                return Err(format!("{method} error: {err}"));
             }
         }
         Ok(())
+    }
+
+    /// Send a read receipt for a message timestamp. This marks the message
+    /// as "read" on the sender's phone.
+    pub async fn send_read_receipt(&self, recipient: &str, timestamp: u64) -> Result<(), String> {
+        self.rpc_call("sendReceipt", json!({
+            "recipient": recipient,
+            "targetTimestamp": [timestamp],
+            "type": "read",
+        })).await
     }
 
     /// Send a typing indicator. Shows the typing bubble for ~15 seconds;
     /// re-send periodically to keep it alive during long generations.
     pub async fn send_typing(&self, recipient: &str) -> Result<(), String> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        let mut stream = TcpStream::connect(&self.config.socket_addr)
-            .await
-            .map_err(|e| format!("signal connect: {e}"))?;
-
-        let req = json!({
-            "jsonrpc": "2.0",
-            "method": "sendTyping",
-            "params": {
-                "recipient": [recipient],
-            },
-            "id": 1,
-        });
-        let line = format!("{}\n", req.to_string());
-        stream.write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("signal write: {e}"))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader.read_line(&mut response_line)
-            .await
-            .map_err(|e| format!("signal read: {e}"))?;
-
-        if let Ok(resp) = serde_json::from_str::<Value>(&response_line) {
-            if let Some(err) = resp.get("error") {
-                return Err(format!("sendTyping error: {err}"));
-            }
-        }
-        Ok(())
+        self.rpc_call("sendTyping", json!({
+            "recipient": [recipient],
+        })).await
     }
 
-    /// Send a message to a recipient. Opens a fresh TCP connection, sends
-    /// the JSON-RPC `send` command, reads the response, closes.
+    /// Typing indicator for a group chat.
+    pub async fn send_typing_group(&self, group_id: &str) -> Result<(), String> {
+        self.rpc_call("sendTyping", json!({
+            "groupId": group_id,
+        })).await
+    }
+
+    /// Send a message to a recipient.
     pub async fn send(&self, recipient: &str, message: &str) -> Result<(), String> {
-        if !self.config.enabled {
-            return Ok(());
-        }
+        self.rpc_call("send", json!({
+            "recipient": [recipient],
+            "message": message,
+        })).await
+    }
 
-        let mut stream = TcpStream::connect(&self.config.socket_addr)
-            .await
-            .map_err(|e| format!("signal connect: {e}"))?;
-
-        let req = json!({
-            "jsonrpc": "2.0",
-            "method": "send",
-            "params": {
-                "recipient": [recipient],
-                "message": message,
-            },
-            "id": 1,
-        });
-        let line = format!("{}\n", req.to_string());
-        stream.write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("signal write: {e}"))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader.read_line(&mut response_line)
-            .await
-            .map_err(|e| format!("signal read: {e}"))?;
-
-        if let Ok(resp) = serde_json::from_str::<Value>(&response_line) {
-            if let Some(err) = resp.get("error") {
-                return Err(format!("signal send error: {err}"));
-            }
-        }
-
-        Ok(())
+    /// Send a message to a group.
+    pub async fn send_group(&self, group_id: &str, message: &str) -> Result<(), String> {
+        self.rpc_call("send", json!({
+            "groupId": group_id,
+            "message": message,
+        })).await
     }
 
     /// Send a message, splitting into multiple messages if it's long.
     /// Signal handles long messages but splitting gives better UX on mobile.
     /// Splits on paragraph boundaries when possible, ~1800 chars per message.
     pub async fn send_multi(&self, recipient: &str, message: &str) -> Result<(), String> {
+        self.send_multi_impl(recipient, message, false).await
+    }
+
+    /// send_multi for a group chat.
+    pub async fn send_multi_group(&self, group_id: &str, message: &str) -> Result<(), String> {
+        self.send_multi_impl(group_id, message, true).await
+    }
+
+    async fn send_multi_impl(&self, target: &str, message: &str, is_group: bool) -> Result<(), String> {
         if !self.config.enabled {
             return Ok(());
         }
@@ -159,7 +127,11 @@ impl Signal {
         let chars: Vec<char> = message.chars().collect();
 
         if chars.len() <= MAX_LEN {
-            return self.send(recipient, message).await;
+            return if is_group {
+                self.send_group(target, message).await
+            } else {
+                self.send(target, message).await
+            };
         }
 
         // Split on paragraph boundaries (\n\n) near MAX_LEN
@@ -187,7 +159,11 @@ impl Signal {
             if i > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
-            self.send(recipient, chunk).await?;
+            if is_group {
+                self.send_group(target, chunk).await?;
+            } else {
+                self.send(target, chunk).await?;
+            }
         }
         Ok(())
     }
@@ -216,11 +192,12 @@ impl Signal {
     /// Run the inbound receive loop. Maintains a persistent TCP connection
     /// to signal-cli daemon, reads incoming message notifications, and calls
     /// the handler for each message from an allowed sender.
+    /// Handler args: (sender, message, timestamp, group_id).
     ///
     /// Returns when the connection is permanently lost (after retry backoff).
     pub async fn receive_loop(
         &self,
-        handler: Arc<dyn Fn(String, String, u64) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64, Option<String>) + Send + Sync>,
     ) {
         if !self.config.enabled {
             return;
@@ -243,7 +220,7 @@ impl Signal {
     /// One receive cycle: connect, read notifications until disconnect.
     async fn receive_once(
         &self,
-        handler: Arc<dyn Fn(String, String, u64) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64, Option<String>) + Send + Sync>,
     ) -> Result<(), String> {
         let stream = TcpStream::connect(&self.config.socket_addr)
             .await
@@ -307,6 +284,13 @@ impl Signal {
                 .unwrap_or("")
                 .to_string();
 
+            // Group messages carry the group id — replies must target it.
+            let group_id = envelope.get("dataMessage")
+                .and_then(|d| d.get("groupInfo"))
+                .and_then(|g| g.get("groupId"))
+                .and_then(|g| g.as_str())
+                .map(|s| s.to_string());
+
             // Extract timestamp for read receipts
             let timestamp = envelope.get("dataMessage")
                 .and_then(|d| d.get("timestamp"))
@@ -338,7 +322,7 @@ impl Signal {
             } else {
                 source_name
             };
-            handler(source.to_string(), message, timestamp);
+            handler(source.to_string(), message, timestamp, group_id);
         }
     }
 }

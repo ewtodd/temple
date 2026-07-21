@@ -180,15 +180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let memory_for_handler = memory_for_signal.clone();
             let auth_token_file = cfg2.auth_token_file.clone();
             let data_dir_workspace = cfg2.data_dir_workspace();
-            // Per-sender active session (session id chosen via /session, /new)
+            // Per-conversation active session (session id chosen via
+            // /session, /new). Keyed by group id for group chats (shared
+            // session), else by sender.
             let active_sessions: Arc<Mutex<std::collections::HashMap<String, uuid::Uuid>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let active_for_handler = active_sessions.clone();
-            // Pending permission requests: sender → (request_id, session_id)
-            let pending_perms: Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid)>>> =
+            // Pending permission requests: sender → (request_id, session_id, group)
+            let pending_perms: Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let perms_for_handler = pending_perms.clone();
-            let handler = Arc::new(move |sender: String, message: String, timestamp: u64| {
+            let handler = Arc::new(move |sender: String, message: String, timestamp: u64, group_id: Option<String>| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
@@ -221,18 +223,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             &auth_user.username,
                                             &sender,
                                         ).await;
-                                        signal.send(&sender, &format!(
+                                        send_conv(&signal, &sender, &group_id, &format!(
                                             "Verified! You are now registered as {}.",
                                             auth_user.username
-                                        )).await.ok();
+                                        )).await;
                                         notify_admins(&signal, &memory, &format!(
                                             "{} (+{}...) just verified on Signal.",
-                                            auth_user.username, &auth_user.phone[..auth_user.phone.len().min(6)]
+                                            auth_user.username, auth_user.phone.chars().take(6).collect::<String>()
                                         )).await;
                                         return;
                                     }
                                 }
-                                signal.send(&sender, "token not recognized — check with Ethan and try again.").await.ok();
+                                send_conv(&signal, &sender, &group_id, "token not recognized — check with Ethan and try again.").await;
                                 notify_admins(&signal, &memory, &format!(
                                     "Someone from {sender} tried /verify with an invalid token."
                                 )).await;
@@ -252,20 +254,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let trimmed = message.trim();
 
+                    // Conversation key: group chats share one session,
+                    // DMs are per-sender.
+                    let conv_key = group_id.clone().unwrap_or_else(|| sender.clone());
+
                     // ── Session commands ──
 
                     // ── Pending permission reply (y/N) ──
                     {
-                        let pending = perms.lock().await.get(&sender).copied();
-                        if let Some((request_id, _sid)) = pending {
+                        let pending = perms.lock().await.get(&sender).cloned();
+                        if let Some((request_id, _sid, perm_group)) = pending {
                             let lower = trimmed.to_lowercase();
                             let granted = lower == "y" || lower == "yes" || lower == "allow";
                             if granted || lower == "n" || lower == "no" || lower == "deny" {
                                 perms.lock().await.remove(&sender);
                                 agent.permissions.resolve(request_id, granted).await;
-                                signal.send(&sender,
+                                send_conv(&signal, &sender, &perm_group,
                                     if granted { "ok, proceeding" } else { "denied" }
-                                ).await.ok();
+                                ).await;
                                 return;
                             }
                         }
@@ -274,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(msg) = trimmed.strip_prefix("/broadcast ") {
                         let body = msg.trim();
                         if body.is_empty() {
-                            signal.send(&sender, "usage: /broadcast <message>").await.ok();
+                            send_conv(&signal, &sender, &group_id, "usage: /broadcast <message>").await;
                             return;
                         }
                         // Admin check: sender must be in the admin list
@@ -283,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             phone == &sender || uuid.as_deref() == Some(&sender)
                         });
                         if !is_admin {
-                            signal.send(&sender, "admin only").await.ok();
+                            send_conv(&signal, &sender, &group_id, "admin only").await;
                             return;
                         }
                         match memory.get_signal_users().await {
@@ -295,39 +301,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         count += 1;
                                     }
                                 }
-                                signal.send(&sender, &format!("sent to {count} users")).await.ok();
+                                send_conv(&signal, &sender, &group_id, &format!("sent to {count} users")).await;
                             }
-                            Err(e) => { signal.send(&sender, &format!("error: {e}")).await.ok(); }
+                            Err(e) => { send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await; }
                         }
                         return;
                     }
 
                     if trimmed == "/help" {
-                        signal.send(&sender,
+                        send_conv(&signal, &sender, &group_id,
                             "commands:\n\
                              /sessions — list your recent sessions\n\
                              /session <id-prefix> — resume a session\n\
                              /new <target> [dir] — new coding session\n\
                              /new — new session\n\
                              /quick — back to the default session\n\
-                             /clear <account> — delete all sessions for an account (e.g. /clear e-play)\n\
+                             /stop — interrupt the running request\n\
+                             /clear <account> — delete all sessions for an account (admin)\n\
                              /targets — list ssh targets\n\
                              /help — this"
-                        ).await.ok();
+                        ).await;
+                        return;
+                    }
+
+                    if trimmed == "/stop" {
+                        let id = active.lock().await.get(&conv_key).copied();
+                        match id {
+                            Some(id) => {
+                                agent.cancel_chat(id).await;
+                                send_conv(&signal, &sender, &group_id, "⏹ stopped").await;
+                            }
+                            None => {
+                                send_conv(&signal, &sender, &group_id, "nothing running").await;
+                            }
+                        }
                         return;
                     }
 
                     if let Some(account) = trimmed.strip_prefix("/clear ") {
                         let account = account.trim();
-                        if account.is_empty() {
-                            signal.send(&sender, "usage: /clear <account> (e.g. /clear e-play)").await.ok();
+                        // /clear can wipe other people's sessions — admin only
+                        let admins = memory.get_admins().await.unwrap_or_default();
+                        let is_admin = admins.iter().any(|(phone, uuid)| {
+                            phone == &sender || uuid.as_deref() == Some(&sender)
+                        });
+                        if !is_admin {
+                            send_conv(&signal, &sender, &group_id, "admin only").await;
+                        } else if account.is_empty() {
+                            send_conv(&signal, &sender, &group_id, "usage: /clear <account> (e.g. /clear e-play)").await;
                         } else {
                             match memory.clear_sessions(account).await {
                                 Ok(n) => {
-                                    signal.send(&sender, &format!("deleted {n} sessions for {account}")).await.ok();
+                                    send_conv(&signal, &sender, &group_id, &format!("deleted {n} sessions for {account}")).await;
                                 }
                                 Err(e) => {
-                                    signal.send(&sender, &format!("error: {e}")).await.ok();
+                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
                                 }
                             }
                         }
@@ -341,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             names.join("\n")
                         };
-                        signal.send(&sender, &body).await.ok();
+                        send_conv(&signal, &sender, &group_id, &body).await;
                         return;
                     }
 
@@ -356,13 +384,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     body.push_str(&format!("• {id8} · {target} · {title}\n"));
                                 }
                                 body.push_str("\nresume with /session <id-prefix>");
-                                signal.send(&sender, &body).await.ok();
+                                send_conv(&signal, &sender, &group_id, &body).await;
                             }
                             Ok(_) => {
-                                signal.send(&sender, "no sessions yet — /new <target> to start one").await.ok();
+                                send_conv(&signal, &sender, &group_id, "no sessions yet — /new <target> to start one").await;
                             }
                             Err(e) => {
-                                signal.send(&sender, &format!("error listing sessions: {e}")).await.ok();
+                                send_conv(&signal, &sender, &group_id, &format!("error listing sessions: {e}")).await;
                             }
                         }
                         return;
@@ -381,11 +409,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // Load into memory if not already there
                                         if !agent.has_session(sid).await {
                                             if let Err(e) = agent.resume_session(sid, &username).await {
-                                                signal.send(&sender, &format!("resume failed: {e}")).await.ok();
+                                                send_conv(&signal, &sender, &group_id, &format!("resume failed: {e}")).await;
                                                 return;
                                             }
                                         }
-                                        active.lock().await.insert(sender.clone(), sid);
+                                        active.lock().await.insert(conv_key.clone(), sid);
                                         // Auto-attach SSH if needed — Signal sessions
                                         // need SSH to execute tools (no TUI client).
                                         if !agent.has_ssh(sid).await {
@@ -401,25 +429,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         let target = r.ssh_target.as_deref().unwrap_or("quick");
                                         let title = r.title.as_deref().unwrap_or("(untitled)");
-                                        signal.send(&sender, &format!(
+                                        send_conv(&signal, &sender, &group_id, &format!(
                                             "📋 resumed {target} · {title}"
-                                        )).await.ok();
+                                        )).await;
                                     }
                                     None => {
-                                        signal.send(&sender, "no session matching that prefix").await.ok();
+                                        send_conv(&signal, &sender, &group_id, "no session matching that prefix").await;
                                     }
                                 }
                             }
                             Err(e) => {
-                                signal.send(&sender, &format!("error: {e}")).await.ok();
+                                send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
                             }
                         }
                         return;
                     }
 
                     if trimmed == "/quick" {
-                        active.lock().await.remove(&sender);
-                        signal.send(&sender, "📋 back to default session").await.ok();
+                        active.lock().await.remove(&conv_key);
+                        send_conv(&signal, &sender, &group_id, "📋 back to default session").await;
                         return;
                     }
 
@@ -430,45 +458,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let subdir = parts.get(1).copied();
                         match agent.new_persisted_session(&username, target, subdir, None).await {
                             Ok(sid) => {
-                                active.lock().await.insert(sender.clone(), sid);
+                                active.lock().await.insert(conv_key.clone(), sid);
                                 let id8: String = sid.simple().to_string().chars().take(8).collect();
-                                signal.send(&sender, &format!(
+                                send_conv(&signal, &sender, &group_id, &format!(
                                     "📋 new session {id8} · {}{}",
                                     target.unwrap_or("quick"),
                                     subdir.map(|d| format!(" · {d}")).unwrap_or_default(),
-                                )).await.ok();
+                                )).await;
                             }
                             Err(e) => {
-                                signal.send(&sender, &format!("error: {e}")).await.ok();
+                                send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
                             }
                         }
                         return;
                     }
 
                     // ── Normal message → route to active or personal session ──
+                    // Group chats share one session owned by "group"; DMs get
+                    // a per-user session. The lock is held across the
+                    // get-or-create so rapid consecutive messages can't
+                    // create two sessions for one conversation.
                     let target_session = {
-                        let active_id = active.lock().await.get(&sender).copied();
-                        match active_id {
-                            Some(id) => id,
+                        let mut active_lock = active.lock().await;
+                        match active_lock.get(&conv_key) {
+                            Some(id) => *id,
                             None => {
-                                // Create a per-user session with the correct username
-                                // (not the shared sys_session with "signal" as username)
                                 let new_id = uuid::Uuid::new_v4();
+                                let session_user: &str =
+                                    if group_id.is_some() { "group" } else { &username };
                                 agent.open_session(
                                     new_id,
-                                    &username,
+                                    session_user,
                                     &workspace,
                                     router::SessionKind::Interactive,
                                     None,
                                 ).await;
-                                active.lock().await.insert(sender.clone(), new_id);
+                                active_lock.insert(conv_key.clone(), new_id);
                                 new_id
                             }
                         }
                     };
 
                     // Send typing indicator
-                    if let Err(e) = signal.send_typing(&sender).await {
+                    let typing_result = match &group_id {
+                        Some(g) => signal.send_typing_group(g).await,
+                        None => signal.send_typing(&sender).await,
+                    };
+                    if let Err(e) = typing_result {
                         tracing::warn!("send_typing: {e}");
                     }
 
@@ -476,17 +512,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // send a "still consulting" note every 2 minutes.
                     let signal_for_timer = signal.clone();
                     let sender_for_timer = sender.clone();
+                    let group_for_timer = group_id.clone();
                     let timer_handle = tokio::spawn(async move {
                         let mut ticks: u32 = 0;
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                             ticks += 1;
-                            signal_for_timer.send_typing(&sender_for_timer).await.ok();
+                            match &group_for_timer {
+                                Some(g) => { signal_for_timer.send_typing_group(g).await.ok(); }
+                                None => { signal_for_timer.send_typing(&sender_for_timer).await.ok(); }
+                            }
                             if ticks % 12 == 0 {
-                                signal_for_timer
-                                    .send(&sender_for_timer, "still consulting the oracle...")
-                                    .await
-                                    .ok();
+                                send_conv(
+                                    &signal_for_timer,
+                                    &sender_for_timer,
+                                    &group_for_timer,
+                                    "still consulting the oracle...",
+                                ).await;
                             }
                         }
                     });
@@ -494,6 +536,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let sender_for_emit = sender.clone();
                     let signal_for_emit = signal.clone();
                     let perms_for_emit = perms.clone();
+                    let group_for_emit = group_id.clone();
+                    let agent_for_emit = agent.clone();
                     let response = Arc::new(std::sync::Mutex::new(String::new()));
                     let resp = response.clone();
                     let emit = move |ev: agent::AgentEvent| {
@@ -506,17 +550,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let signal = signal_for_emit.clone();
                                     let sender = sender_for_emit.clone();
                                     let perms = perms_for_emit.clone();
+                                    let group = group_for_emit.clone();
+                                    let agent = agent_for_emit.clone();
                                     let request_id = req.request_id;
                                     let session_id = req.session_id;
                                     async move {
-                                        perms.lock().await.insert(
+                                        // One pending prompt per user —
+                                        // auto-deny an older unanswered one
+                                        // so it can't stall for 300s.
+                                        let old = perms.lock().await.insert(
                                             sender.clone(),
-                                            (request_id, session_id),
+                                            (request_id, session_id, group.clone()),
                                         );
-                                        signal.send(&sender, &format!(
+                                        if let Some((old_id, _, _)) = old {
+                                            agent.permissions.resolve(old_id, false).await;
+                                        }
+                                        send_conv(&signal, &sender, &group, &format!(
                                             "Allow {path}? Reply y or N (300s timeout)"
-                                        )).await.ok();
+                                        )).await;
                                     }
+                                });
+                            }
+                            agent::AgentEvent::ToolRequestNeeded { request_id, name, .. } => {
+                                // Signal sessions have no local tool executor
+                                // (tools run via SSH or a TUI client) — fail
+                                // fast instead of stalling the request queue
+                                // for the 300s timeout.
+                                let agent = agent_for_emit.clone();
+                                tokio::spawn(async move {
+                                    agent.resolve_tool(request_id, format!(
+                                        "Error: tool {name} needs an SSH target or TUI client — none attached to this session"
+                                    )).await;
                                 });
                             }
                             agent::AgentEvent::Delta(d) => {
@@ -530,8 +594,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     };
+                    // Group messages are prefixed so the model knows who is
+                    // speaking; queue priority is the individual sender's.
+                    let content = match &group_id {
+                        Some(_) => format!("{username}: {message}"),
+                        None => message.clone(),
+                    };
                     agent
-                        .process_chat(target_session, &message, scope, &emit)
+                        .process_chat(target_session, &content, scope, &emit, Some(&username))
                         .await;
 
                     // Stop the "still consulting" timer
@@ -553,7 +623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 text
                             )
                         };
-                        signal.send_multi(&sender, &full).await.ok();
+                        send_conv(&signal, &sender, &group_id, &full).await;
                     }
                 });
             });
@@ -571,10 +641,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Check if user hasn't verified yet (no UUID)
                     if let Ok(Some((_, _, uuid))) = memory.find_signal_user(&u.phone).await {
                         if uuid.is_none() {
-                            signal.send(
+                            if let Err(e) = signal.send(
                                 &u.phone,
                                 "You've been added to renco! Send /verify to complete setup.",
-                            ).await.ok();
+                            ).await {
+                                tracing::warn!("welcome message to {} failed: {e}", u.phone);
+                            }
                         }
                     }
                 }
@@ -642,6 +714,17 @@ fn generate_and_save_token(
     let token_file = cfg.auth_token_file.as_ref()
         .ok_or("auth_token_file not set in config — cannot generate token")?;
 
+    // ':' is the field separator and newlines are the record separator —
+    // either would corrupt the token file.
+    for (field, value) in [("username", username), ("phone", phone)] {
+        if value.is_empty()
+            || value.contains(':')
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(format!("invalid {field}: must be non-empty with no ':' or whitespace").into());
+        }
+    }
+
     if let Some(parent) = token_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -652,9 +735,8 @@ fn generate_and_save_token(
         (true, None) => format!("{token}:{username}:{phone}:yes\n"),
         (false, None) => format!("{token}:{username}:{phone}\n"),
     };
-    let mut existing = std::fs::read_to_string(token_file).unwrap_or_default();
+    let existing = std::fs::read_to_string(token_file).unwrap_or_default();
     // Remove any existing line for this username (re-generating replaces)
-    existing.retain(|c| c != '\n' && c != '\r');
     let lines: Vec<&str> = existing.lines()
         .filter(|l| {
             let parts: Vec<&str> = l.splitn(3, ':').collect();
@@ -671,8 +753,25 @@ fn generate_and_save_token(
     Ok(token)
 }
 
-async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {
-    match memory.get_admins().await {
+/// Send a Signal message to the conversation it came from — the group
+/// when the inbound message was a group message, else the sender's DM.
+/// Long messages are split; failures are logged, not swallowed.
+async fn send_conv(
+    signal: &crate::signal::Signal,
+    sender: &str,
+    group_id: &Option<String>,
+    text: &str,
+) {
+    let result = match group_id {
+        Some(g) => signal.send_multi_group(g, text).await,
+        None => signal.send_multi(sender, text).await,
+    };
+    if let Err(e) = result {
+        tracing::warn!("signal send_conv to {}: {e}", group_id.as_deref().unwrap_or(sender));
+    }
+}
+
+async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {    match memory.get_admins().await {
         Ok(admins) if !admins.is_empty() => {
             for (phone, uuid) in &admins {
                 let recipient = uuid.as_deref().unwrap_or(phone);
