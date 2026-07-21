@@ -1601,6 +1601,44 @@ Git conventions:
                     .map_err(|e| format!("save_memory: {e}"))?;
                 Ok(format!("Saved memory: {key} = {value}"))
             }
+            "edit_file" => {
+                let path = args["path"].as_str().ok_or("missing path")?;
+                let old_str = args["old_str"].as_str().ok_or("missing old_str")?;
+                let new_str = args["new_str"].as_str().unwrap_or("");
+                if let Some(ssh) = ssh {
+                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
+                    self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
+                    let content = ssh.read_file(&resolved).await?;
+                    if !content.contains(old_str) {
+                        return Err(format!("old_str not found in {resolved}"));
+                    }
+                    let count = content.matches(old_str).count();
+                    if count > 1 {
+                        return Err(format!(
+                            "old_str found {count} times — must be unique"
+                        ));
+                    }
+                    let mut new_content = content.replacen(old_str, new_str, 1);
+                    if content.ends_with('\n') && !new_content.ends_with('\n') {
+                        new_content.push('\n');
+                    }
+                    ssh.write_file(&resolved, &new_content).await?;
+                    Ok(format!("edited {resolved} (replaced 1 occurrence)"))
+                } else {
+                    let request_id = Uuid::new_v4();
+                    let rx = self.ask_tool(request_id).await;
+                    emit(AgentEvent::ToolRequestNeeded {
+                        request_id,
+                        name: "edit_file".to_string(),
+                        args_json: args_json.to_string(),
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(_)) => Err("tool request channel closed".into()),
+                        Err(_) => Err("tool request timed out".into()),
+                    }
+                }
+            }
             "recall_memory" => {
                 let username = {
                     let sessions = self.sessions.lock().await;
@@ -1862,6 +1900,22 @@ fn local_tools() -> Vec<ToolDefinition> {
                     "type": "object",
                     "properties": {
                         "key": {"type": "string", "description": "Key to search for (partial match, case-insensitive). Omit to list all memories."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "edit_file".into(),
+                description: "Replace a specific string in a file with new text. The old string must appear EXACTLY ONCE in the file — if found multiple times or not at all, the edit is rejected. This prevents ambiguous or destructive edits. Use read_file first to confirm the string you want to replace.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path", "old_str"],
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to edit."},
+                        "old_str": {"type": "string", "description": "The EXACT string to replace — must be unique within the file."},
+                        "new_str": {"type": "string", "description": "The replacement text."},
                     },
                 }),
             },

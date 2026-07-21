@@ -152,35 +152,46 @@ fn spawn_ws(
                         let result = match name.as_str() {
                             "read_file" => {
                                 let path = args["path"].as_str().unwrap_or("");
-                                match tokio::fs::read_to_string(path).await {
-                                    Ok(content) => content,
-                                    Err(e) => format!("Error: {}", e),
+                                match resolve_tool_path(path, &cwd) {
+                                    Err(e) => format!("Error: {e}"),
+                                    Ok(resolved) => match tokio::fs::read_to_string(&resolved).await {
+                                        Ok(content) => format!("{content}\n[read {path}]"),
+                                        Err(e) => format!("Error: {e}"),
+                                    },
                                 }
                             }
                             "write_file" => {
                                 let path = args["path"].as_str().unwrap_or("");
                                 let content = args["content"].as_str().unwrap_or("");
-                                if let Some(parent) = std::path::Path::new(path).parent() {
-                                    tokio::fs::create_dir_all(parent).await.ok();
-                                }
-                                match tokio::fs::write(path, content).await {
-                                    Ok(()) => format!("wrote {} ({} bytes)", path, content.len()),
-                                    Err(e) => format!("Error: {}", e),
+                                match resolve_tool_path(path, &cwd) {
+                                    Err(e) => format!("Error: {e}"),
+                                    Ok(resolved) => {
+                                        if let Some(parent) = resolved.parent() {
+                                            tokio::fs::create_dir_all(parent).await.ok();
+                                        }
+                                        match tokio::fs::write(&resolved, content).await {
+                                            Ok(()) => format!("wrote {} ({} bytes)", resolved.display(), content.len()),
+                                            Err(e) => format!("Error: {e}"),
+                                        }
+                                    },
                                 }
                             }
                             "list_dir" => {
                                 let path = args["path"].as_str().unwrap_or(".");
-                                match tokio::fs::read_dir(path).await {
-                                    Err(e) => format!("Error: {}", e),
-                                    Ok(mut entries) => {
-                                        let mut out = Vec::new();
-                                        while let Ok(Some(e)) = entries.next_entry().await {
-                                            let name = e.file_name().to_string_lossy().to_string();
-                                            let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                                            out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                                match resolve_tool_path(path, &cwd) {
+                                    Err(e) => format!("Error: {e}"),
+                                    Ok(resolved) => match tokio::fs::read_dir(&resolved).await {
+                                        Err(e) => format!("Error: {e}"),
+                                        Ok(mut entries) => {
+                                            let mut out = Vec::new();
+                                            while let Ok(Some(e)) = entries.next_entry().await {
+                                                let name = e.file_name().to_string_lossy().to_string();
+                                                let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                                                out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                                            }
+                                            out.join("\n")
                                         }
-                                        out.join("\n")
-                                    }
+                                    },
                                 }
                             }
                             "execute_command" => {
@@ -205,6 +216,36 @@ fn spawn_ws(
                                         if out.is_empty() { out.push_str("(no output)"); }
                                         out
                                     }
+                                }
+                            }
+                            "edit_file" => {
+                                let path = args["path"].as_str().unwrap_or("");
+                                let old_str = args["old_str"].as_str().unwrap_or("");
+                                let new_str = args["new_str"].as_str().unwrap_or("");
+                                match resolve_tool_path(path, &cwd) {
+                                    Err(e) => format!("Error: {e}"),
+                                    Ok(resolved) => match tokio::fs::read_to_string(&resolved).await {
+                                        Err(e) => format!("Error: {e}"),
+                                        Ok(content) => {
+                                            if !content.contains(old_str) {
+                                                format!("Error: old_str not found in {}", resolved.display())
+                                            } else {
+                                                let count = content.matches(old_str).count();
+                                                if count > 1 {
+                                                    format!("Error: old_str found {count} times — must be unique")
+                                                } else {
+                                                    let mut n = content.replacen(old_str, new_str, 1);
+                                                    if content.ends_with('\n') && !n.ends_with('\n') {
+                                                        n.push('\n');
+                                                    }
+                                                    match tokio::fs::write(&resolved, &n).await {
+                                                        Err(e) => format!("Error: {e}"),
+                                                        Ok(()) => format!("edited {} (replaced 1 occurrence)", resolved.display()),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
                                 }
                             }
                             _ => format!("Error: unknown tool {}", name),
@@ -555,6 +596,60 @@ fn osc52_copy(text: &str) {
 /// at draw but they'd corrupt our width math first), tabs become spaces,
 /// C0/C1 control chars (except \n) are dropped. Raw control bytes desync
 /// iocraft's canvas model from the real terminal (row corruption).
+/// Normalize a tool path against the session cwd and reject ones that
+/// escape the working directory. For new files (write_file), walks up
+/// until an existing parent dir is found, canonicalizes that, then
+/// re-joins the tail — the resolved path is always under cwd or /tmp.
+fn resolve_tool_path(path: &str, cwd: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(p)
+    };
+
+    // Walk up until we find an existing component — handles writing to
+    // new files in new directories.
+    let mut candidate = abs.clone();
+    let mut suffix = std::path::PathBuf::new();
+    loop {
+        if candidate.exists() {
+            break;
+        }
+        match candidate.parent().and_then(|parent| {
+            if parent.as_os_str().is_empty() {
+                None
+            } else {
+                Some(parent)
+            }
+        }) {
+            Some(parent) => {
+                suffix = candidate
+                    .file_name()
+                    .map(|n| std::path::PathBuf::from(n).join(&suffix))
+                    .unwrap_or(suffix);
+                candidate = parent.to_path_buf();
+            }
+            None => break,
+        }
+    }
+
+    let canonical_base = std::fs::canonicalize(&candidate)
+        .map_err(|e| format!("cannot resolve {abs:?}: {e}"))?;
+    let resolved = canonical_base.join(&suffix);
+    let cwd_canon =
+        std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+
+    if resolved.starts_with(&cwd_canon) || resolved.starts_with("/tmp") {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "{path:?} escapes working directory ({})",
+            cwd_canon.display()
+        ))
+    }
+}
+
 fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
