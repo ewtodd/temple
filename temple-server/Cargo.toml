@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 temple-protocol = { path = "../temple-protocol" }
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 tokio-util = "0.7"
 futures-util = { version = "0.3", features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
