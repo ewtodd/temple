@@ -774,9 +774,12 @@ impl Agent {
             let (busy, waiting) = self.queue.lane_status(&lane);
             let ahead = waiting + busy as usize;
             let detail = if ahead == 0 {
-                format!("⚡ {model_desc}")
+                format!("working on your message — using {model_desc}, you're next up")
             } else {
-                format!("⏳ {model_desc} · ~{ahead} ahead")
+                format!(
+                    "working on your message — using {model_desc} · you're #{} in line (~{ahead} ahead)",
+                    ahead + 1
+                )
             };
             emit(AgentEvent::ToolEvent {
                 name: "routing".into(),
