@@ -495,6 +495,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Load signal users from token file into DB and send welcome messages
+    // to newly added (unverified) users so they can reply on Signal.
+    if cfg.signal.enabled {
+        match auth::load_signal_users(&memory, &cfg).await {
+            Ok(users) => {
+                for u in &users {
+                    // Check if user hasn't verified yet (no UUID)
+                    if let Ok(Some((_, _, uuid))) = memory.find_signal_user(&u.phone).await {
+                        if uuid.is_none() {
+                            signal.send(
+                                &u.phone,
+                                &format!(
+                                    "Welcome to renco! You've been added by Ethan.\n\n\
+                                     Send this to verify your account:\n\
+                                     /verify {}",
+                                    u.token,
+                                ),
+                            ).await.ok();
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Failed to load signal users: {e}"),
+        }
+    }
+
     // Cron scheduler
     {
         let agent = agent.clone();

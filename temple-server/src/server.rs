@@ -10,7 +10,7 @@ use crate::agent::{Agent, AgentEvent};
 use crate::permissions::PermissionScope;
 use crate::config::Config;
 use crate::memory::Memory;
-use crate::auth::{check_token, load_signal_users};
+use crate::auth::check_token;
 
 pub async fn run_server(
     agent: Arc<Agent>,
@@ -29,13 +29,6 @@ pub async fn run_server(
             keep_alive.keep_warm().await;
         }
     });
-
-    // Load signal users from token file into DB (for UUID verification)
-    if config.signal.enabled {
-        if let Err(e) = load_signal_users(&memory, &config).await {
-            tracing::warn!("Failed to load signal users: {e}");
-        }
-    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
