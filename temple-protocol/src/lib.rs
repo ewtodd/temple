@@ -99,6 +99,8 @@ pub enum ClientMessage {
     /// Create a new session, optionally bound to an SSH target
     /// (e.g. "e-work@e-desktop"). No target = local/quick session.
     NewSession { ssh_target: Option<String> },
+    /// Delete a persisted session by id or index from the last listing
+    DeleteSession { session_id: Uuid },
     /// Clear all sessions for a specific account (e.g. "e-play")
     ClearSessions { account: String },
     Ping,
@@ -154,6 +156,10 @@ pub enum ServerMessage {
     /// Persisted sessions for the authenticated user
     SessionList {
         sessions: Vec<SessionMeta>,
+    },
+    /// A session was deleted permanently
+    SessionDeleted {
+        session_id: Uuid,
     },
     /// A session was resumed — includes replayed history for display
     SessionResumed {

@@ -17,12 +17,14 @@ impl Memory {
             }
         }
         let conn = Connection::open(path)?;
-        // Run migrations without lock — we own the connection
-        // 1. Run ALTER TABLE first (column must exist before indexes reference it)
-        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN account TEXT");
-        let _ = conn.execute_batch("ALTER TABLE signal_users ADD COLUMN admin TEXT DEFAULT 'no'");
-        let _ = conn.execute_batch("ALTER TABLE signal_users ADD COLUMN priority INTEGER DEFAULT -1");
-        // 2. Run schema creation
+        // Use PRAGMA user_version to track schema migrations so we don't
+        // run ALTER TABLE blindly every startup (which logs spurious errors
+        // when columns already exist).
+        let user_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        // Base schema (version 0) — idempotent CREATE TABLE IF NOT EXISTS.
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS conversations (
@@ -66,7 +68,6 @@ impl Memory {
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
                 ssh_target TEXT,
-                account TEXT,
                 cwd TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'default',
                 kind TEXT NOT NULL DEFAULT 'interactive',
@@ -76,9 +77,30 @@ impl Memory {
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
-            CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             ",
+        )?;
+
+        // ── Incremental migrations (only run once) ──
+        let migrate = |ver: i32, sql: &str| -> rusqlite::Result<()> {
+            if user_version < ver {
+                conn.execute_batch(sql)?;
+                conn.execute_batch(&format!("PRAGMA user_version = {ver}"))?;
+                tracing::info!("memory: migrated to version {ver}");
+            }
+            Ok(())
+        };
+
+        // Version 1: add account column to sessions + its index
+        migrate(1,
+            "ALTER TABLE sessions ADD COLUMN account TEXT;\
+             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);"
+        )?;
+
+        // Version 2: add admin and priority columns to signal_users
+        migrate(2,
+            "ALTER TABLE signal_users ADD COLUMN admin TEXT DEFAULT 'no';\
+             ALTER TABLE signal_users ADD COLUMN priority INTEGER DEFAULT -1;"
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -483,6 +505,14 @@ impl Memory {
             params![account],
         )?;
         Ok(n)
+    }
+
+    /// Delete a single session by id. Also removes its conversation history.
+    pub async fn delete_session(&self, id: Uuid) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM conversations WHERE session_id = ?1", params![id.to_string()])?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id.to_string()])?;
+        Ok(())
     }
 
     /// Get all admin users' phone numbers + UUIDs.

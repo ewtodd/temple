@@ -279,6 +279,22 @@ async fn handle_connection(
                 }
             }
 
+            ClientMessage::DeleteSession { session_id: sid } => {
+                // Close in-memory session if loaded, then remove from DB.
+                agent.close_session(sid).await;
+                match memory.delete_session(sid).await {
+                    Ok(_) => {
+                        let _ = tx.send(ServerMessage::SessionDeleted { session_id: sid });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("delete session: {e}"),
+                        });
+                    }
+                }
+            }
+
             ClientMessage::ClearSessions { account } => {
                 // /clear can wipe other users' sessions — admin only
                 let owner = auth_owner.clone().unwrap_or_default();

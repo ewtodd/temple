@@ -145,6 +145,8 @@ struct SessionCtx {
     /// Permission mode, persisted and restored on resume.
     /// SSH sessions can never be Yolo.
     permission_mode: PermissionMode,
+    /// Cached project context string (detected from CWD on first message)
+    project_context: Option<String>,
 }
 
 pub struct Agent {
@@ -332,6 +334,7 @@ impl Agent {
                 title: None,
                 persist: true,
                 permission_mode: PermissionMode::Default,
+                project_context: None,
             },
         );
     }
@@ -419,6 +422,7 @@ impl Agent {
                 title: None,
                 persist: true,
                 permission_mode: PermissionMode::Default,
+                project_context: None,
             },
         );
         drop(sessions);
@@ -488,6 +492,7 @@ impl Agent {
                 title: row.title,
                 persist: true,
                 permission_mode: PermissionMode::Default,
+                project_context: None,
             },
         );
 
@@ -820,7 +825,27 @@ impl Agent {
         }
         *self.last_request.lock().unwrap() = Instant::now();
 
-        let base_system_prompt = self.build_system_prompt(&username, &cwd, session_kind).await;
+        // Get or lazily detect project context (cached per-session)
+        let project_context = {
+            let mut sessions = self.sessions.lock().await;
+            let needs_detect = sessions.get(&session_id)
+                .and_then(|s| s.project_context.clone())
+                .unwrap_or_else(|| String::new());
+            // If cached, return it
+            if !needs_detect.is_empty() || session_kind == SessionKind::Headless {
+                needs_detect
+            } else {
+                drop(sessions);
+                // Detect project type from CWD (only once per session)
+                let ctx = detect_project_context(&cwd).await;
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.project_context = Some(ctx.clone());
+                }
+                ctx
+            }
+        };
+        let base_system_prompt = self.build_system_prompt(&username, &cwd, session_kind, &project_context).await;
 
         // Stats accumulators across all rounds
         let mut stats = StatsAccum::new();
@@ -846,7 +871,7 @@ impl Agent {
         // Clean up cancellation token
         self.cancel_tokens.lock().await.remove(&session_id);
 
-        // Store assistant reply in history + DB
+        // Store assistant reply in history (needed for context in next turns)
         if !final_content.is_empty() {
             {
                 let mut sessions = self.sessions.lock().await;
@@ -854,21 +879,26 @@ impl Agent {
                     s.history.push(ChatMessage::assistant(Some(final_content.clone()), None));
                 }
             }
-            let _ = self.memory.store_conversation(&ConversationEntry {
-                role: "user".into(), content: content.to_string(),
-                timestamp: chrono::Utc::now(), session_id, model_used: None,
-            }).await;
-            let _ = self.memory.store_conversation(&ConversationEntry {
-                role: "assistant".into(), content: final_content.clone(),
-                timestamp: chrono::Utc::now(), session_id,
-                model_used: Some(model_for_stats.clone()),
-            }).await;
+            // Fire-and-forget conversation persistence (don't block the lane)
+            let memory = self.memory.clone();
+            let content_owned = content.to_string();
+            let final_owned = final_content.clone();
+            let model_owned = model_for_stats.clone();
+            tokio::spawn(async move {
+                let _ = memory.store_conversation(&ConversationEntry {
+                    role: "user".into(), content: content_owned,
+                    timestamp: chrono::Utc::now(), session_id, model_used: None,
+                }).await;
+                let _ = memory.store_conversation(&ConversationEntry {
+                    role: "assistant".into(), content: final_owned,
+                    timestamp: chrono::Utc::now(), session_id,
+                    model_used: Some(model_owned),
+                }).await;
+            });
         }
 
-        // Persist the session (history + title) after each turn
-        self.ensure_session_title(session_id).await;
-        self.persist_session(session_id).await;
-
+        // Emit the Done event immediately — the client sees the response
+        // before title generation or session persistence run.
         let duration_ms = started.elapsed().as_millis() as u64;
         emit(AgentEvent::Done(ChatStatsData {
             model: model_for_stats,
@@ -879,6 +909,14 @@ impl Agent {
             prefill_tps: stats.prefill_tps(),
             decode_tps: stats.decode_tps(),
         }));
+
+        // Title + persist happen after the user sees the response.
+        // The queue permit is still held, but title gen is ~1-2s and
+        // persist is instant — negligible impact on lane throughput.
+        if !final_content.is_empty() {
+            self.ensure_session_title(session_id).await;
+        }
+        self.persist_session(session_id).await;
     }
 
     /// Cancel ALL in-flight agent loops — admin escape hatch to drain a
@@ -1356,7 +1394,7 @@ impl Agent {
     }
 
     /// Build system prompt with personality, user memories, code rules, and CWD detection.
-    async fn build_system_prompt(&self, username: &str, cwd: &str, kind: SessionKind) -> String {
+    async fn build_system_prompt(&self, username: &str, _cwd: &str, kind: SessionKind, project_context: &str) -> String {
         let personality = self.memory.get_personality().await.unwrap_or_default();
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
@@ -1387,7 +1425,7 @@ impl Agent {
 
         match kind {
             SessionKind::Interactive => {
-                let project_section = detect_project_context(cwd).await;
+                let project_section = project_context.to_string();
                 let has_code = !project_section.is_empty();
                 let code_rules = if has_code {
                     // Include rules matching detected project types only
@@ -1494,6 +1532,15 @@ Git conventions:
                     self.check_ssh_perm(session_id, &resolved, AccessKind::Read, ssh, emit).await?;
                     ssh.read_file(&resolved).await
                 } else {
+                    let resolved = if std::path::Path::new(path).is_absolute() {
+                        std::path::PathBuf::from(path)
+                    } else {
+                        let sessions = self.sessions.lock().await;
+                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        drop(sessions);
+                        std::path::Path::new(&cwd).join(path)
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit).await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1517,6 +1564,15 @@ Git conventions:
                     self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
                     ssh.write_file(&resolved, content).await
                 } else {
+                    let resolved = if std::path::Path::new(path).is_absolute() {
+                        std::path::PathBuf::from(path)
+                    } else {
+                        let sessions = self.sessions.lock().await;
+                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        drop(sessions);
+                        std::path::Path::new(&cwd).join(path)
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1539,6 +1595,15 @@ Git conventions:
                     self.check_ssh_perm(session_id, &resolved, AccessKind::ReadDir, ssh, emit).await?;
                     ssh.list_dir(&resolved).await
                 } else {
+                    let resolved = if std::path::Path::new(path).is_absolute() {
+                        std::path::PathBuf::from(path)
+                    } else {
+                        let sessions = self.sessions.lock().await;
+                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        drop(sessions);
+                        std::path::Path::new(&cwd).join(path)
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit).await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1573,6 +1638,25 @@ Git conventions:
                     };
                     ssh.execute(&command).await
                 } else {
+                    // Local session: check permission mode. Lockdown always
+                    // prompts for commands. Unsafe commands always prompt.
+                    // Safe read-only commands are allowed automatically.
+                    let must_check = {
+                        if is_dangerous_command(command) { true }
+                        else if !is_safe_command(command) { true }
+                        else {
+                            let sessions = self.sessions.lock().await;
+                            let mode = sessions.get(&session_id)
+                                .map(|s| s.permission_mode);
+                            drop(sessions);
+                            matches!(mode, Some(PermissionMode::Lockdown))
+                        }
+                    };
+                    if must_check {
+                        // Use the command as the "path" for the prompt
+                        let cmd_path = std::path::Path::new(command);
+                        self.check_perm(session_id, cmd_path, AccessKind::Execute, scope.clone(), emit).await?;
+                    }
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1625,6 +1709,15 @@ Git conventions:
                     ssh.write_file(&resolved, &new_content).await?;
                     Ok(format!("edited {resolved} (replaced 1 occurrence)"))
                 } else {
+                    let resolved = if std::path::Path::new(path).is_absolute() {
+                        std::path::PathBuf::from(path)
+                    } else {
+                        let sessions = self.sessions.lock().await;
+                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        drop(sessions);
+                        std::path::Path::new(&cwd).join(path)
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {

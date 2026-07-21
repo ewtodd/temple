@@ -495,6 +495,11 @@ fn spawn_ws(
                             }
                             s.scroll = 0;
                         }
+                        ServerMessage::SessionDeleted { session_id: sid, .. } => {
+                            let id8: String = sid.simple().to_string()
+                                .chars().take(8).collect();
+                            s.entries.push(ChatEntry::System(format!("deleted session {id8}")));
+                        }
                         ServerMessage::Pong | ServerMessage::SessionClosed { .. } | ServerMessage::ToolResult { .. } | ServerMessage::ToolRequest { .. } => {}
                     }
                 }
@@ -1055,7 +1060,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/sessions · /session N · /new [target] [dir] · /stop · /clear <user|account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] [dir] · /delete N · /stop · /clear <user|account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
@@ -1095,6 +1100,32 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 cmd_h.send(ClientMessage::ClearSessions {
                                     account: account.trim().to_string(),
                                 }).ok();
+                                return;
+                            }
+                            if let Some(arg) = content.strip_prefix("/delete ") {
+                                let arg = arg.trim();
+                                let sid = if let Ok(n) = arg.parse::<usize>() {
+                                    s.last_sessions.get(n).map(|m| m.id)
+                                } else {
+                                    s.last_sessions.iter()
+                                        .find(|m| m.id.simple().to_string().starts_with(arg))
+                                        .map(|m| m.id)
+                                };
+                                match sid {
+                                    Some(id) => {
+                                        cmd_h.send(ClientMessage::DeleteSession {
+                                            session_id: id,
+                                        }).ok();
+                                        s.entries.push(ChatEntry::System(
+                                            "session delete requested".into(),
+                                        ));
+                                    }
+                                    None => {
+                                        s.entries.push(ChatEntry::System(
+                                            "no matching session — run /sessions first".into(),
+                                        ));
+                                    }
+                                }
                                 return;
                             }
                             if let Some(target) = content.strip_prefix("/new ") {
@@ -1305,6 +1336,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let s_permission = s.permission.clone();
     let s_working = s.working;
     let s_work_started = s.work_started;
+    let s_prompt_len = s.prompt.len();
     let banner = match &s.banner {
         Some((text, at)) if at.elapsed() < std::time::Duration::from_secs(3) => {
             Some(text.clone())
@@ -1333,12 +1365,13 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     } else {
         let model_info = if s_model.is_empty() { String::new() } else { format!(" · {s_model}") };
         let scroll_info = if scroll > 0 { format!(" · ↑{scroll}") } else { String::new() };
+        let char_info = if s_prompt_len > 0 && !s_working { format!(" · ch:{s_prompt_len}") } else { String::new() };
         if s_working {
             let frame = SPINNER[(tick_val as usize / 2) % SPINNER.len()];
             let secs = s_work_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             format!(" {frame} working… {secs}s{model_info}{scroll_info}")
         } else {
-            format!(" {s_status}{model_info}{scroll_info}")
+            format!(" {s_status}{model_info}{scroll_info}{char_info}")
         }
     };
     children.push(element! {

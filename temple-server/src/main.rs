@@ -849,7 +849,8 @@ fn parse_retry_after(err: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {    match memory.get_admins().await {
+async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {
+    match memory.get_admins().await {
         Ok(admins) if !admins.is_empty() => {
             for (phone, uuid) in &admins {
                 let recipient = uuid.as_deref().unwrap_or(phone);
