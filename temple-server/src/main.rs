@@ -317,6 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              /new — new session\n\
                              /quick — back to the default session\n\
                              /stop — interrupt the running request\n\
+                             /reset — cancel ALL in-flight requests (admin)\n\
                              /clear <account> — delete all sessions for an account (admin)\n\
                              /targets — list ssh targets\n\
                              /help — this"
@@ -335,6 +336,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 send_conv(&signal, &sender, &group_id, "nothing running").await;
                             }
                         }
+                        return;
+                    }
+
+                    if trimmed == "/reset" {
+                        // Admin escape hatch: cancel every in-flight request
+                        // to drain a wedged queue without a restart.
+                        let admins = memory.get_admins().await.unwrap_or_default();
+                        let is_admin = admins.iter().any(|(phone, uuid)| {
+                            phone == &sender || uuid.as_deref() == Some(&sender)
+                        });
+                        if !is_admin {
+                            send_conv(&signal, &sender, &group_id, "admin only").await;
+                            return;
+                        }
+                        let n = agent.cancel_all().await;
+                        send_conv(&signal, &sender, &group_id,
+                            &format!("cancelled {n} in-flight request(s) — queue drained")).await;
                         return;
                     }
 

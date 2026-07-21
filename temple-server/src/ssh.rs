@@ -27,6 +27,11 @@ impl SshExecutor {
         vec![
             "-F".into(),
             "/var/lib/temple/.ssh/config".into(),
+            // Fail fast on unreachable hosts; kill the session if the
+            // link goes silent (woke host fell back asleep, relay died).
+            "-o".into(), "ConnectTimeout=10".into(),
+            "-o".into(), "ServerAliveInterval=15".into(),
+            "-o".into(), "ServerAliveCountMax=3".into(),
             alias,
             remote_command.into(),
         ]
@@ -35,11 +40,14 @@ impl SshExecutor {
     /// Execute a command on the remote host.
     pub async fn execute(&self, command: &str) -> Result<String, String> {
         let args = self.ssh_args(command);
-        let output = Command::new("ssh")
-            .args(&args)
-            .output()
-            .await
-            .map_err(|e| format!("ssh spawn: {e}"))?;
+        // Hard cap — an unbounded hang here wedges the global request queue.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            Command::new("ssh").args(&args).output(),
+        )
+        .await
+        .map_err(|_| "ssh timed out after 120s".to_string())?
+        .map_err(|e| format!("ssh spawn: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

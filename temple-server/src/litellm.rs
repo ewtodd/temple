@@ -289,8 +289,21 @@ impl LiteLLM {
         let mut buffer: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
 
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| format!("stream read: {e}"))?;
+        // Idle timeout per chunk: a hung backend (model host down, proxy
+        // stuck) otherwise holds the connection for the full 1800s client
+        // timeout — and with the global request queue, wedges everyone.
+        // Timing out errors the attempt so the caller's retry loop runs.
+        const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+        loop {
+            let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+                Ok(Some(chunk)) => chunk.map_err(|e| format!("stream read: {e}"))?,
+                Ok(None) => break,
+                Err(_) => return Err(format!(
+                    "stream idle for {}s — backend hung",
+                    IDLE_TIMEOUT.as_secs()
+                )),
+            };
+            let bytes = chunk;
             buffer.extend_from_slice(&bytes);
 
             // Process complete SSE events (separated by \n\n). Split on raw

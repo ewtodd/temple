@@ -709,6 +709,7 @@ impl Agent {
         // users (lower number: 0 ethan, 1 valarie, -1 default) jump ahead
         // of whatever is queued. The permit is held until this fn returns.
         let priority = self.memory.get_user_priority(priority_user.unwrap_or(&username)).await.unwrap_or(-1);
+        let queue_start = Instant::now();
         let (_queue_permit, queued) = self.queue.acquire(priority).await;
         if cancel_token.is_cancelled() {
             // Cancelled while waiting in the queue — bail before doing any
@@ -718,6 +719,10 @@ impl Agent {
             return;
         }
         if queued {
+            tracing::info!(
+                "session {session_id} waited {:?} in queue (priority {priority})",
+                queue_start.elapsed()
+            );
             emit(AgentEvent::ToolEvent {
                 name: "queue".into(),
                 status: ToolStatus::Finished,
@@ -793,6 +798,17 @@ impl Agent {
             prefill_tps: stats.prefill_tps(),
             decode_tps: stats.decode_tps(),
         }));
+    }
+
+    /// Cancel ALL in-flight agent loops — admin escape hatch to drain a
+    /// wedged request queue without restarting the server.
+    pub async fn cancel_all(&self) -> usize {
+        let tokens = self.cancel_tokens.lock().await;
+        let n = tokens.len();
+        for (_, t) in tokens.iter() {
+            t.cancel();
+        }
+        n
     }
 
     /// Run the planner→executor→reviewer pipeline for Complex queries.
