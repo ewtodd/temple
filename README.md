@@ -162,8 +162,14 @@ Secrets (API keys, tokens, phone numbers) come from agenix via
   (x86_64 bastion — signal-cli's native lib doesn't support aarch64).
   Read receipts, typing bubbles, "still consulting the oracle..." status,
   multi-message splitting.
-- **Auth**: Bearer token auth on WebSocket. Token file contains
-  `token:person:phone` triples. Generate with `temple-server --generate-token`.
+- **Auth**: Bearer token auth on WebSocket. Token file lines are
+  `token:person:phone[:admin[:priority]]` (`admin` = `yes` unlocks
+  /broadcast; `priority` is the queue tier — lower runs first: 0 ethan,
+  1 valarie, -1 default). Generate with
+  `temple-server --generate-token USER PHONE [--admin] [--priority N]`.
+- **Queue**: one agent loop runs at a time across all sessions (Signal,
+  TUI). Queued requests dequeue by user priority, non-preemptive — ethan's
+  work never waits behind anyone else's queued requests.
 - **Sessions**: owned by the token identity (e.g. "ethan"), not the
   computer account. OpenSession auto-matches hostname+username to SSH
   targets. `--continue` resumes the most recent session.

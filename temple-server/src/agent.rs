@@ -63,6 +63,9 @@ pub enum AgentEvent {
     PermissionNeeded(PermissionRequest),
     Done(ChatStatsData),
     Error(String),
+    /// A stream that already produced deltas failed and is being retried —
+    /// clients should discard the partial message they accumulated.
+    StreamReset,
     /// Server requests the client to execute a local tool
     ToolRequestNeeded {
         request_id: Uuid,
@@ -157,6 +160,8 @@ pub struct Agent {
     /// Pending tool requests: request_id → oneshot sender for the result
     pending_tools: Mutex<HashMap<Uuid, oneshot::Sender<String>>>,
     pub models: ModelConfig,
+    /// Global priority queue — one agent loop at a time across all sessions
+    pub queue: crate::queue::RequestQueue,
     router_model: String,
     title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
@@ -187,6 +192,7 @@ impl Agent {
             router_model: "qwen3-4b-instruct".to_string(),
             title_model: "qwen3-4b-instruct".to_string(),
             models,
+            queue: crate::queue::RequestQueue::new(),
             tools: Mutex::new(Vec::new()),
             ssh_targets: Vec::new(),
             ssh_key_path: None,
@@ -514,60 +520,86 @@ impl Agent {
     }
 
     /// Generate and store a title for a session if it doesn't have one yet.
+    /// Titles summarize the FIRST USER MESSAGE only — including the
+    /// assistant's reply makes small models parrot the response as the
+    /// "title". Invalid model output falls back to a truncated excerpt.
     pub async fn ensure_session_title(&self, session_id: Uuid) {
-        let needs_title = {
+        let first_user_msg = {
             let sessions = self.sessions.lock().await;
-            sessions.get(&session_id)
-                .map(|s| s.persist && s.title.is_none() && !s.history.is_empty())
-                .unwrap_or(false)
+            sessions.get(&session_id).and_then(|s| {
+                if !(s.persist && s.title.is_none()) {
+                    return None;
+                }
+                s.history.iter()
+                    .find(|m| m.role == "user")
+                    .and_then(|m| m.content.clone())
+            })
         };
-        if !needs_title {
+        let Some(first_user_msg) = first_user_msg else {
             return;
-        }
-
-        let history = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id)
-                .map(|s| s.history.iter().take(4).cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
         };
 
-        let mut messages = vec![ChatMessage::system(
-            "Generate a short title (2-6 words) for this conversation. \
-             Just the title. No quotes, no punctuation, no preamble."
-        )];
-        messages.extend(history);
+        // Deterministic fallback: first line of the request, truncated at a
+        // word boundary. Always sane, used whenever the model misbehaves.
+        let fallback_title = |text: &str| -> String {
+            let first_line = text.lines().next().unwrap_or("").trim();
+            if first_line.chars().count() <= 48 {
+                return first_line.to_string();
+            }
+            let mut t: String = first_line.chars().take(48).collect();
+            if let Some(pos) = t.rfind(' ') {
+                t.truncate(pos);
+            }
+            t.push('…');
+            t
+        };
 
+        let excerpt: String = first_user_msg.chars().take(500).collect();
         // Use litellm proxy (fast), not the local oracle model (slow, unreliable)
         let req = ChatRequest {
             model: self.models.researcher_model.clone(), // gemma-4-31b on anton
-            messages,
+            messages: vec![
+                ChatMessage::system(
+                    "Summarize the user's request as a short title (2-6 words). \
+                     Reply with only the title — no quotes, no punctuation, \
+                     no explanation, no greeting."
+                ),
+                ChatMessage::user(excerpt),
+            ],
             tools: None,
             stream: Some(false),
             stream_options: None,
-            max_tokens: Some(20),
+            max_tokens: Some(24),
             temperature: Some(0.2),
         };
 
-        match self.litellm.chat(req).await {
-            Ok(resp) => {
-                if let Some(choice) = resp.choices.first() {
-                    if let Some(content) = choice.message.content.as_deref() {
-                        let title = content.trim().to_string();
-                        if !title.is_empty() && title.len() > 2 {
-                            let mut sessions = self.sessions.lock().await;
-                            if let Some(s) = sessions.get_mut(&session_id) {
-                                s.title = Some(title.clone());
-                            }
-                            tracing::info!("Session {session_id} title: {title}");
-                        }
-                    }
-                }
-            }
+        let model_title = match self.litellm.chat(req).await {
+            Ok(resp) => resp.choices.first()
+                .and_then(|c| c.message.content.clone())
+                .map(|t| t.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string())
+                .filter(|t| {
+                    let words = t.split_whitespace().count();
+                    !t.is_empty()
+                        && !t.contains('\n')
+                        && t.chars().count() <= 60
+                        && words >= 2
+                        && words <= 8
+                }),
             Err(e) => {
                 tracing::warn!("Title generation for {session_id} failed: {e}");
+                None
             }
+        };
+
+        let title = model_title.unwrap_or_else(|| fallback_title(&first_user_msg));
+        if title.is_empty() {
+            return;
         }
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(&session_id) {
+            s.title = Some(title.clone());
+        }
+        tracing::info!("Session {session_id} title: {title}");
     }
 
     /// Get display metadata for an in-memory session (for preambles).
@@ -668,6 +700,20 @@ impl Agent {
                 s.model.clone(), s.kind, s.ssh.clone(),
             )
         };
+
+        // ── Global priority queue ──
+        // One agent loop at a time across all sessions; higher-priority
+        // users (lower number: 0 ethan, 1 valarie, -1 default) jump ahead
+        // of whatever is queued. The permit is held until this fn returns.
+        let priority = self.memory.get_user_priority(&username).await.unwrap_or(-1);
+        let (_queue_permit, queued) = self.queue.acquire(priority).await;
+        if queued {
+            emit(AgentEvent::ToolEvent {
+                name: "queue".into(),
+                status: ToolStatus::Finished,
+                detail: format!("waited for higher-priority work (priority {priority})"),
+            });
+        }
 
         // Route the query — heuristics only (skip local model call for speed)
         let route = if content.starts_with('/') || content.starts_with(':') {
@@ -1004,11 +1050,13 @@ impl Agent {
                     });
 
                     let mut attempt_error: Option<String> = None;
+                    let mut attempt_had_output = false;
                     stream_first_delta = None;
                     while let Some(ev) = rx.recv().await {
                         if cancel_token.is_cancelled() { break; }
                         match ev {
                             StreamEvent::Delta(d) => {
+                                attempt_had_output = true;
                                 if stream_first_delta.is_none() {
                                     stream_first_delta = Some(Instant::now());
                                 }
@@ -1040,6 +1088,11 @@ impl Agent {
                     if attempt < MAX_STREAM_RETRIES - 1 {
                         let delay = std::time::Duration::from_millis(500 * (1 << attempt));
                         tracing::warn!("Stream retry {}/{}: {} in {:?}", attempt+1, MAX_STREAM_RETRIES, last_err, delay);
+                        // The client accumulated a partial message from this
+                        // attempt — tell it to discard before we re-stream.
+                        if attempt_had_output {
+                            emit(AgentEvent::StreamReset);
+                        }
                         emit(AgentEvent::ToolEvent {
                             name: "system".into(), status: ToolStatus::Started,
                             detail: format!("retry {}/{} after stream error", attempt+1, MAX_STREAM_RETRIES),

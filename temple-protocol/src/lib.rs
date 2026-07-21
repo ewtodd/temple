@@ -145,6 +145,10 @@ pub enum ServerMessage {
     Pong,
     /// Agent loop was cancelled by the user
     ChatCancelled { session_id: Uuid },
+    /// The in-progress assistant message is being regenerated after a stream
+    /// error — the client should drop the partial assistant entry; the
+    /// deltas that follow rebuild it from scratch.
+    ChatReset { session_id: Uuid },
     /// Server is shutting down
     Shutdown,
     /// Persisted sessions for the authenticated user

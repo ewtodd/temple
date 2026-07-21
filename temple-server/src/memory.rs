@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Arc;
 use temple_protocol::{ConversationEntry, MemoryEntry, Skill};
@@ -21,6 +21,7 @@ impl Memory {
         // 1. Run ALTER TABLE first (column must exist before indexes reference it)
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN account TEXT");
         let _ = conn.execute_batch("ALTER TABLE signal_users ADD COLUMN admin TEXT DEFAULT 'no'");
+        let _ = conn.execute_batch("ALTER TABLE signal_users ADD COLUMN priority INTEGER DEFAULT -1");
         // 2. Run schema creation
         conn.execute_batch(
             "
@@ -285,14 +286,32 @@ impl Memory {
         username: &str,
         phone: &str,
         admin: bool,
+        priority: i32,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO signal_users (username, phone, admin) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(username) DO UPDATE SET phone = EXCLUDED.phone, admin = EXCLUDED.admin",
-            params![username, phone, if admin { "yes" } else { "no" }],
+            "INSERT INTO signal_users (username, phone, admin, priority) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(username) DO UPDATE SET phone = EXCLUDED.phone, \
+             admin = EXCLUDED.admin, priority = EXCLUDED.priority",
+            params![username, phone, if admin { "yes" } else { "no" }, priority],
         )?;
         Ok(())
+    }
+
+    /// Request-queue priority for a user — lower runs first
+    /// (0 ethan, 1 valarie, -1 default for everyone else).
+    pub async fn get_user_priority(&self, username: &str) -> rusqlite::Result<i32> {
+        let conn = self.conn.lock().await;
+        let priority = conn
+            .query_row(
+                "SELECT priority FROM signal_users WHERE username = ?1",
+                params![username],
+                |row| row.get::<_, Option<i32>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or(-1);
+        Ok(priority)
     }
 
     /// Record a verified UUID for a signal user.

@@ -7,6 +7,7 @@ mod mcp;
 mod memory;
 mod nextcloud;
 mod permissions;
+mod queue;
 mod router;
 mod server;
 mod signal;
@@ -42,14 +43,20 @@ struct Cli {
     generate_completions: Option<Shell>,
 
     /// Generate a new auth token for a user.
-    /// Usage: --generate-token USERNAME PHONE [--admin]
-    /// Writes `token:username:phone[:yes]` to the auth_token_file and prints the token.
+    /// Usage: --generate-token USERNAME PHONE [--admin] [--priority N]
+    /// Writes `token:username:phone[:admin[:priority]]` to the auth_token_file
+    /// and prints the token.
     #[arg(long, num_args = 2, value_names = ["USERNAME", "PHONE"])]
     generate_token: Option<Vec<String>>,
 
     /// Mark the generated user as an admin
     #[arg(long)]
     admin: bool,
+
+    /// Queue priority for the generated user — lower runs first
+    /// (0 = ethan, 1 = valarie, -1 = default)
+    #[arg(long, allow_negative_numbers = true)]
+    priority: Option<i32>,
 }
 
 impl Cli {
@@ -97,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(args) = &cli.generate_token {
         let username = &args[0];
         let phone = &args[1];
-        let token = generate_and_save_token(&cfg, username, phone, cli.admin)?;
+        let token = generate_and_save_token(&cfg, username, phone, cli.admin, cli.priority)?;
         println!("{token}");
         return Ok(());
     }
@@ -515,6 +522,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             agent::AgentEvent::Delta(d) => {
                                 response.lock().unwrap().push_str(&d);
                             }
+                            agent::AgentEvent::StreamReset => {
+                                // Partial response from a failed stream
+                                // attempt — drop it, a retry follows.
+                                response.lock().unwrap().clear();
+                            }
                             _ => {}
                         }
                     };
@@ -611,6 +623,7 @@ fn generate_and_save_token(
     username: &str,
     phone: &str,
     admin: bool,
+    priority: Option<i32>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use rand::Rng;
     let token: String = (0..32)
@@ -633,10 +646,11 @@ fn generate_and_save_token(
         std::fs::create_dir_all(parent)?;
     }
 
-    let line = if admin {
-        format!("{token}:{username}:{phone}:yes\n")
-    } else {
-        format!("{token}:{username}:{phone}\n")
+    let line = match (admin, priority) {
+        (true, Some(p)) => format!("{token}:{username}:{phone}:yes:{p}\n"),
+        (false, Some(p)) => format!("{token}:{username}:{phone}:no:{p}\n"),
+        (true, None) => format!("{token}:{username}:{phone}:yes\n"),
+        (false, None) => format!("{token}:{username}:{phone}\n"),
     };
     let mut existing = std::fs::read_to_string(token_file).unwrap_or_default();
     // Remove any existing line for this username (re-generating replaces)

@@ -334,6 +334,9 @@ async fn handle_connection(
                         AgentEvent::PermissionNeeded(req) => {
                             ServerMessage::PermissionRequired(req)
                         }
+                        AgentEvent::StreamReset => ServerMessage::ChatReset {
+                            session_id: sid,
+                        },
                         AgentEvent::ToolRequestNeeded { request_id, name, args_json } => {
                             ServerMessage::ToolRequest {
                                 request_id,
