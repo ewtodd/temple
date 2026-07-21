@@ -1601,6 +1601,36 @@ Git conventions:
                     .map_err(|e| format!("save_memory: {e}"))?;
                 Ok(format!("Saved memory: {key} = {value}"))
             }
+            "recall_memory" => {
+                let username = {
+                    let sessions = self.sessions.lock().await;
+                    sessions.get(&session_id)
+                        .map(|s| s.username.clone())
+                        .unwrap_or_else(|| "global".into())
+                };
+                let memories = self.memory.get_all_memory(&username).await
+                    .map_err(|e| format!("recall_memory: {e}"))?;
+
+                let key_filter = args["key"].as_str().unwrap_or("");
+                let filtered: Vec<_> = if key_filter.is_empty() {
+                    memories
+                } else {
+                    let kf = key_filter.to_lowercase();
+                    memories.into_iter()
+                        .filter(|m| m.key.to_lowercase().contains(&kf))
+                        .collect()
+                };
+
+                if filtered.is_empty() {
+                    return Ok("No memories found.".into());
+                }
+
+                let mut out = String::new();
+                for m in filtered.iter().take(20) {
+                    out.push_str(&format!("{}: {}\n", m.key, m.value));
+                }
+                Ok(out.trim_end().to_string())
+            }
 
             _ => self.mcp.call_tool(name, args).await,
         }
@@ -1820,6 +1850,19 @@ fn local_tools() -> Vec<ToolDefinition> {
                         "value": {"type": "string", "description": "The value to remember."},
                     },
                     "required": ["key", "value"],
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "recall_memory".into(),
+                description: "Recall previously saved memories. Search by key (partial match) or omit to list all memories for the current user.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Key to search for (partial match, case-insensitive). Omit to list all memories."},
+                    },
                 }),
             },
         },
