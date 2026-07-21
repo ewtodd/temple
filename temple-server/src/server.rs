@@ -159,12 +159,11 @@ async fn handle_connection(
                 if auth_owner.is_none() {
                     auth_owner = Some(open.username.clone());
                 }
-                // Auto-match the client to an SSH target by account name.
-                // e-work → e-work@e-desktop, e-play → e-play@e-desktop.
-                // Each account exists on exactly one host, so hostname matching
-                // isn't needed (and hostname != IP in the config).
+                // Auto-match the client's hostname + username to an SSH target.
+                // e-work on e-desktop → finds e-work@e-desktop target → Coding session
+                // This means every `temple` invocation gets working tools immediately.
                 let ssh_target = agent.ssh_targets.iter().find(|t| {
-                    t.account == open.username
+                    t.host == open.hostname && t.account == open.username
                 });
                 if let Some(target) = ssh_target {
                     tracing::info!(
