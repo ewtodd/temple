@@ -22,6 +22,8 @@ impl SshExecutor {
     /// Build the SSH command prefix (ssh -i key -p port [-J bastion] account@host)
     fn ssh_args(&self, remote_command: &str) -> Vec<String> {
         let mut args = vec![
+            "-F".into(),
+            "/var/lib/temple/.ssh/config".into(),
             "-i".into(),
             self.key_path.display().to_string(),
             "-p".into(),

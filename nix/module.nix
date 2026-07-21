@@ -254,6 +254,7 @@ in
       wants = [ "network-online.target" ];
 
       environment.RUST_LOG = "temple_server=info";
+      environment.HOME = "/var/lib/temple";
 
       serviceConfig = {
         Type = "simple";
@@ -284,6 +285,22 @@ in
         EnvironmentFile = if builtins.isList cfg.environmentFile then cfg.environmentFile else [ cfg.environmentFile ];
       });
     };
+
+    # SSH config for the temple user — defines the bastion alias
+    # used by ProxyJump to reach LAN workstations.
+    environment.etc."temple/ssh_config".text = ''
+      Host bastion
+        HostName 10.0.0.2
+        Port 2222
+        User deploy
+        IdentityFile /var/lib/temple/ssh_key
+        StrictHostKeyChecking accept-new
+    '';
+    # Temple reads this via SSH_OPTIONS or ~/.ssh/config
+    systemd.tmpfiles.rules = [
+      "d /var/lib/temple/.ssh 0700 temple temple - -"
+      "L+ /var/lib/temple/.ssh/config - - - - /etc/temple/ssh_config"
+    ];
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
       (lib.toInt port)
