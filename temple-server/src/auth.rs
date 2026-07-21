@@ -82,6 +82,30 @@ pub async fn load_signal_users(
         let token = parts[0];
         let username = parts[1];
         let phone = parts[2];
+        // Field-order mistakes (admin/priority in the phone slot, phone
+        // tacked on the end) silently corrupt the DB sync — warn loudly.
+        if !phone.starts_with('+') {
+            tracing::warn!(
+                "token file: user {username} has phone field '{phone}' — \
+                 expected token:username:phone[:admin[:priority]]"
+            );
+        }
+        if let Some(a) = parts.get(3) {
+            let a = a.trim();
+            if !a.eq_ignore_ascii_case("yes") && !a.eq_ignore_ascii_case("no") {
+                tracing::warn!(
+                    "token file: user {username} field 4 is '{a}' — expected 'yes' or 'no'"
+                );
+            }
+        }
+        if let Some(p) = parts.get(4) {
+            if p.trim().parse::<i32>().is_err() {
+                tracing::warn!(
+                    "token file: user {username} field 5 is '{}' — expected an integer priority",
+                    p.trim()
+                );
+            }
+        }
         let (admin, priority) = parse_extras(&parts);
         memory.upsert_signal_user_phone(username, phone, admin, priority).await
             .map_err(|e| format!("upsert signal user: {e}"))?;
