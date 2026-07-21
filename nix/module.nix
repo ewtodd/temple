@@ -41,7 +41,18 @@ let
       executor_model = cfg.executorModel;
       reviewer_model = cfg.reviewerModel;
       critical_model = cfg.criticalModel;
+      researcher_model = cfg.researcherModel;
     };
+    ssh_targets = map (t: {
+      name = t.name;
+      account = t.account;
+      host = t.host;
+      port = t.port;
+      owner = t.owner;
+      allowed_dirs = t.allowedDirs;
+    }) cfg.sshTargets;
+    ssh_bastion = cfg.sshBastion;
+    ssh_key_path = cfg.sshKeyPath;
     local_llama_url = cfg.localLlamaUrl;
     local_llama_model = cfg.localLlamaModel;
   };
@@ -103,6 +114,41 @@ in
       type = types.str;
       default = "deepseek-v4-flash-high";
       description = "Model for Critical complexity queries (deepseek direct).";
+    };
+
+    researcherModel = mkOption {
+      type = types.str;
+      default = "gemma-4-31b";
+      description = "Model for research/lookup queries (Signal quick questions).";
+    };
+
+    sshTargets = mkOption {
+      type = types.listOf (types.submodule {
+        options = {
+          name = mkOption { type = types.str; description = "Human-readable name (e.g. e-work@e-desktop)."; };
+          account = mkOption { type = types.str; description = "SSH username on the workstation."; };
+          host = mkOption { type = types.str; description = "Workstation IP or hostname."; };
+          port = mkOption { type = types.port; default = 2222; description = "SSH port."; };
+          owner = mkOption { type = types.str; description = "Temple username who owns this account."; };
+          allowedDirs = mkOption { type = types.listOf types.str; default = [ ]; description = "Extra allowed dirs (beyond $HOME and /tmp)."; };
+        };
+      });
+      default = [ ];
+      description = "SSH targets for remote tool execution.";
+    };
+
+    sshBastion = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "deploy@10.0.0.2:2222";
+      description = "Bastion host for ProxyJump SSH connections.";
+    };
+
+    sshKeyPath = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = "/run/agenix/temple-ssh-key";
+      description = "SSH private key for connecting to workstations.";
     };
 
     defaultPermission = mkOption {
