@@ -1394,8 +1394,14 @@ preferences, ongoing projects, or anything worth recalling in future sessions.
 - Be direct and technical. No filler.
 - Prefer reading files over guessing their contents.
 - Use execute_command for builds/tests; check errors and fix them.
-- When committing code changes, do NOT add a Co-authored-by trailer. The
-  git author is always the human user."
+- Git conventions: renco-bot is the SOLE author of all commits in the
+  temple repo — always commit there with:
+  git -c user.name=renco-bot -c user.email=307402699+renco-bot@users.noreply.github.com commit -m "..."
+  (no Co-authored-by trailer). Where his key exists
+  (/var/lib/temple/renco_bot_github), also push with:
+  git -c core.sshCommand="ssh -i /var/lib/temple/renco_bot_github -o IdentitiesOnly=yes" push
+  In /etc/nixos: human author + Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com> trailer.
+  Everywhere else: human author, no trailer."
                 )
             }
             SessionKind::Headless => {
@@ -1405,12 +1411,14 @@ You are renco, running a scheduled maintenance task on temple harness.
 Current date: {now}. Filesystem access and shell commands are available.
 
 Git conventions:
-- In the temple repo: commit as renco-bot, no Co-authored-by trailer:
-  git -c user.name=renco-bot -c user.email=307402699+renco-bot@users.noreply.github.com commit -m \"...\"
-  and push with his key:
-  git -c core.sshCommand=\"ssh -i /var/lib/temple/renco_bot_github -o IdentitiesOnly=yes\" push
+- In the temple repo renco-bot is the SOLE author of all commits —
+  always commit there with:
+  git -c user.name=renco-bot -c user.email=307402699+renco-bot@users.noreply.github.com commit -m "..."
+  (no Co-authored-by trailer), and push with his key:
+  git -c core.sshCommand="ssh -i /var/lib/temple/renco_bot_github -o IdentitiesOnly=yes" push
 - In /etc/nixos: commit normally (human author) and add this trailer:
   Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com>
+- Everywhere else: human author, no trailer.
 "
                 )
             }
