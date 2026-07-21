@@ -11,7 +11,7 @@ use crate::litellm::{ChatMessage, ChatRequest, LiteLLM, StreamEvent, ToolDefinit
 use crate::mcp::McpClient;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
-use crate::router::{Route, Router};
+use crate::router::{Route, Router, SessionKind};
 
 /// Maximum tool-loop rounds per user message before forcing an answer.
 const MAX_TOOL_ROUNDS: usize = 30;
@@ -120,6 +120,9 @@ struct SessionCtx {
     username: String,
     cwd: String,
     initialized: bool,
+    kind: SessionKind,
+    /// SSH executor for remote tool execution (None = local tools only)
+    ssh: Option<Arc<crate::ssh::SshExecutor>>,
 }
 
 pub struct Agent {
@@ -205,9 +208,15 @@ impl Agent {
         let _ = self.litellm.chat(req).await;
     }
 
-    pub async fn open_session(&self, session_id: Uuid, username: &str, cwd: &str) {
+    pub async fn open_session(
+        &self,
+        session_id: Uuid,
+        username: &str,
+        cwd: &str,
+        kind: SessionKind,
+        ssh: Option<Arc<crate::ssh::SshExecutor>>,
+    ) {
         let mut sessions = self.sessions.lock().await;
-        // Check if user already has memories (onboarding done?)
         let initialized = self
             .memory
             .get_memory("onboarded", username)
@@ -222,6 +231,8 @@ impl Agent {
                 username: username.to_string(),
                 cwd: cwd.to_string(),
                 initialized,
+                kind,
+                ssh,
             },
         );
     }
@@ -275,7 +286,7 @@ impl Agent {
         }
 
         // Get session info
-        let (username, cwd, _is_initialized, session_model) = {
+        let (username, cwd, _is_initialized, session_model, session_kind, ssh_executor) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
@@ -283,7 +294,10 @@ impl Agent {
                 return;
             };
             s.history.push(ChatMessage::user(content));
-            (s.username.clone(), s.cwd.clone(), s.initialized, s.model.clone())
+            (
+                s.username.clone(), s.cwd.clone(), s.initialized,
+                s.model.clone(), s.kind, s.ssh.clone(),
+            )
         };
 
         // Route the query — heuristics only (skip local model call for speed)
@@ -291,11 +305,11 @@ impl Agent {
             Route::Direct { model: session_model }
         } else {
             let complexity = Router::classify(content);
-            tracing::info!("Router: {complexity:?}");
-            Router::route(complexity, &self.models)
+            tracing::info!("Router: {complexity:?} (kind={session_kind:?})");
+            Router::route(complexity, &self.models, session_kind)
         };
 
-        let base_system_prompt = self.build_system_prompt(&username, &cwd).await;
+        let base_system_prompt = self.build_system_prompt(&username, &cwd, session_kind).await;
 
         // Stats accumulators across all rounds
         let mut stats = StatsAccum::new();
@@ -305,7 +319,7 @@ impl Agent {
                 let mut tool_history = Vec::new();
                 let content = self.run_tool_loop(
                     session_id, model, &base_system_prompt, &cancel_token,
-                    &scope, emit, &mut stats, &mut tool_history,
+                    &scope, ssh_executor.as_ref(), emit, &mut stats, &mut tool_history,
                 ).await;
                 (content, model.clone())
             }
@@ -313,7 +327,7 @@ impl Agent {
                 self.run_pipeline(
                     session_id, content, &base_system_prompt,
                     planner, executor, reviewer,
-                    &cancel_token, &scope, emit, &mut stats,
+                    &cancel_token, &scope, ssh_executor.as_ref(), emit, &mut stats,
                 ).await
             }
         };
@@ -364,6 +378,7 @@ impl Agent {
         reviewer: &str,
         cancel_token: &CancellationToken,
         scope: &Arc<Mutex<PermissionScope>>,
+        ssh: Option<&Arc<crate::ssh::SshExecutor>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         stats: &mut StatsAccum,
     ) -> (String, String) {
@@ -397,7 +412,7 @@ impl Agent {
         // ── 2. Executor: run the tool loop with the plan ──
         let mut executor_output = self.run_tool_loop(
             session_id, executor, &executor_prompt, cancel_token,
-            scope, emit, stats, &mut tool_history,
+            scope, ssh, emit, stats, &mut tool_history,
         ).await;
 
         // ── 3. Reviewer: evaluate the executor's output ──
@@ -448,7 +463,7 @@ impl Agent {
             // Run executor again with the revision feedback
             executor_output = self.run_tool_loop(
                 session_id, executor, &executor_prompt, cancel_token,
-                scope, emit, stats, &mut tool_history,
+                scope, ssh, emit, stats, &mut tool_history,
             ).await;
         }
 
@@ -566,6 +581,7 @@ impl Agent {
         system_prompt: &str,
         cancel_token: &CancellationToken,
         scope: &Arc<Mutex<PermissionScope>>,
+        ssh: Option<&Arc<crate::ssh::SshExecutor>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         stats: &mut StatsAccum,
         tool_call_history: &mut Vec<String>,
@@ -732,7 +748,7 @@ impl Agent {
                     detail: summarize_args(args_str),
                 });
 
-                let output = self.execute_tool(session_id, name, args_str, scope.clone(), emit).await;
+                let output = self.execute_tool(session_id, name, args_str, scope.clone(), ssh, emit).await;
                 let (status, text) = match &output {
                     Ok(t) => (ToolStatus::Finished, truncate(t, MAX_TOOL_RESULT)),
                     Err(e) => (ToolStatus::Failed, truncate(e, MAX_TOOL_RESULT)),
@@ -769,10 +785,11 @@ impl Agent {
     }
 
     /// Build system prompt with personality, user memories, code rules, and CWD detection.
-    async fn build_system_prompt(&self, username: &str, cwd: &str) -> String {
+    async fn build_system_prompt(&self, username: &str, cwd: &str, kind: SessionKind) -> String {
         let personality = self.memory.get_personality().await.unwrap_or_default();
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
-        // User-specific memories
+        // User-specific memories (always included)
         let user_memories = self.memory.get_all_memory(username).await.unwrap_or_default();
         let user_section = if user_memories.is_empty() {
             String::new()
@@ -784,7 +801,7 @@ impl Agent {
             s
         };
 
-        // Skills
+        // Skills (always included — they're useful in any context)
         let skills = self.memory.get_all_skills().await.unwrap_or_default();
         let skills_section = if skills.is_empty() {
             String::new()
@@ -799,23 +816,47 @@ impl Agent {
             s
         };
 
-        // CWD-based project detection
-        let project_section = detect_project_context(cwd).await;
+        match kind {
+            SessionKind::Quick => {
+                // Minimal prompt for Signal quick questions / research.
+                // No coding rules, no project context, no filesystem tools.
+                format!(
+                    "{personality}
 
-        format!(
-            "{personality}
+You are renco, an agentic assistant running on temple harness.
+You are talking to {username} right now.
+Current date: {now}{user_section}{skills_section}
 
-You are renco, an agentic coding assistant running on {username}'s own hardware.
-You are talking to {username} right now.{user_section}{skills_section}
+## Available tools
+You have tools for web search/fetch, NixOS queries, arXiv paper search,
+library docs (context7), and persistent memory (save_memory). Use them
+when they help. Use `save_memory` to remember facts about the user,
+their preferences, or anything worth recalling in future sessions.
+
+## Guidelines
+- Be direct and concise. No filler.
+- For factual questions, use web_search to get current information.
+- For library/framework questions, use context7.
+- For NixOS questions, use the nixos tool.
+- For research questions, use arxiv search.
+"
+                )
+            }
+            SessionKind::Coding => {
+                // Full prompt for coding sessions (TUI/SSH with filesystem access).
+                let project_section = detect_project_context(cwd).await;
+                format!(
+                    "{personality}
+
+You are renco, an agentic coding assistant running on temple harness.
+You are talking to {username} right now.
+Current date: {now}{user_section}{skills_section}
 
 ## Available tools
 You have tools for filesystem access, shell commands, persistent memory, web
 search/fetch, NixOS queries, arXiv, and library docs (context7). Use them when
 they help. Use `save_memory` to remember facts about the user, their
 preferences, ongoing projects, or anything worth recalling in future sessions.
-If this is the first time you're talking to {username} and you don't know them
-yet, ask a few brief questions (name, what they do, coding preferences, main
-projects) and use `save_memory` to store the answers.
 
 ## Code rules (hardcoded — always follow)
 - Prefer slightly verbose, self-explanatory code over terse code that needs comments.
@@ -855,9 +896,24 @@ projects) and use `save_memory` to store the answers.
 - Be direct and technical. No filler.
 - Prefer reading files over guessing their contents.
 - Use execute_command for builds/tests; check errors and fix them.
-- The working directory is {username}'s project root; relative paths resolve there.
+- The working directory is the user's project root; relative paths resolve there.
 "
-        )
+                )
+            }
+            SessionKind::System => {
+                // System prompt for cron jobs — operates on oracle's local FS.
+                format!(
+                    "{personality}
+
+You are renco, running a scheduled maintenance task on temple harness.
+Current date: {now}
+
+## Available tools
+You have filesystem access, shell commands, and persistent memory.
+"
+                )
+            }
+        }
     }
 
     async fn execute_tool(
@@ -866,6 +922,7 @@ projects) and use `save_memory` to store the answers.
         name: &str,
         args_json: &str,
         scope: Arc<Mutex<PermissionScope>>,
+        ssh: Option<&Arc<crate::ssh::SshExecutor>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String, String> {
         let args = LiteLLM::recover_tool_call(args_json)
@@ -874,86 +931,111 @@ projects) and use `save_memory` to store the answers.
         match name {
             "read_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let resolved = {
-                    let s = scope.lock().await;
-                    s.resolve(std::path::Path::new(path))
-                };
-                self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit).await?;
-                tokio::fs::read_to_string(&resolved)
-                    .await
-                    .map_err(|e| format!("read {}: {e}", resolved.display()))
+                if let Some(ssh) = ssh {
+                    let resolved = ssh.resolve_path(path).await?;
+                    self.check_ssh_perm(session_id, &resolved, AccessKind::Read, ssh, emit).await?;
+                    ssh.read_file(&resolved).await
+                } else {
+                    let resolved = {
+                        let s = scope.lock().await;
+                        s.resolve(std::path::Path::new(path))
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit).await?;
+                    tokio::fs::read_to_string(&resolved)
+                        .await
+                        .map_err(|e| format!("read {}: {e}", resolved.display()))
+                }
             }
 
             "write_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
                 let content = args["content"].as_str().ok_or("missing content")?;
-                let resolved = {
-                    let s = scope.lock().await;
-                    s.resolve(std::path::Path::new(path))
-                };
-                self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
-                if let Some(parent) = resolved.parent() {
-                    tokio::fs::create_dir_all(parent).await.ok();
+                if let Some(ssh) = ssh {
+                    let resolved = ssh.resolve_path(path).await?;
+                    self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
+                    ssh.write_file(&resolved, content).await
+                } else {
+                    let resolved = {
+                        let s = scope.lock().await;
+                        s.resolve(std::path::Path::new(path))
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
+                    if let Some(parent) = resolved.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+                    tokio::fs::write(&resolved, content)
+                        .await
+                        .map_err(|e| format!("write {}: {e}", resolved.display()))?;
+                    Ok(format!("wrote {} ({} bytes)", resolved.display(), content.len()))
                 }
-                tokio::fs::write(&resolved, content)
-                    .await
-                    .map_err(|e| format!("write {}: {e}", resolved.display()))?;
-                Ok(format!("wrote {} ({} bytes)", resolved.display(), content.len()))
             }
 
             "list_dir" => {
                 let path = args["path"].as_str().unwrap_or(".");
-                let resolved = {
-                    let s = scope.lock().await;
-                    s.resolve(std::path::Path::new(path))
-                };
-                self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit).await?;
-                let mut entries = tokio::fs::read_dir(&resolved)
-                    .await
-                    .map_err(|e| format!("readdir {}: {e}", resolved.display()))?;
-                let mut out = Vec::new();
-                while let Ok(Some(e)) = entries.next_entry().await {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                    out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                if let Some(ssh) = ssh {
+                    let resolved = ssh.resolve_path(path).await?;
+                    self.check_ssh_perm(session_id, &resolved, AccessKind::ReadDir, ssh, emit).await?;
+                    ssh.list_dir(&resolved).await
+                } else {
+                    let resolved = {
+                        let s = scope.lock().await;
+                        s.resolve(std::path::Path::new(path))
+                    };
+                    self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit).await?;
+                    let mut entries = tokio::fs::read_dir(&resolved)
+                        .await
+                        .map_err(|e| format!("readdir {}: {e}", resolved.display()))?;
+                    let mut out = Vec::new();
+                    while let Ok(Some(e)) = entries.next_entry().await {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                        out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                    }
+                    Ok(out.join("\n"))
                 }
-                Ok(out.join("\n"))
             }
 
             "execute_command" => {
                 let command = args["command"].as_str().ok_or("missing command")?;
-                let cwd = {
-                    let s = scope.lock().await;
-                    s.cwd()
-                };
+                if let Some(ssh) = ssh {
+                    // SSH sessions: Yolo is never allowed, dangerous commands always prompt
+                    if is_dangerous_command(command) {
+                        self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
+                    }
+                    if !is_safe_command(command) {
+                        self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
+                    }
+                    ssh.execute(command).await
+                } else {
+                    let cwd = {
+                        let s = scope.lock().await;
+                        s.cwd()
+                    };
+                    if is_dangerous_command(command) {
+                        self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+                    }
+                    if !is_safe_command(command) {
+                        self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+                    }
+                    let output = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .current_dir(&cwd)
+                        .output()
+                        .await
+                        .map_err(|e| format!("spawn: {e}"))?;
 
-                // Check if command is dangerous — always prompt, even in Yolo
-                if is_dangerous_command(command) {
-                    self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let mut out = String::new();
+                    if !stdout.is_empty() { out.push_str(&stdout); }
+                    if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{stderr}")); }
+                    if !output.status.success() {
+                        out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+                    }
+                    if out.is_empty() { out.push_str("(no output)"); }
+                    Ok(out)
                 }
-                // Safe read-only commands skip the permission check entirely
-                if !is_safe_command(command) {
-                    self.check_perm(session_id, &cwd, AccessKind::Execute, scope.clone(), emit).await?;
-                }
-
-                let output = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .current_dir(&cwd)
-                    .output()
-                    .await
-                    .map_err(|e| format!("spawn: {e}"))?;
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let mut out = String::new();
-                if !stdout.is_empty() { out.push_str(&stdout); }
-                if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{stderr}")); }
-                if !output.status.success() {
-                    out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
-                }
-                if out.is_empty() { out.push_str("(no output)"); }
-                Ok(out)
             }
 
             "save_memory" => {
@@ -1005,6 +1087,41 @@ projects) and use `save_memory` to store the answers.
                     _ => Err("permission request timed out".into()),
                 }
             }
+        }
+    }
+
+    /// Check permissions for SSH-executed tools. Always prompts for
+    /// paths outside $HOME and /tmp. Yolo is never allowed.
+    async fn check_ssh_perm(
+        &self,
+        session_id: Uuid,
+        target: &str,
+        access: AccessKind,
+        ssh: &crate::ssh::SshExecutor,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<(), String> {
+        // Get the remote home dir to check against
+        let home = ssh.home_dir().await.unwrap_or_default();
+        let allowed = ssh.is_path_allowed(target, &home);
+
+        if allowed {
+            return Ok(());
+        }
+
+        // Not in allowed dirs — prompt the user
+        let request_id = Uuid::new_v4();
+        emit(AgentEvent::PermissionNeeded(PermissionRequest {
+            request_id,
+            session_id,
+            path: format!("{} @ {}", target, ssh.target_name()),
+            access,
+        }));
+
+        let rx = self.permissions.ask(request_id).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(format!("permission denied: {target}")),
+            _ => Err("permission request timed out".into()),
         }
     }
 

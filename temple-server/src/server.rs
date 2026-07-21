@@ -152,7 +152,13 @@ async fn handle_connection(
                 )
                 .await;
                 permissions = Some(Arc::new(Mutex::new(scope)));
-                agent.open_session(session_id, &open.username, &open.cwd).await;
+                agent.open_session(
+                    session_id,
+                    &open.username,
+                    &open.cwd,
+                    crate::router::SessionKind::Quick,
+                    None,
+                ).await;
                 let info = SessionInfo {
                     session_id,
                     client_id: open.client_id.clone(),

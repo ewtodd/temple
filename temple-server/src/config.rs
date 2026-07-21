@@ -15,13 +15,33 @@ pub struct Config {
     pub default_permission: String,
     pub allowed_dirs: Vec<String>,
     /// Local llama.cpp instance for routing/titles (on oracle).
-    /// Points at localhost, not litellm — zero network latency.
     pub local_llama_url: String,
     pub local_llama_model: String,
     /// Path to the auth tokens file. Each line: `token:username:phone`.
-    /// The file is read on each connection so new tokens work without restart.
-    /// If None, auth is disabled (LAN-only mode).
     pub auth_token_file: Option<PathBuf>,
+    /// SSH targets for remote tool execution.
+    pub ssh_targets: Vec<SshTarget>,
+    /// Bastion host for SSH (e.g., "deploy-mu" or "10.0.0.2:2222").
+    pub ssh_bastion: Option<String>,
+    /// SSH key for connecting to workstations (path on oracle).
+    pub ssh_key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SshTarget {
+    /// Human-readable name, e.g., "e-work@e-desktop"
+    pub name: String,
+    /// Username on the workstation, e.g., "e-work"
+    pub account: String,
+    /// Workstation IP, e.g., "10.0.0.4"
+    pub host: String,
+    /// SSH port (usually 2222)
+    pub port: u16,
+    /// User who owns this account (matches token file username)
+    pub owner: String,
+    /// Allowed directories for this target (in addition to $HOME and /tmp)
+    #[serde(default)]
+    pub allowed_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,6 +107,8 @@ pub struct ModelConfig {
     pub reviewer_model: String,
     /// Model for Critical complexity (deepseek direct)
     pub critical_model: String,
+    /// Model for research/lookups (gemma on anton — good at general knowledge)
+    pub researcher_model: String,
     /// Model definitions
     pub models: Vec<ModelDef>,
 }
@@ -102,6 +124,7 @@ impl Default for ModelConfig {
             executor_model: "qwen3.6-27b-coding".into(),
             reviewer_model: "deepseek-v4-flash-high".into(),
             critical_model: "deepseek-v4-flash-high".into(),
+            researcher_model: "gemma-4-31b".into(),
             models: Vec::new(),
         }
     }
@@ -150,6 +173,9 @@ impl Default for Config {
             local_llama_url: "http://127.0.0.1:8080/v1".into(),
             local_llama_model: "qwen3-4b-instruct".into(),
             auth_token_file: None,
+            ssh_targets: Vec::new(),
+            ssh_bastion: None,
+            ssh_key_path: None,
         }
     }
 }

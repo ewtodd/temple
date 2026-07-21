@@ -19,6 +19,17 @@ pub enum Route {
     },
 }
 
+/// What kind of session this is — determines system prompt tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// Quick question via Signal — no CWD, no coding rules
+    Quick,
+    /// Coding session with SSH/TUI access to a workstation
+    Coding,
+    /// Cron job — operates on oracle's local filesystem
+    System,
+}
+
 impl Router {
     /// Quick heuristic classification — no model call needed.
     pub fn classify(query: &str) -> ComplexityClass {
@@ -104,21 +115,43 @@ impl Router {
     }
 
     /// Map a complexity class to a concrete route using configured models.
-    pub fn route(complexity: ComplexityClass, models: &ModelConfig) -> Route {
-        match complexity {
-            ComplexityClass::Simple => Route::Direct {
-                model: models.simple_model.clone(),
+    /// The session kind influences which models are appropriate.
+    pub fn route(complexity: ComplexityClass, models: &ModelConfig, kind: SessionKind) -> Route {
+        match (complexity, kind) {
+            // Quick sessions (Signal): route to researcher for lookups,
+            // deepseek for complex, never the pipeline (no file access)
+            (ComplexityClass::Simple, SessionKind::Quick) => Route::Direct {
+                model: models.researcher_model.clone(),
             },
-            ComplexityClass::Medium => Route::Direct {
+            (ComplexityClass::Medium, SessionKind::Quick) => Route::Direct {
+                model: models.researcher_model.clone(),
+            },
+            (ComplexityClass::Complex, SessionKind::Quick) => Route::Direct {
                 model: models.default_model.clone(),
             },
-            ComplexityClass::Complex => Route::Pipeline {
+            (ComplexityClass::Critical, SessionKind::Quick) => Route::Direct {
+                model: models.critical_model.clone(),
+            },
+
+            // Coding sessions (TUI/SSH): full pipeline available
+            (ComplexityClass::Simple, SessionKind::Coding) => Route::Direct {
+                model: models.simple_model.clone(),
+            },
+            (ComplexityClass::Medium, SessionKind::Coding) => Route::Direct {
+                model: models.default_model.clone(),
+            },
+            (ComplexityClass::Complex, SessionKind::Coding) => Route::Pipeline {
                 planner: models.planner_model.clone(),
                 executor: models.executor_model.clone(),
                 reviewer: models.reviewer_model.clone(),
             },
-            ComplexityClass::Critical => Route::Direct {
+            (ComplexityClass::Critical, SessionKind::Coding) => Route::Direct {
                 model: models.critical_model.clone(),
+            },
+
+            // System sessions (cron): always default model, no pipeline
+            (_, SessionKind::System) => Route::Direct {
+                model: models.default_model.clone(),
             },
         }
     }

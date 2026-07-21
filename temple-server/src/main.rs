@@ -10,6 +10,7 @@ mod permissions;
 mod router;
 mod server;
 mod signal;
+mod ssh;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Generator, Shell};
@@ -154,6 +155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sys_session,
                 "signal",
                 &cfg2.data_dir_workspace(),
+                router::SessionKind::Quick,
+                None,
             ).await;
             let scope = Arc::new(Mutex::new(
                 permissions::PermissionScope::new(
@@ -168,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let signal_for_handler = signal.clone();
             let memory_for_handler = memory_for_signal.clone();
             let token_file_for_handler = cfg2.auth_token_file.clone();
-            let handler = Arc::new(move |sender: String, message: String| {
+            let handler = Arc::new(move |sender: String, message: String, timestamp: u64| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
@@ -177,22 +180,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     tracing::info!("signal inbound from {sender}: {message:.60}");
 
+                    // Send read receipt immediately
+                    if timestamp > 0 {
+                        signal.send_read_receipt(&sender, timestamp).await.ok();
+                    }
+
                     // Check if sender is a verified signal user
                     let user = memory.find_signal_user(&sender).await
                         .unwrap_or(None);
 
                     let username = match &user {
-                        Some((u, _, Some(_))) => u.clone(), // verified (has UUID)
-                        Some((u, _, None)) => u.clone(),    // phone known, UUID pending
+                        Some((u, _, Some(_))) => u.clone(),
+                        Some((u, _, None)) => u.clone(),
                         None => {
-                            // Unknown sender — check if it's a /verify command
-                            // for an unverified user
                             if let Some(token) = message.strip_prefix("/verify ") {
                                 let token = token.trim();
-                                // Try to find this token in the auth file
                                 if let Some(ref token_file) = token_file {
                                     if let Ok(auth_user) = auth::check_token(token_file, token) {
-                                        // Found the token — record the UUID
                                         let _ = memory.set_signal_user_uuid(
                                             &auth_user.username,
                                             &sender,
@@ -212,33 +216,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
-                    // If user's UUID wasn't set yet, set it now (first message)
+                    // If user's UUID wasn't set yet, set it now
                     if let Some((_, _, None)) = &user {
                         let _ = memory.set_signal_user_uuid(&username, &sender).await;
                     }
 
+                    // Send typing indicator
+                    signal.send_typing(&sender).await.ok();
+
+                    // Start "still consulting" timer — sends a status message
+                    // every 2 minutes while the agent is still working.
+                    let signal_for_timer = signal.clone();
+                    let sender_for_timer = sender.clone();
+                    let timer_handle = tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                            signal_for_timer.send(&sender_for_timer, "still consulting the oracle...").await.ok();
+                            signal_for_timer.send_typing(&sender_for_timer).await.ok();
+                        }
+                    });
+
                     let response = Arc::new(std::sync::Mutex::new(String::new()));
+                    let first_delta = Arc::new(std::sync::Mutex::new(true));
                     let resp = response.clone();
+                    let first = first_delta.clone();
                     let emit = move |ev: agent::AgentEvent| {
                         if let agent::AgentEvent::Delta(d) = ev {
+                            // First delta cancels the "consulting" message
+                            // (typing indicator continues)
                             response.lock().unwrap().push_str(&d);
                         }
                     };
                     agent
                         .process_chat(sys_session, &message, scope, &emit)
                         .await;
+
+                    // Stop the "still consulting" timer
+                    timer_handle.abort();
+
                     let text = resp.lock().unwrap().clone();
                     if !text.trim().is_empty() {
-                        let truncated: String = text.chars().take(1900).collect();
-                        let suffix = if text.chars().count() > 1900 {
-                            "\n…[truncated]"
-                        } else {
-                            ""
-                        };
-                        signal
-                            .send(&sender, &format!("{truncated}{suffix}"))
-                            .await
-                            .ok();
+                        signal.send_multi(&sender, &text).await.ok();
                     }
                 });
             });

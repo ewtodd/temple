@@ -29,6 +29,67 @@ impl Signal {
         self.config.enabled
     }
 
+    /// Send a read receipt for a message timestamp. This marks the message
+    /// as "read" on the sender's phone.
+    pub async fn send_read_receipt(&self, recipient: &str, timestamp: u64) -> Result<(), String> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let mut stream = TcpStream::connect(&self.config.socket_addr)
+            .await
+            .map_err(|e| format!("signal connect: {e}"))?;
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "sendReadReceipt",
+            "params": {
+                "recipient": [recipient],
+                "timestamps": [timestamp],
+            },
+            "id": 1,
+        });
+        let line = format!("{}\n", req.to_string());
+        stream.write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("signal write: {e}"))?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line)
+            .await
+            .map_err(|e| format!("signal read: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Send a typing indicator to a recipient.
+    pub async fn send_typing(&self, recipient: &str) -> Result<(), String> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let mut stream = TcpStream::connect(&self.config.socket_addr)
+            .await
+            .map_err(|e| format!("signal connect: {e}"))?;
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "sendTypingMessage",
+            "params": {
+                "recipient": [recipient],
+            },
+            "id": 1,
+        });
+        let line = format!("{}\n", req.to_string());
+        stream.write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("signal write: {e}"))?;
+
+        // Don't bother reading response — fire and forget
+        Ok(())
+    }
+
     /// Send a message to a recipient. Opens a fresh TCP connection, sends
     /// the JSON-RPC `send` command, reads the response, closes.
     pub async fn send(&self, recipient: &str, message: &str) -> Result<(), String> {
@@ -69,6 +130,51 @@ impl Signal {
         Ok(())
     }
 
+    /// Send a message, splitting into multiple messages if it's long.
+    /// Signal handles long messages but splitting gives better UX on mobile.
+    /// Splits on paragraph boundaries when possible, ~1800 chars per message.
+    pub async fn send_multi(&self, recipient: &str, message: &str) -> Result<(), String> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        const MAX_LEN: usize = 1800;
+        let chars: Vec<char> = message.chars().collect();
+
+        if chars.len() <= MAX_LEN {
+            return self.send(recipient, message).await;
+        }
+
+        // Split on paragraph boundaries (\n\n) near MAX_LEN
+        let mut chunks: Vec<String> = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let end = (start + MAX_LEN).min(chars.len());
+            if end == chars.len() {
+                chunks.push(chars[start..end].iter().collect());
+                break;
+            }
+            // Look for \n\n near the split point (search backwards)
+            let mut split_at = end;
+            for i in (start.max(end.saturating_sub(200))..end).rev() {
+                if i > 0 && chars[i - 1] == '\n' && chars[i] == '\n' {
+                    split_at = i + 1;
+                    break;
+                }
+            }
+            chunks.push(chars[start..split_at].iter().collect());
+            start = split_at;
+        }
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            self.send(recipient, chunk).await?;
+        }
+        Ok(())
+    }
+
     /// Convenience: send a notification with a title prefix.
     /// Sends to the default recipient (or all recipients if multiple are set).
     pub async fn notify(&self, title: &str, body: &str) -> Result<(), String> {
@@ -97,7 +203,7 @@ impl Signal {
     /// Returns when the connection is permanently lost (after retry backoff).
     pub async fn receive_loop(
         &self,
-        handler: Arc<dyn Fn(String, String) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64) + Send + Sync>,
     ) {
         if !self.config.enabled {
             return;
@@ -120,7 +226,7 @@ impl Signal {
     /// One receive cycle: connect, read notifications until disconnect.
     async fn receive_once(
         &self,
-        handler: Arc<dyn Fn(String, String) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64) + Send + Sync>,
     ) -> Result<(), String> {
         let stream = TcpStream::connect(&self.config.socket_addr)
             .await
@@ -184,13 +290,18 @@ impl Signal {
                 .unwrap_or("")
                 .to_string();
 
+            // Extract timestamp for read receipts
+            let timestamp = envelope.get("dataMessage")
+                .and_then(|d| d.get("timestamp"))
+                .or_else(|| envelope.get("timestamp"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+
             if message.is_empty() {
                 continue;
             }
 
             // Whitelist check: match against phone number, UUID, or name.
-            // This handles cases where Signal redacts the phone number and
-            // only provides a UUID (increasingly common for privacy).
             let matched = self.config.allowed_senders.iter().any(|allowed| {
                 allowed == source_number
                     || allowed == source_uuid
@@ -203,7 +314,6 @@ impl Signal {
                 continue;
             }
 
-            // Use whichever identifier matched as the source for replies
             let source = if !source_number.is_empty() {
                 source_number
             } else if !source_uuid.is_empty() {
@@ -211,7 +321,7 @@ impl Signal {
             } else {
                 source_name
             };
-            handler(source.to_string(), message);
+            handler(source.to_string(), message, timestamp);
         }
     }
 }
