@@ -71,7 +71,7 @@ struct AppState {
     status: String,
     model: String,
     prompt: String,
-    permission: Option<(Uuid, Uuid, String)>,
+    permission: Option<(Uuid, Uuid, String, std::time::Instant)>,
     running: bool,
     editor_pending: bool,
     /// Working directory for local tool execution
@@ -116,16 +116,21 @@ fn spawn_ws(
         rt.block_on(async {
             let sess = SessionOpen {
                 client_id,
-                cwd: std::fs::canonicalize(&cwd).unwrap().to_string_lossy().into(),
+                cwd: std::fs::canonicalize(&cwd)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&cwd))
+                    .to_string_lossy()
+                    .into(),
                 hostname: whoami::hostname(),
                 username: whoami::username(),
             };
             let (mut conn, _) = match client::connect(&server, &token, sess).await {
                 Ok(c) => c,
                 Err(e) => {
-                    state.lock().unwrap().entries.push(ChatEntry::System(
+                    let mut s = state.lock().unwrap();
+                    s.entries.push(ChatEntry::System(
                         format!("Connection failed: {e}"),
                     ));
+                    s.status = "connection failed".into();
                     return;
                 }
             };
@@ -222,7 +227,10 @@ fn spawn_ws(
                                 let _ = tx_session.send(ClientMessage::ListSessions);
                             }
                         }
-                        ServerMessage::ChatDelta { delta, done, .. } => {
+                        ServerMessage::ChatDelta { session_id, delta, done, .. } => {
+                            // Stale message for a session we switched away
+                            // from — ignore rather than corrupt the view.
+                            if session_id != s.session_id { continue; }
                             if done {
                                 // stream finished; nothing to do (stats come separately)
                             } else if let Some(ChatEntry::Assistant { content, .. }) =
@@ -236,12 +244,14 @@ fn spawn_ws(
                                 });
                             }
                         }
-                        ServerMessage::ChatError { error, .. } => {
+                        ServerMessage::ChatError { session_id, error, .. } => {
+                            if session_id != s.session_id { continue; }
                             s.working = false;
                             s.work_started = None;
                             s.entries.push(ChatEntry::System(format!("error: {error}")));
                         }
                         ServerMessage::ChatStats {
+                            session_id,
                             model,
                             prompt_tokens,
                             completion_tokens,
@@ -251,6 +261,7 @@ fn spawn_ws(
                             decode_tps,
                             ..
                         } => {
+                            if session_id != s.session_id { continue; }
                             let stats = format!(
                                 "{model} · prefill {:.0} tok/s · decode {:.1} tok/s · {} ctx · {}+{} · {:.1}s",
                                 prefill_tps,
@@ -270,20 +281,30 @@ fn spawn_ws(
                             s.working = false;
                             s.work_started = None;
                         }
-                        ServerMessage::ToolEvent { name, status, detail, .. } => {
+                        ServerMessage::ToolEvent { session_id, name, status, detail, .. } => {
+                            if session_id != s.session_id { continue; }
                             // A Started entry is updated in place when its
-                            // tool finishes — one line per tool call.
+                            // tool finishes — one line per tool call. Merge
+                            // iff the most recent entry for THIS tool is
+                            // still Started (an Assistant entry may have
+                            // been pushed in between).
                             let can_merge = status != ToolStatus::Started && matches!(
-                                s.entries.last(),
-                                Some(ChatEntry::Tool {
-                                    name: ref n,
-                                    status: ToolStatus::Started,
-                                    ..
-                                }) if *n == name
+                                s.entries.iter().rev().find(|e| matches!(
+                                    e,
+                                    ChatEntry::Tool { name: n, .. } if *n == name
+                                )),
+                                Some(ChatEntry::Tool { status: ToolStatus::Started, .. })
                             );
                             if can_merge {
                                 if let Some(ChatEntry::Tool { status: st, detail: d, .. }) =
-                                    s.entries.last_mut()
+                                    s.entries.iter_mut().rev().find(|e| matches!(
+                                        e,
+                                        ChatEntry::Tool {
+                                            name: n,
+                                            status: ToolStatus::Started,
+                                            ..
+                                        } if *n == name
+                                    ))
                                 {
                                     *st = status;
                                     if !detail.is_empty() {
@@ -308,7 +329,13 @@ fn spawn_ws(
                             s.entries.push(ChatEntry::System(format!("model → {model}")));
                         }
                         ServerMessage::PermissionRequired(r) => {
-                            s.permission = Some((r.request_id, r.session_id, r.path));
+                            if r.session_id != s.session_id { continue; }
+                            s.permission = Some((
+                                r.request_id,
+                                r.session_id,
+                                r.path,
+                                std::time::Instant::now(),
+                            ));
                             s.status = "permission? (y/N)".into();
                         }
                         ServerMessage::PermissionResult(_) => {
@@ -329,11 +356,16 @@ fn spawn_ws(
                             s.work_started = None;
                             s.entries.push(ChatEntry::System("(cancelled by user)".into()));
                         }
-                        ServerMessage::ChatReset { .. } => {
+                        ServerMessage::ChatReset { session_id, .. } => {
+                            if session_id != s.session_id { continue; }
                             // Server is regenerating a message that failed
-                            // mid-stream — drop the partial assistant entry.
-                            if matches!(s.entries.last(), Some(ChatEntry::Assistant { .. })) {
-                                s.entries.pop();
+                            // mid-stream — drop the partial assistant entry
+                            // and anything after it (e.g. interleaved tool
+                            // lines from the failed attempt).
+                            if let Some(pos) = s.entries.iter().rposition(
+                                |e| matches!(e, ChatEntry::Assistant { .. })
+                            ) {
+                                s.entries.truncate(pos);
                             }
                         }
                         ServerMessage::SessionList { sessions } => {
@@ -400,6 +432,9 @@ fn spawn_ws(
                             let title = meta.title.as_deref().unwrap_or("(untitled)");
                             s.entries.clear();
                             s.last_total = 0;
+                            s.last_lines.clear();
+                            s.selection = None;
+                            s.sel_anchor = None;
                             s.entries.push(ChatEntry::System(format!(
                                 "📋 session {target} · {title}"
                             )));
@@ -416,6 +451,19 @@ fn spawn_ws(
                             s.scroll = 0;
                         }
                         ServerMessage::Pong | ServerMessage::SessionClosed { .. } | ServerMessage::ToolResult { .. } | ServerMessage::ToolRequest { .. } => {}
+                    }
+                }
+
+                // Connection dropped (server died / socket closed) — clean
+                // up so the UI doesn't show a spinner forever.
+                {
+                    let mut s = s.lock().unwrap();
+                    s.working = false;
+                    s.work_started = None;
+                    s.permission = None;
+                    if s.running {
+                        s.entries.push(ChatEntry::System("disconnected from server".into()));
+                        s.status = "disconnected".into();
                     }
                 }
             });
@@ -462,7 +510,8 @@ fn norm_sel(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, us
     }
 }
 
-/// Extract selected text from visible lines.
+/// Extract selected text from visible lines. Selection columns are
+/// display columns — convert to char indices per line.
 fn extract_selection(lines: &[String], sel: ((usize, usize), (usize, usize))) -> String {
     let ((sl, sc), (el, ec)) = sel;
     if sl >= lines.len() {
@@ -472,8 +521,8 @@ fn extract_selection(lines: &[String], sel: ((usize, usize), (usize, usize))) ->
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate().take(el + 1).skip(sl) {
         let chars: Vec<char> = line.chars().collect();
-        let from = if i == sl { sc.min(chars.len()) } else { 0 };
-        let to = if i == el { ec.min(chars.len()) } else { chars.len() };
+        let from = if i == sl { display_col_to_char_idx(line, sc).min(chars.len()) } else { 0 };
+        let to = if i == el { display_col_to_char_idx(line, ec).min(chars.len()) } else { chars.len() };
         if to > from {
             out.push_str(&chars[from..to].iter().collect::<String>());
         }
@@ -497,19 +546,61 @@ fn osc52_copy(text: &str) {
 
 // ── Text wrapping & markdown-lite rendering ──
 
-/// Strip terminal-hostile characters from streamed content: tabs become
-/// spaces, C0/C1 control chars (except \n) are dropped. Raw control bytes
-/// desync iocraft's canvas model from the real terminal (row corruption).
+/// Strip terminal-hostile content from streamed text: ANSI escape
+/// sequences (tool output is often colorized — iocraft would strip them
+/// at draw but they'd corrupt our width math first), tabs become spaces,
+/// C0/C1 control chars (except \n) are dropped. Raw control bytes desync
+/// iocraft's canvas model from the real terminal (row corruption).
 fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '\t' => out.push_str("    "),
+            '\x1b' => match chars.peek() {
+                // CSI: ESC [ params... final-byte (0x40–0x7E)
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for c in chars.by_ref() {
+                        if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                            break;
+                        }
+                        prev = c;
+                    }
+                }
+                // Two-byte sequence: ESC x
+                _ => {
+                    chars.next();
+                }
+            },
             c if c.is_control() && c != '\n' => {}
             c => out.push(c),
         }
     }
     out
+}
+
+/// Map a terminal display column to a char index (wide chars occupy
+/// two columns, so column ≠ char index on lines containing them).
+fn display_col_to_char_idx(line: &str, col: usize) -> usize {
+    let mut w = 0usize;
+    for (i, ch) in line.chars().enumerate() {
+        if w >= col {
+            return i;
+        }
+        w += ch.width().unwrap_or(0);
+    }
+    line.chars().count()
 }
 
 /// Truncate to at most `max` display columns (wide chars count double).
@@ -746,17 +837,30 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             if s.permission.is_some() {
                 match k.code {
                     Char('y') | Char('Y') => {
-                        let (rid, sid, _) = s.permission.take().unwrap();
+                        let (rid, sid, _, _) = s.permission.take().unwrap();
                         cmd_h.send(ClientMessage::PermissionReply {
                             request_id: rid, session_id: sid, granted: true,
                         }).ok();
                         s.status = "ready".into();
                     }
                     Enter | Char('n') | Char('N') | Esc => {
-                        let (rid, sid, _) = s.permission.take().unwrap();
+                        let (rid, sid, _, _) = s.permission.take().unwrap();
                         cmd_h.send(ClientMessage::PermissionReply {
                             request_id: rid, session_id: sid, granted: false,
                         }).ok();
+                        s.status = "ready".into();
+                    }
+                    Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Deny + cancel the whole loop
+                        let (rid, sid, _, _) = s.permission.take().unwrap();
+                        cmd_h.send(ClientMessage::PermissionReply {
+                            request_id: rid, session_id: sid, granted: false,
+                        }).ok();
+                        cmd_h.send(ClientMessage::CancelChat {
+                            session_id: sid,
+                        }).ok();
+                        s.working = false;
+                        s.work_started = None;
                         s.status = "ready".into();
                     }
                     _ => {}
@@ -766,13 +870,13 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
             match k.code {
                 Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Cancel in-progress agent loop
+                    // Cancel in-progress agent loop (server replies with
+                    // ChatCancelled, which adds the scrollback entry)
                     cmd_h.send(ClientMessage::CancelChat {
                         session_id: s.session_id,
                     }).ok();
                     s.working = false;
                     s.work_started = None;
-                    s.entries.push(ChatEntry::System("(cancelled)".into()));
                 }
                 Char('g') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.editor_pending = true;
@@ -781,6 +885,9 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     s.entries.clear();
                     s.scroll = 0;
                     s.last_total = 0;
+                    s.last_lines.clear();
+                    s.selection = None;
+                    s.sel_anchor = None;
                 }
                 Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.scroll = s.scroll.saturating_add(10);
@@ -831,6 +938,14 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         ":q" | ":quit" => { s.running = false; }
                         "/models" => { cmd_h.send(ClientMessage::ListModels).ok(); return; }
                         "/quit" | "/exit" => { s.running = false; }
+                        "/stop" => {
+                            cmd_h.send(ClientMessage::CancelChat {
+                                session_id: s.session_id,
+                            }).ok();
+                            s.working = false;
+                            s.work_started = None;
+                            return;
+                        }
                         "/sessions" => {
                             cmd_h.send(ClientMessage::ListSessions).ok();
                             return;
@@ -841,7 +956,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/sessions · /session N · /new [target] [dir] · /clear <account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] [dir] · /stop · /clear <account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
@@ -918,7 +1033,13 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         session_id: s.session_id, content,
                     }).ok();
                 }
-                Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => s.prompt.push(c),
+                Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Drop pasted control characters (they'd desync the
+                    // prompt line or send pasted lines as separate messages)
+                    if !c.is_control() {
+                        s.prompt.push(c);
+                    }
+                }
                 Backspace => { s.prompt.pop(); }
                 Esc => { s.prompt.clear(); }
                 _ => {}
@@ -931,6 +1052,24 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // ── Render ──
     let tick_val = tick.get();
     let mut s = state.lock().unwrap();
+
+    // Permission prompts time out server-side after 300s — mirror that
+    // locally so the keyboard doesn't wedge if PermissionResult never
+    // arrives (server restart, dropped connection mid-prompt).
+    if let Some((rid, sid, _, at)) = &s.permission {
+        if at.elapsed() > Duration::from_secs(300) {
+            let (rid, sid) = (*rid, *sid);
+            s.permission = None;
+            s.status = "ready".into();
+            s.entries.push(ChatEntry::System("permission timed out — denied".into()));
+            cmd_tx.send(ClientMessage::PermissionReply {
+                request_id: rid,
+                session_id: sid,
+                granted: false,
+            }).ok();
+        }
+    }
+
     let w = width.max(20) as usize;
     let h = height.max(5) as usize;
 
@@ -1019,10 +1158,12 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let total = lines.len();
     let max_scroll = total.saturating_sub(view_h);
     // While scrolled up reading, pin the view to the same content: lines
-    // arriving below bump the offset instead of sliding the window.
+    // arriving below bump the offset, lines vanishing (ChatReset) shrink it.
     let mut scroll = s.scroll.min(max_scroll);
     if scroll > 0 && total > s.last_total {
         scroll = (scroll + (total - s.last_total)).min(max_scroll);
+    } else if scroll > 0 && total < s.last_total {
+        scroll = scroll.saturating_sub(s.last_total - total).min(max_scroll);
     }
     s.scroll = scroll;
     s.last_total = total;
@@ -1126,13 +1267,13 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     }
 
     // Prompt box — bordered, subtle background, like opencode
-    let prompt_text = if let Some((_, _, ref path)) = s_permission {
-        format!("Allow {path}? (y/N)")
+    let prompt_text = if let Some((_, _, ref path, _)) = s_permission {
+        format!("Allow {}? (y/N)", sanitize(path))
     } else {
         if s_prompt.is_empty() {
             "│ ".into()
         } else {
-            format!("│ {}", s_prompt)
+            format!("│ {}", sanitize(&s_prompt))
         }
     };
     children.push(element! {
@@ -1149,8 +1290,10 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
     element! {
         View(
-            width,
-            height,
+            // Clamped like the wrap math — a 0/1-wide terminal otherwise
+            // underflows iocraft's border-width arithmetic and panics.
+            width: width.max(20),
+            height: height.max(5),
             flex_direction: FlexDirection::Column,
         ) {
             #(children.into_iter())
