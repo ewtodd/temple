@@ -469,4 +469,49 @@ impl LiteLLM {
         }
         Ok(out)
     }
+
+    /// Quick complexity classification. Sends a tiny prompt (~200 tokens in,
+    /// ~10 tokens out) to determine Simple/Medium/Complex/Critical.
+    /// Expects the model to respond with a single word.
+    pub async fn classify_query(
+        &self,
+        model: &str,
+        query: &str,
+    ) -> Option<temple_protocol::ComplexityClass> {
+        use temple_protocol::ComplexityClass;
+
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage::system(
+                    "Classify this user query into exactly one word: simple, medium, complex, or critical.\n\
+                     simple = greeting, thanks, short factual question\n\
+                     medium = explanation, chat, opinion, general discussion\n\
+                     complex = coding, debugging, multi-step task, file operations\n\
+                     critical = system design, architecture, novel problems\n\
+                     Respond with ONLY the word, nothing else."
+                ),
+                ChatMessage::user(query),
+            ],
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(10),
+            temperature: Some(0.0),
+        };
+
+        let resp = self.chat(req).await.ok()?;
+        let choice = resp.choices.first()?;
+        let content = choice.message.content.as_deref()?.trim().to_lowercase();
+
+        if content.starts_with("simple") {
+            Some(ComplexityClass::Simple)
+        } else if content.starts_with("complex") {
+            Some(ComplexityClass::Complex)
+        } else if content.starts_with("critical") {
+            Some(ComplexityClass::Critical)
+        } else {
+            Some(ComplexityClass::Medium)
+        }
+    }
 }

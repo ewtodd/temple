@@ -91,9 +91,9 @@ impl Default for NextcloudConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// Whether to use small local model as router
+    /// Whether to use small local model as router (deprecated — use router_model)
     pub use_local_router: bool,
-    /// Path to small GGUF for router (optional)
+    /// Path to small GGUF for router (deprecated — use router_model)
     pub local_router_model: Option<String>,
     /// Default model for fallback / Medium complexity
     pub default_model: String,
@@ -109,6 +109,13 @@ pub struct ModelConfig {
     pub critical_model: String,
     /// Model for research/lookups (gemma on anton — good at general knowledge)
     pub researcher_model: String,
+    /// Model for complexity classification — a small fast model co-resident
+    /// with the default/executor model on the same GPU host. Defaults to
+    /// researcher_model if unset. Point this at a 4B-class model (e.g.
+    /// gemma-4-E4B) loaded alongside deepseek on son-of-anton for ~50ms
+    /// classification latency.
+    #[serde(default)]
+    pub router_model: Option<String>,
     /// Model definitions
     pub models: Vec<ModelDef>,
 }
@@ -125,6 +132,7 @@ impl Default for ModelConfig {
             reviewer_model: "deepseek-v4-flash-high".into(),
             critical_model: "deepseek-v4-flash-high".into(),
             researcher_model: "gemma-4-31b".into(),
+            router_model: None,
             models: Vec::new(),
         }
     }

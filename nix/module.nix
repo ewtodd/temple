@@ -42,6 +42,7 @@ let
       reviewer_model = cfg.reviewerModel;
       critical_model = cfg.criticalModel;
       researcher_model = cfg.researcherModel;
+      router_model = cfg.routerModel;
     };
     ssh_targets = map (t: {
       name = t.name;
@@ -120,6 +121,19 @@ in
       type = types.str;
       default = "gemma-4-31b";
       description = "Model for research/lookup queries (Signal quick questions).";
+    };
+
+    routerModel = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "gemma-4-e4b-it";
+      description = ''
+        Model used for complexity classification during query routing.
+        Should be a small fast model (4B-class) co-resident with the
+        default/executor model on the same GPU host. Defaults to
+        researcherModel if unset. Point this at a 4B model loaded
+        alongside deepseek on son-of-anton for ~50ms classification.
+      '';
     };
 
     sshTargets = mkOption {

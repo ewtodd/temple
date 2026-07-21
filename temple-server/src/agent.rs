@@ -749,26 +749,39 @@ impl Agent {
             )
         };
 
-        // ── Per-model priority queue ──
-        // Route first (heuristics only, no LLM) so the queue lane is the
-        // target model: requests to different backends run in parallel,
-        // same-model requests serialize by priority (lower number first:
-        // 0 ethan, 1 valarie, -1 default). The permit is held until this
-        // fn returns.
-        let route = if content.starts_with('/') || content.starts_with(':') {
-            Route::Direct { model: session_model }
-        } else if content.to_lowercase().contains("pipeline") {
-            // Explicit ask: "use the pipeline" forces planner→executor→reviewer
-            tracing::info!("Router: explicit pipeline request");
-            Route::Pipeline {
-                planner: self.models.planner_model.clone(),
-                executor: self.models.executor_model.clone(),
-                reviewer: self.models.reviewer_model.clone(),
-            }
+        // ── Classify: heuristic first, refine ambiguous (Medium) with a
+        // quick model call before queue acquisition. The improved heuristic
+        // is already confident about Simple and Complex; only truly
+        // ambiguous queries fall through to Medium and get refined.
+        // Classification costs ~500ms for a ~10-token response — acceptable
+        // for the correctness gain.
+        let is_command = content.starts_with('/') || content.starts_with(':');
+        let complexity = if is_command || session_kind == SessionKind::Headless {
+            None // commands skip router; headless always uses default model
         } else {
-            let complexity = Router::classify(content);
-            tracing::info!("Router: {complexity:?} (kind={session_kind:?})");
-            Router::route(complexity, &self.models, session_kind)
+            let heuristic = Router::classify(content);
+            if heuristic == ComplexityClass::Medium {
+                // Ambiguous — ask the classifier model via litellm.
+                // Uses router_model if configured (small 4B model co-resident
+                // with deepseek on son-of-anton for ~50ms latency), falls back
+                // to researcher_model (gemma-4-31b on anton, ~500ms).
+                let classifier = self.models.router_model.as_deref()
+                    .unwrap_or(&self.models.researcher_model);
+                tracing::info!("Router heuristic: Medium — refining via {classifier}");
+                let refined = self.litellm.classify_query(classifier, content)
+                    .await
+                    .unwrap_or(ComplexityClass::Medium);
+                tracing::info!("Router refined: {refined:?}");
+                Some(refined)
+            } else {
+                tracing::info!("Router heuristic: {heuristic:?}");
+                Some(heuristic)
+            }
+        };
+        let route = match complexity {
+            Some(c) => Router::route(c, &self.models, session_kind),
+            None if is_command => Route::Direct { model: session_model },
+            None => Route::Direct { model: self.models.default_model.clone() },
         };
         let lane = match &route {
             Route::Direct { model } => model.clone(),
