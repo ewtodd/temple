@@ -25,6 +25,9 @@ struct Cli {
     /// Auth token (or set TEMPLE_TOKEN env var)
     #[arg(short = 't', long, env = "TEMPLE_TOKEN")]
     token: Option<String>,
+    /// Resume the most recent persisted session on connect
+    #[arg(long)]
+    r#continue: bool,
     /// Use TLS (wss://) — set automatically if server starts with https://
     #[arg(long)]
     tls: bool,
@@ -92,6 +95,7 @@ struct AppState {
 fn spawn_ws(
     server: String, cwd: String, client_id: String,
     token: Option<String>,
+    do_continue: bool,
     state: Arc<Mutex<AppState>>,
     ui_cmd: mpsc::Receiver<ClientMessage>,
 ) {
@@ -115,6 +119,7 @@ fn spawn_ws(
             };
             let tx = conn.write;
             let tx_ping = tx.clone();
+            let tx_session = tx.clone();
 
             // Reader: server → shared state
             let s = state.clone();
@@ -128,6 +133,10 @@ fn spawn_ws(
                                 "session on {}", info.hostname
                             )));
                             s.status = format!("renco · {}", info.hostname);
+                            // Auto-resume the most recent session if --continue
+                            if do_continue {
+                                let _ = tx_session.send(ClientMessage::ListSessions);
+                            }
                         }
                         ServerMessage::ChatDelta { delta, done, .. } => {
                             if done {
@@ -213,21 +222,34 @@ fn spawn_ws(
                                     "no sessions — /new [target] to start one".into(),
                                 ));
                             } else {
-                                s.entries.push(ChatEntry::System(format!(
-                                    "sessions ({}):", sessions.len()
-                                )));
-                                for (i, m) in sessions.iter().enumerate() {
-                                    let id8: String = m.id.simple().to_string()
-                                        .chars().take(8).collect();
-                                    let target = m.ssh_target.as_deref().unwrap_or("quick");
-                                    let title = m.title.as_deref().unwrap_or("(untitled)");
+                                // Auto-resume the most recent if --continue
+                                if do_continue {
+                                    let first = sessions[0].id;
+                                    let target = sessions[0].ssh_target.as_deref().unwrap_or("quick");
+                                    let title = sessions[0].title.as_deref().unwrap_or("(untitled)");
                                     s.entries.push(ChatEntry::System(format!(
-                                        "  [{i}] {id8} · {target} · {title}"
+                                        "resuming most recent: {target} · {title}"
                                     )));
+                                    let _ = tx_session.send(ClientMessage::ResumeSession {
+                                        session_id: first,
+                                    });
+                                } else {
+                                    s.entries.push(ChatEntry::System(format!(
+                                        "sessions ({}):", sessions.len()
+                                    )));
+                                    for (i, m) in sessions.iter().enumerate() {
+                                        let id8: String = m.id.simple().to_string()
+                                            .chars().take(8).collect();
+                                        let target = m.ssh_target.as_deref().unwrap_or("quick");
+                                        let title = m.title.as_deref().unwrap_or("(untitled)");
+                                        s.entries.push(ChatEntry::System(format!(
+                                            "  [{i}] {id8} · {target} · {title}"
+                                        )));
+                                    }
+                                    s.entries.push(ChatEntry::System(
+                                        "  resume: /session <n>".into(),
+                                    ));
                                 }
-                                s.entries.push(ChatEntry::System(
-                                    "  resume: /session <n>".into(),
-                                ));
                             }
                             s.last_sessions = sessions;
                         }
@@ -951,7 +973,7 @@ fn main() {
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();
-    spawn_ws(cli.server, cwd_str, client_id, cli.token, state.clone(), cmd_rx);
+    spawn_ws(cli.server, cwd_str, client_id, cli.token, cli.r#continue, state.clone(), cmd_rx);
 
     smol::block_on(async {
         loop {
