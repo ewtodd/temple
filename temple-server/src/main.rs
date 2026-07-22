@@ -190,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pending_perms: Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let perms_for_handler = pending_perms.clone();
-            let handler = Arc::new(move |sender: String, mut message: String, timestamp: u64, group_id: Option<String>, attachment_paths: Vec<String>| {
+            let handler = Arc::new(move |sender: String, mut message: String, timestamp: u64, group_id: Option<String>, attachment_paths: Vec<(String, String)>| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
@@ -253,22 +253,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // ── Image attachments: describe with vision model, prepend to text ──
+                    // Attachments live on the signal-cli host (mu, 10.0.0.2), not on
+                    // oracle. Read them via SSH, then send to the vision model via litellm.
                     if !attachment_paths.is_empty() {
                         let vision_model = agent.models.router_model.as_deref()
                             .unwrap_or(&agent.models.researcher_model);
+                        let signal_host = signal.host().to_string();
                         let mut descriptions = Vec::new();
-                        for path in &attachment_paths {
-                            match describe_image(&agent.litellm, vision_model, path).await {
+                        for (path, content_type) in &attachment_paths {
+                            // Read the file from the signal host via SSH
+                            let data = match read_remote_file(&signal_host, path).await {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    tracing::warn!("ssh read {signal_host}:{path}: {e}");
+                                    continue;
+                                }
+                            };
+                            let ext = if content_type.contains("png") { "png" } else { "jpg" };
+                            let b64 = base64_encode(&data);
+                            let image_url = format!("data:image/{ext};base64,{b64}");
+                            match litellm_describe_image(&agent.litellm, vision_model, &image_url).await {
                                 Ok(desc) => descriptions.push(desc),
-                                Err(e) => tracing::warn!("image description failed for {path}: {e}"),
+                                Err(e) => tracing::warn!("image description failed: {e}"),
                             }
                         }
                         if !descriptions.is_empty() {
                             let prefix = descriptions.join("\n");
                             if message.is_empty() {
-                                message = format!("[The user sent an image. Here is a description:\n{prefix}]\n\n(respond to what's in the image)");
+                                message = format!("[Image description:\n{prefix}]\n\n(respond to what's in the image)");
                             } else {
-                                message = format!("[The user sent an image. Here is a description:\n{prefix}]\n\nThe user also said: {message}");
+                                message = format!("[Image description:\n{prefix}]\n\nUser also said: {message}");
                             }
                         }
                     }
@@ -887,27 +901,16 @@ async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::M
     }
 }
 
-/// Describe an image using a vision-capable model via litellm.
-/// Reads the file, base64-encodes it, sends a brief description prompt,
-/// and returns the model's text response.
-async fn describe_image(
+/// Describe an image via a vision-capable model. Takes a pre-encoded
+/// data:image/...;base64,... URL and returns the model's text response.
+async fn litellm_describe_image(
     litellm: &crate::litellm::LiteLLM,
     model: &str,
-    path: &str,
+    image_url: &str,
 ) -> Result<String, String> {
-    let data = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("read {path}: {e}"))?;
-    let mime = if path.ends_with(".png") { "image/png" } else { "image/jpeg" };
-    let b64 = base64_encode(&data);
-    let image_url = format!("data:{mime};base64,{b64}");
-
-    // Build a vision request using OpenAI's content-parts format.
-    // litellm passes this through to llama-server which handles it
-    // when --mmproj is loaded.
     let content = serde_json::json!([
         {"type": "image_url", "image_url": {"url": image_url}},
-        {"type": "text", "text": "Describe this image in detail. Focus on what's visible: text, UI elements, code, diagrams, people, objects, etc. Be concise but thorough."},
+        {"type": "text", "text": "Describe this image in detail. Focus on visible text, UI elements, code, diagrams, people, objects. Be concise but thorough."},
     ]);
 
     let req = crate::litellm::ChatRequest {
@@ -931,6 +934,33 @@ async fn describe_image(
     resp.choices.first()
         .and_then(|c| c.message.content.clone())
         .ok_or_else(|| "no response from vision model".into())
+}
+
+/// Read a file from a remote host via SSH. Uses the system SSH config
+/// (keys, known_hosts). Files are read as raw bytes — no shell escaping
+/// needed since we cat a known path.
+async fn read_remote_file(host: &str, path: &str) -> Result<Vec<u8>, String> {
+    let output = tokio::process::Command::new("ssh")
+        .args([
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            host,
+            &format!("cat -- {}", shell_escape_single(path)),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("ssh spawn: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        return Err(format!("ssh {host} exit {code}: {stderr}"));
+    }
+    Ok(output.stdout)
+}
+
+fn shell_escape_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 fn base64_encode(data: &[u8]) -> String {

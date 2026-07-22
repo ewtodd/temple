@@ -29,6 +29,13 @@ impl Signal {
         self.config.enabled
     }
 
+    /// Return the host portion of the configured socket address.
+    pub fn host(&self) -> &str {
+        self.config.socket_addr
+            .split(':').next()
+            .unwrap_or("127.0.0.1")
+    }
+
     /// One JSON-RPC call over a fresh TCP connection: write the request
     /// line, read the response line, surface any error field.
     async fn rpc_call(&self, method: &str, params: Value) -> Result<(), String> {
@@ -197,7 +204,7 @@ impl Signal {
     /// Returns when the connection is permanently lost (after retry backoff).
     pub async fn receive_loop(
         &self,
-        handler: Arc<dyn Fn(String, String, u64, Option<String>, Vec<String>) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64, Option<String>, Vec<(String, String)>) + Send + Sync>,
     ) {
         if !self.config.enabled {
             return;
@@ -220,7 +227,7 @@ impl Signal {
     /// One receive cycle: connect, read notifications until disconnect.
     async fn receive_once(
         &self,
-        handler: Arc<dyn Fn(String, String, u64, Option<String>, Vec<String>) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64, Option<String>, Vec<(String, String)>) + Send + Sync>,
     ) -> Result<(), String> {
         let stream = TcpStream::connect(&self.config.socket_addr)
             .await
@@ -299,10 +306,13 @@ impl Signal {
                 .unwrap_or(0);
 
             // Extract image attachments — signal-cli daemon downloads them to
-            // /var/lib/signal-cli/data/attachments/<id>.<ext> automatically.
-            // The JSON notification uses "storedFilename" (or sometimes just
-            // "id" + known directory). Try both.
-            let attachment_paths: Vec<String> = envelope.get("dataMessage")
+            // /var/lib/signal-cli/data/attachments/<id> on the signal host.
+            // The JSON notification only includes metadata (id, contentType,
+            // size, width, height), NOT the local path. We construct the path
+            // from the known attachment directory.
+            // NB: attachments live on the signal host (mu), NOT on oracle.
+            // Reading them requires SSH — handled by describe_image in main.rs.
+            let attachment_ids: Vec<(String, String)> = envelope.get("dataMessage")
                 .and_then(|d| d.get("attachments"))
                 .and_then(|a| a.as_array())
                 .map(|arr| {
@@ -310,40 +320,32 @@ impl Signal {
                         .filter_map(|att| {
                             let content_type = att.get("contentType")
                                 .and_then(|c| c.as_str())
-                                .unwrap_or("");
+                                .unwrap_or("")
+                                .to_string();
                             if !content_type.starts_with("image/") {
                                 return None;
                             }
-                            // Primary: daemon includes the stored path
-                            if let Some(p) = att.get("storedFilename")
-                                .and_then(|s| s.as_str())
-                                .filter(|s| !s.is_empty())
-                            {
-                                return Some(p.to_string());
-                            }
-                            // Fallback: construct path from attachment id
-                            // e.g.  g7h-BJg65iNqLPDZrJwr.png  →
-                            //       /var/lib/signal-cli/data/attachments/g7h-BJg65iNqLPDZrJwr.png
-                            let id = att.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            let id = att.get("id")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if id.is_empty() {
                                 return None;
                             }
-                            let ext = content_type.strip_prefix("image/").unwrap_or("jpg");
-                            let ext = if ext == "jpeg" { "jpg" } else { ext };
-                            let dir = att.get("storedDir")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("/var/lib/signal-cli/data/attachments");
-                            Some(format!("{dir}/{id}.{ext}"))
+                            let path = format!(
+                                "/var/lib/signal-cli/data/attachments/{id}"
+                            );
+                            Some((path, content_type))
                         })
                         .collect()
                 })
                 .unwrap_or_default();
 
-            if !attachment_paths.is_empty() {
+            if !attachment_ids.is_empty() {
                 tracing::info!(
                     "signal: got {} attachment(s): {:?}",
-                    attachment_paths.len(),
-                    attachment_paths,
+                    attachment_ids.len(),
+                    attachment_ids,
                 );
                 // Dump raw attachment JSON to find correct field names
                 if let Some(atts) = envelope.get("dataMessage")
@@ -353,7 +355,7 @@ impl Signal {
                 }
             }
 
-            if message.is_empty() && attachment_paths.is_empty() {
+            if message.is_empty() && attachment_ids.is_empty() {
                 continue;
             }
 
@@ -377,7 +379,7 @@ impl Signal {
             } else {
                 source_name
             };
-            handler(source.to_string(), message, timestamp, group_id, attachment_paths);
+            handler(source.to_string(), message, timestamp, group_id, attachment_ids);
         }
     }
 }
