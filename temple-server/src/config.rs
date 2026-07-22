@@ -51,7 +51,8 @@ pub struct SignalConfig {
     /// signal-cli daemon TCP socket, e.g. "127.0.0.1:7583"
     pub socket_addr: String,
     /// Phone numbers allowed to send inbound commands (E.164 format, + prefix).
-    /// If empty, all senders are rejected.
+    /// Optional ADDITIONAL restriction — when empty, senders are gated by
+    /// the token-auth flow (signal_users table + /verify) instead.
     pub allowed_senders: Vec<String>,
     /// Default recipient for outbound notifications (user's phone number).
     pub default_recipient: String,

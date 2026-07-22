@@ -459,27 +459,23 @@ impl Signal {
                 continue;
             }
 
-            // Whitelist check: match against phone number or UUID only.
-            // Profile names are self-asserted — any Signal user can set
-            // their name to "ethan", so name matching is not a security
-            // boundary. An empty whitelist FAILS CLOSED (ignores everyone)
-            // — a misconfigured bot must not accept commands from the
-            // entire network.
-            if self.config.allowed_senders.is_empty() {
-                tracing::warn!(
-                    "signal: allowed_senders is empty — ignoring ALL inbound messages (fail closed)"
-                );
-                continue;
-            }
-            let matched = self.config.allowed_senders.iter().any(|allowed| {
-                (!source_number.is_empty() && allowed == source_number)
-                    || (!source_uuid.is_empty() && allowed == source_uuid)
-            });
-            if !matched {
-                tracing::warn!(
-                    "signal: ignoring message from non-whitelisted sender: number={source_number} uuid={source_uuid} name={source_name}"
-                );
-                continue;
+            // Whitelist check: match against phone number or UUID only —
+            // profile names are self-asserted and prove nothing. When the
+            // whitelist is EMPTY, messages pass through to the handler,
+            // which applies the token-auth gate (find_signal_user +
+            // /verify). The whitelist is an optional ADDITIONAL
+            // restriction, not the primary auth mechanism.
+            if !self.config.allowed_senders.is_empty() {
+                let matched = self.config.allowed_senders.iter().any(|allowed| {
+                    (!source_number.is_empty() && allowed == source_number)
+                        || (!source_uuid.is_empty() && allowed == source_uuid)
+                });
+                if !matched {
+                    tracing::warn!(
+                        "signal: ignoring message from non-whitelisted sender: number={source_number} uuid={source_uuid} name={source_name}"
+                    );
+                    continue;
+                }
             }
 
             let source = if !source_number.is_empty() {
