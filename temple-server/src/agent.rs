@@ -1427,7 +1427,7 @@ impl Agent {
     }
 
     /// Build system prompt with personality, user memories, code rules, and CWD detection.
-    async fn build_system_prompt(&self, username: &str, _cwd: &str, kind: SessionKind, project_context: &str) -> String {
+    async fn build_system_prompt(&self, username: &str, cwd: &str, kind: SessionKind, project_context: &str) -> String {
         let personality = self.memory.get_personality().await.unwrap_or_default();
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
@@ -1479,7 +1479,12 @@ impl Agent {
 
 You are renco, an agentic coding assistant running on temple harness.
 You are talking to {username} right now.
-Current date: {now}{user_section}{skills_section}
+Current date: {now}
+Working directory: {cwd}
+
+When working with files, use paths relative to the working directory.
+Do not prepend /var/lib/temple or any other base path — that is an
+implementation detail of the server, not the user's filesystem.{user_section}{skills_section}
 
 ## Available tools
 You have filesystem access, shell commands, persistent memory, web
@@ -1507,7 +1512,8 @@ preferences, ongoing projects, or anything worth recalling in future sessions.
                 format!(
                     "{personality}
 You are renco, running a scheduled maintenance task on temple harness.
-Current date: {now}. Filesystem access and shell commands are available.
+Current date: {now}. Working directory: {cwd}
+Filesystem access and shell commands are available.
 
 Git conventions:
 - In the temple repo renco-bot is the SOLE author of all commits —
