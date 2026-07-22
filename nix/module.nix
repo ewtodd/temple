@@ -180,7 +180,13 @@ in
       type = types.nullOr types.str;
       default = null;
       example = "deploy@10.0.0.2:2222";
-      description = "Bastion host for ProxyJump SSH connections (user@host:port).";
+      description = ''
+        Bastion host for SSH connections, as user@host:port (user and port
+        optional — default "deploy" and 2222). A `bastion` Host alias is
+        generated from this spec; targets reference it via ProxyJump or in
+        their proxyCommand. A bare alias name is NOT valid here — it would
+        become the HostName and fail to resolve.
+      '';
     };
 
     sshKeyPath = mkOption {
