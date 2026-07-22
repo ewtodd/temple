@@ -259,12 +259,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !attachment_paths.is_empty() {
                         let vision_model = agent.models.router_model.as_deref()
                             .unwrap_or(&agent.models.researcher_model);
+                        tracing::info!(
+                            "signal: describing {} image(s) via vision model {vision_model}",
+                            attachment_paths.len(),
+                        );
                         let mut descriptions = Vec::new();
                         for (id, content_type) in &attachment_paths {
                             let bytes = match signal.get_attachment(id).await {
-                                Ok(b) => b,
+                                Ok(b) => {
+                                    tracing::info!("signal: getAttachment {id} → {} bytes", b.len());
+                                    b
+                                }
                                 Err(e) => {
-                                    tracing::warn!("getAttachment {id}: {e}");
+                                    tracing::warn!("signal: getAttachment {id}: {e}");
                                     continue;
                                 }
                             };
@@ -272,8 +279,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let b64 = base64_encode(&bytes);
                             let image_url = format!("data:image/{ext};base64,{b64}");
                             match litellm_describe_image(&agent.litellm, vision_model, &image_url).await {
-                                Ok(desc) => descriptions.push(desc),
-                                Err(e) => tracing::warn!("image description failed: {e}"),
+                                Ok(desc) => {
+                                    if desc.trim().is_empty() {
+                                        tracing::warn!(
+                                            "signal: vision model {vision_model} returned empty description for {id}"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "signal: vision description for {id} ({} chars): {:.80}",
+                                            desc.len(),
+                                            desc,
+                                        );
+                                        descriptions.push(desc);
+                                    }
+                                }
+                                Err(e) => tracing::warn!("signal: image description failed: {e}"),
                             }
                         }
                         if !descriptions.is_empty() {
