@@ -1060,15 +1060,23 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/sessions · /session N · /new [target] [dir] · /delete N · /stop · /clear <user|account> · /models · /model X · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] [dir] · /delete N · /stop · /clear <user|account> · /models · /model X · /model auto · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
                         _ => {
                             if let Some(m) = content.strip_prefix("/model ") {
-                                cmd_h.send(ClientMessage::SetModel {
-                                    session_id: s.session_id, model: m.trim().into(),
-                                }).ok();
+                                let model = m.trim();
+                                if model == "auto" {
+                                    cmd_h.send(ClientMessage::SetModel {
+                                        session_id: s.session_id,
+                                        model: "auto".into(),
+                                    }).ok();
+                                } else {
+                                    cmd_h.send(ClientMessage::SetModel {
+                                        session_id: s.session_id, model: model.into(),
+                                    }).ok();
+                                }
                                 return;
                             }
                             if let Some(arg) = content.strip_prefix("/session ") {

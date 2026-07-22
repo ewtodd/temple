@@ -147,6 +147,9 @@ struct SessionCtx {
     permission_mode: PermissionMode,
     /// Cached project context string (detected from CWD on first message)
     project_context: Option<String>,
+    /// True when the user explicitly picked a model via /model — routing
+    /// is bypassed and this model is used directly.  /model auto clears it.
+    model_override: bool,
 }
 
 pub struct Agent {
@@ -335,6 +338,7 @@ impl Agent {
                 persist: true,
                 permission_mode: PermissionMode::Default,
                 project_context: None,
+                model_override: false,
             },
         );
     }
@@ -423,6 +427,7 @@ impl Agent {
                 persist: true,
                 permission_mode: PermissionMode::Default,
                 project_context: None,
+                model_override: false,
             },
         );
         drop(sessions);
@@ -493,6 +498,7 @@ impl Agent {
                 persist: true,
                 permission_mode: PermissionMode::Default,
                 project_context: None,
+                model_override: false,
             },
         );
 
@@ -600,9 +606,12 @@ impl Agent {
         };
 
         let excerpt: String = first_user_msg.chars().take(500).collect();
-        // Use litellm proxy (fast), not the local oracle model (slow, unreliable)
+        // Use the router model (fast 4B co-resident with deepseek on
+        // son-of-anton), falling back to researcher if unconfigured.
+        let title_model = self.models.router_model.as_deref()
+            .unwrap_or(&self.models.researcher_model);
         let req = ChatRequest {
-            model: self.models.researcher_model.clone(), // gemma-4-31b on anton
+            model: title_model.to_string(),
             messages: vec![
                 ChatMessage::system(
                     "Summarize the user's request as a short title (2-6 words). \
@@ -676,6 +685,15 @@ impl Agent {
     pub async fn set_session_model(&self, session_id: Uuid, model: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
             s.model = model.to_string();
+            s.model_override = true;
+        }
+    }
+
+    /// Reset the session model to default, re-enabling router classification.
+    pub async fn reset_session_model(&self, session_id: Uuid) {
+        if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
+            s.model = self.models.default_model.clone();
+            s.model_override = false;
         }
     }
 
@@ -735,7 +753,7 @@ impl Agent {
         }
 
         // Get session info
-        let (username, cwd, _is_initialized, session_model, session_kind, ssh_executor) = {
+        let (username, cwd, _is_initialized, session_model, session_kind, ssh_executor, model_override) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
@@ -746,6 +764,7 @@ impl Agent {
             (
                 s.username.clone(), s.cwd.clone(), s.initialized,
                 s.model.clone(), s.kind, s.ssh.clone(),
+                s.model_override,
             )
         };
 
@@ -756,8 +775,8 @@ impl Agent {
         // Classification costs ~500ms for a ~10-token response — acceptable
         // for the correctness gain.
         let is_command = content.starts_with('/') || content.starts_with(':');
-        let complexity = if is_command || session_kind == SessionKind::Headless {
-            None // commands skip router; headless always uses default model
+        let complexity = if is_command || session_kind == SessionKind::Headless || model_override {
+            None // commands + headless skip routing; /model override uses session model directly
         } else {
             let heuristic = Router::classify(content);
             if heuristic == ComplexityClass::Medium {

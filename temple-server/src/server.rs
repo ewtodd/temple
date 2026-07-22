@@ -434,8 +434,14 @@ async fn handle_connection(
             }
 
             ClientMessage::SetModel { session_id: sid, model } => {
-                agent.set_session_model(sid, &model).await;
-                let _ = tx.send(ServerMessage::ModelChanged { session_id: sid, model });
+                if model == "auto" {
+                    agent.reset_session_model(sid).await;
+                    let default = agent.session_model(sid).await;
+                    let _ = tx.send(ServerMessage::ModelChanged { session_id: sid, model: default });
+                } else {
+                    agent.set_session_model(sid, &model).await;
+                    let _ = tx.send(ServerMessage::ModelChanged { session_id: sid, model });
+                }
             }
 
             ClientMessage::SetPermissionMode { session_id: sid, mode } => {
