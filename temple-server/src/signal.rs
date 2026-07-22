@@ -298,8 +298,10 @@ impl Signal {
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0);
 
-            // Extract image attachments — signal-cli downloads them to a temp
-            // directory and stores the path in storedFilename.
+            // Extract image attachments — signal-cli daemon downloads them to
+            // /var/lib/signal-cli/data/attachments/<id>.<ext> automatically.
+            // The JSON notification uses "storedFilename" (or sometimes just
+            // "id" + known directory). Try both.
             let attachment_paths: Vec<String> = envelope.get("dataMessage")
                 .and_then(|d| d.get("attachments"))
                 .and_then(|a| a.as_array())
@@ -309,17 +311,47 @@ impl Signal {
                             let content_type = att.get("contentType")
                                 .and_then(|c| c.as_str())
                                 .unwrap_or("");
-                            // Only handle image attachments
                             if !content_type.starts_with("image/") {
                                 return None;
                             }
-                            att.get("storedFilename")
+                            // Primary: daemon includes the stored path
+                            if let Some(p) = att.get("storedFilename")
                                 .and_then(|s| s.as_str())
-                                .map(|s| s.to_string())
+                                .filter(|s| !s.is_empty())
+                            {
+                                return Some(p.to_string());
+                            }
+                            // Fallback: construct path from attachment id
+                            // e.g.  g7h-BJg65iNqLPDZrJwr.png  →
+                            //       /var/lib/signal-cli/data/attachments/g7h-BJg65iNqLPDZrJwr.png
+                            let id = att.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            if id.is_empty() {
+                                return None;
+                            }
+                            let ext = content_type.strip_prefix("image/").unwrap_or("jpg");
+                            let ext = if ext == "jpeg" { "jpg" } else { ext };
+                            let dir = att.get("storedDir")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("/var/lib/signal-cli/data/attachments");
+                            Some(format!("{dir}/{id}.{ext}"))
                         })
                         .collect()
                 })
                 .unwrap_or_default();
+
+            if !attachment_paths.is_empty() {
+                tracing::info!(
+                    "signal: got {} attachment(s): {:?}",
+                    attachment_paths.len(),
+                    attachment_paths,
+                );
+                // Dump raw attachment JSON to find correct field names
+                if let Some(atts) = envelope.get("dataMessage")
+                    .and_then(|d| d.get("attachments"))
+                {
+                    tracing::info!("signal: raw attachment JSON: {}", atts);
+                }
+            }
 
             if message.is_empty() && attachment_paths.is_empty() {
                 continue;
