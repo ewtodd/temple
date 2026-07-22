@@ -1,16 +1,16 @@
+use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use temple_protocol::*;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::accept_hdr_async;
-use futures_util::{SinkExt, StreamExt};
-use temple_protocol::*;
 use uuid::Uuid;
 
 use crate::agent::{Agent, AgentEvent};
-use crate::permissions::PermissionScope;
+use crate::auth::check_token;
 use crate::config::Config;
 use crate::memory::Memory;
-use crate::auth::check_token;
+use crate::permissions::PermissionScope;
 
 pub async fn run_server(
     agent: Arc<Agent>,
@@ -62,6 +62,7 @@ async fn handle_connection(
         let captured_token = Arc::new(Mutex::new(None::<String>));
         let ct = captured_token.clone();
         let tf = token_file.clone();
+        #[allow(clippy::result_large_err)] // tungstenite's callback signature is fixed.
         let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
             if let Some(auth) = req.headers().get("Authorization") {
                 let auth_str = auth.to_str().unwrap_or("");
@@ -155,22 +156,29 @@ async fn handle_connection(
                 // Auto-create a persisted Coding session (no SSH — tools run
                 // client-side via ToolRequest, so every `temple` invocation
                 // gets working tools and sessions show up in /sessions).
-                match agent.new_persisted_session(
-                    auth_owner.as_deref().unwrap_or(&open.username),
-                    None,
-                    None,
-                    Some(&open.username),
-                ).await {
-                    Ok(sid) => { session_id = sid; }
+                match agent
+                    .new_persisted_session(
+                        auth_owner.as_deref().unwrap_or(&open.username),
+                        None,
+                        None,
+                        Some(&open.username),
+                    )
+                    .await
+                {
+                    Ok(sid) => {
+                        session_id = sid;
+                    }
                     Err(e) => {
                         tracing::warn!("new_persisted_session failed: {e}");
-                        agent.open_session(
-                            session_id,
-                            auth_owner.as_deref().unwrap_or(&open.username),
-                            &open.cwd,
-                            crate::router::SessionKind::Interactive,
-                            None,
-                        ).await;
+                        agent
+                            .open_session(
+                                session_id,
+                                auth_owner.as_deref().unwrap_or(&open.username),
+                                &open.cwd,
+                                crate::router::SessionKind::Interactive,
+                                None,
+                            )
+                            .await;
                     }
                 }
                 let scope = PermissionScope::new(
@@ -196,14 +204,17 @@ async fn handle_connection(
                 let owner = auth_owner.clone().unwrap_or_default();
                 match memory.list_sessions(&owner, 10).await {
                     Ok(rows) => {
-                        let sessions = rows.into_iter().map(|r| SessionMeta {
-                            id: r.id,
-                            title: r.title,
-                            ssh_target: r.ssh_target,
-                            cwd: r.cwd,
-                            mode: r.mode,
-                            updated_at: r.updated_at,
-                        }).collect();
+                        let sessions = rows
+                            .into_iter()
+                            .map(|r| SessionMeta {
+                                id: r.id,
+                                title: r.title,
+                                ssh_target: r.ssh_target,
+                                cwd: r.cwd,
+                                mode: r.mode,
+                                updated_at: r.updated_at,
+                            })
+                            .collect();
                         let _ = tx.send(ServerMessage::SessionList { sessions });
                     }
                     Err(e) => {
@@ -220,14 +231,16 @@ async fn handle_connection(
                 match agent.resume_session(sid, &owner).await {
                     Ok((meta, transcript)) => {
                         session_id = sid;
-                        if permissions.is_none() {
-                            let scope = PermissionScope::new(
-                                std::path::Path::new("/var/lib/temple"),
-                                PermissionMode::Default,
-                                &config.allowed_dirs,
-                            ).await;
-                            permissions = Some(Arc::new(Mutex::new(scope)));
-                        }
+                        // Scope the permission check to the session's actual
+                        // working directory — NOT the server's data dir,
+                        // which would auto-grant /var/lib/temple.
+                        let scope = PermissionScope::new(
+                            std::path::Path::new(&meta.cwd),
+                            PermissionMode::Default,
+                            &config.allowed_dirs,
+                        )
+                        .await;
+                        permissions = Some(Arc::new(Mutex::new(scope)));
                         let _ = tx.send(ServerMessage::SessionResumed {
                             session_id: sid,
                             meta,
@@ -245,15 +258,27 @@ async fn handle_connection(
 
             ClientMessage::NewSession { ssh_target } => {
                 let owner = auth_owner.clone().unwrap_or_default();
-                match agent.new_persisted_session(&owner, ssh_target.as_deref(), None, None).await {
+                match agent
+                    .new_persisted_session(&owner, ssh_target.as_deref(), None, None)
+                    .await
+                {
                     Ok(sid) => {
                         session_id = sid;
+                        // For SSH targets the scope is irrelevant (SSH
+                        // permission checks run against $HOME on the remote
+                        // host). For local sessions, fall back to the
+                        // connection's existing scope if one exists.
                         if permissions.is_none() {
+                            let cwd = agent
+                                .session_cwd(sid)
+                                .await
+                                .unwrap_or_else(|| "/var/lib/temple".into());
                             let scope = PermissionScope::new(
-                                std::path::Path::new("/var/lib/temple"),
+                                std::path::Path::new(&cwd),
                                 PermissionMode::Default,
                                 &config.allowed_dirs,
-                            ).await;
+                            )
+                            .await;
                             permissions = Some(Arc::new(Mutex::new(scope)));
                         }
                         let meta = SessionMeta {
@@ -329,7 +354,21 @@ async fn handle_connection(
                 break;
             }
 
-            ClientMessage::ChatInput { session_id: sid, content } => {
+            ClientMessage::ChatInput {
+                session_id: sid,
+                content,
+            } => {
+                // Session ownership: a connection may only drive its own
+                // active session. Without this check, any client that
+                // learns another session's UUID could inject chat into it —
+                // executed with THIS connection's permission scope.
+                if sid != session_id {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id: sid,
+                        error: "session id mismatch — open/resume a session first".into(),
+                    });
+                    continue;
+                }
                 let Some(scope) = permissions.clone() else {
                     let _ = tx.send(ServerMessage::ChatError {
                         session_id: sid,
@@ -342,36 +381,42 @@ async fn handle_connection(
                 let agent = agent.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                let emit = move |ev: AgentEvent| {
-                    let msg = match ev {
-                        AgentEvent::Delta(d) => ServerMessage::ChatDelta {
-                            session_id: sid,
-                            delta: d,
-                            done: false,
-                        },
-                        AgentEvent::ToolEvent { name, status, detail } => {
-                            ServerMessage::ToolEvent {
+                    let emit = move |ev: AgentEvent| {
+                        let msg = match ev {
+                            AgentEvent::Delta(d) => ServerMessage::ChatDelta {
+                                session_id: sid,
+                                delta: d,
+                                done: false,
+                            },
+                            AgentEvent::ToolEvent {
+                                name,
+                                status,
+                                detail,
+                            } => ServerMessage::ToolEvent {
                                 session_id: sid,
                                 name,
                                 status,
                                 detail,
+                            },
+                            AgentEvent::PermissionNeeded(req) => {
+                                ServerMessage::PermissionRequired(req)
                             }
-                        }
-                        AgentEvent::PermissionNeeded(req) => {
-                            ServerMessage::PermissionRequired(req)
-                        }
-                        AgentEvent::StreamReset => ServerMessage::ChatReset {
-                            session_id: sid,
-                        },
-                        AgentEvent::ToolRequestNeeded { request_id, name, args_json } => {
-                            ServerMessage::ToolRequest {
+                            AgentEvent::StreamReset => ServerMessage::ChatReset { session_id: sid },
+                            AgentEvent::ToolRequestNeeded {
+                                request_id,
+                                name,
+                                args_json,
+                            } => ServerMessage::ToolRequest {
                                 request_id,
                                 session_id: sid,
                                 name,
                                 args_json,
-                            }
-                        }
-                        AgentEvent::Done(stats) => {
+                            },
+                            AgentEvent::TodoUpdated(items) => ServerMessage::TodoUpdate {
+                                session_id: sid,
+                                items,
+                            },
+                            AgentEvent::Done(stats) => {
                                 let _ = tx.send(ServerMessage::ChatDelta {
                                     session_id: sid,
                                     delta: String::new(),
@@ -396,63 +441,98 @@ async fn handle_connection(
                         };
                         let _ = tx.send(msg);
                     };
-                    agent
-                        .process_chat(sid, &content, scope, &emit, None)
-                        .await;
+                    agent.process_chat(sid, &content, scope, &emit, None).await;
                 });
             }
 
-            ClientMessage::PermissionReply { request_id, granted, .. } => {
-                agent.permissions.resolve(request_id, granted).await;
-            }
-
-            ClientMessage::ToolResult { request_id, result, .. } => {
-                agent.resolve_tool(request_id, result).await;
-            }
-
-            ClientMessage::ListModels => {
-                match agent.litellm.list_models().await {
-                    Ok(models) => {
-                        let infos: Vec<ModelInfo> = models
-                            .into_iter()
-                            .map(|id| ModelInfo {
-                                id,
-                                provider: "litellm".into(),
-                                description: None,
-                                capabilities: vec![],
-                            })
-                            .collect();
-                        let _ = tx.send(ServerMessage::ModelList { models: infos });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ServerMessage::ChatError {
-                            session_id,
-                            error: format!("model list failed: {e}"),
-                        });
-                    }
+            ClientMessage::PermissionReply {
+                request_id,
+                session_id: sid,
+                granted,
+            } => {
+                // Only resolve prompts belonging to this connection's
+                // session — a client must not answer another session's
+                // permission prompts.
+                if sid == session_id {
+                    agent.permissions.resolve(request_id, granted).await;
                 }
             }
 
-            ClientMessage::SetModel { session_id: sid, model } => {
+            ClientMessage::ToolResult {
+                request_id,
+                session_id: sid,
+                result,
+            } => {
+                if sid == session_id {
+                    agent.resolve_tool(request_id, result).await;
+                }
+            }
+
+            ClientMessage::ListModels => match agent.litellm.list_models().await {
+                Ok(models) => {
+                    let infos: Vec<ModelInfo> = models
+                        .into_iter()
+                        .map(|id| ModelInfo {
+                            id,
+                            provider: "litellm".into(),
+                            description: None,
+                            capabilities: vec![],
+                        })
+                        .collect();
+                    let _ = tx.send(ServerMessage::ModelList { models: infos });
+                }
+                Err(e) => {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: format!("model list failed: {e}"),
+                    });
+                }
+            },
+
+            ClientMessage::SetModel {
+                session_id: sid,
+                model,
+            } => {
+                if sid != session_id {
+                    continue;
+                }
                 if model == "auto" {
                     agent.reset_session_model(sid).await;
                     let default = agent.session_model(sid).await;
-                    let _ = tx.send(ServerMessage::ModelChanged { session_id: sid, model: default });
+                    let _ = tx.send(ServerMessage::ModelChanged {
+                        session_id: sid,
+                        model: default,
+                    });
                 } else {
                     agent.set_session_model(sid, &model).await;
-                    let _ = tx.send(ServerMessage::ModelChanged { session_id: sid, model });
+                    let _ = tx.send(ServerMessage::ModelChanged {
+                        session_id: sid,
+                        model,
+                    });
                 }
             }
 
-            ClientMessage::SetPermissionMode { session_id: sid, mode } => {
+            ClientMessage::SetPermissionMode {
+                session_id: sid,
+                mode,
+            } => {
+                if sid != session_id {
+                    continue;
+                }
                 if let Some(ref p) = permissions {
                     p.lock().await.set_mode(mode);
                 }
                 agent.set_session_mode(sid, mode).await;
-                let _ = tx.send(ServerMessage::ModeChanged { session_id: sid, mode });
+                let _ = tx.send(ServerMessage::ModeChanged {
+                    session_id: sid,
+                    mode,
+                });
             }
 
             ClientMessage::CancelChat { session_id: sid } => {
+                if sid != session_id {
+                    continue;
+                }
                 agent.cancel_chat(sid).await;
                 let _ = tx.send(ServerMessage::ChatCancelled { session_id: sid });
             }

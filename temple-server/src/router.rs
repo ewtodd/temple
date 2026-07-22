@@ -1,5 +1,5 @@
-use temple_protocol::ComplexityClass;
 use crate::config::ModelConfig;
+use temple_protocol::ComplexityClass;
 
 /// Session kind — determines system prompt tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,20 +38,37 @@ impl Router {
 
         // ── Obvious Simple: greetings, thanks, status, very short ──
         if len < 15
-            || q == "hi" || q == "hey" || q == "hello" || q == "yo" || q == "sup"
-            || q == "thanks" || q == "thank you" || q == "thx" || q == "ty"
-            || q == "ok" || q == "okay" || q == "k" || q == "kk"
-            || q == "status" || q == "help" || q == "ping"
-            || q == "lol" || q == "nice" || q == "cool"
+            || q == "hi"
+            || q == "hey"
+            || q == "hello"
+            || q == "yo"
+            || q == "sup"
+            || q == "thanks"
+            || q == "thank you"
+            || q == "thx"
+            || q == "ty"
+            || q == "ok"
+            || q == "okay"
+            || q == "k"
+            || q == "kk"
+            || q == "status"
+            || q == "help"
+            || q == "ping"
+            || q == "lol"
+            || q == "nice"
+            || q == "cool"
         {
             return ComplexityClass::Simple;
         }
 
         // Greeting-prefixed short messages are Simple
-        if q.starts_with("hello ") || q.starts_with("hi ") || q.starts_with("hey ")
-            || q.starts_with("thanks ") || q.starts_with("thank you ")
+        if q.starts_with("hello ")
+            || q.starts_with("hi ")
+            || q.starts_with("hey ")
+            || q.starts_with("thanks ")
+            || q.starts_with("thank you ")
         {
-            let rest = q.splitn(2, ' ').nth(1).unwrap_or("");
+            let rest = q.split_once(' ').map(|x| x.1).unwrap_or("");
             if rest.len() < 30 {
                 return ComplexityClass::Simple;
             }
@@ -61,30 +78,49 @@ impl Router {
         // Require BOTH a coding signal AND substantive content (not just
         // "what's an error code" type questions).
         let has_code_signal = q.contains(" code")
-            || q.contains(" bug") || q.contains("fix ")
+            || q.contains(" bug")
+            || q.contains("fix ")
             || q.contains("implement ")
             || q.contains("refactor")
-            || q.contains(" rewrite") || q.contains("rewrite ")
-            || q.contains(" build") || q.contains("building ")
+            || q.contains(" rewrite")
+            || q.contains("rewrite ")
+            || q.contains(" build")
+            || q.contains("building ")
             || q.contains("compile")
-            || q.contains(" debug") || q.contains("debugging ")
-            || q.contains("commit ") || q.contains("push ")
-            || q.contains(" test") || q.contains("testing ");
+            || q.contains(" debug")
+            || q.contains("debugging ")
+            || q.contains("commit ")
+            || q.contains("push ")
+            || q.contains(" test")
+            || q.contains("testing ");
 
         let has_substance = len > 40
             || q.contains('.')
             || q.contains('/')
             || q.contains('(')
             || q.contains("src")
-            || q.contains("fn ") || q.contains("def ")
-            || q.contains("class ") || q.contains("struct ")
-            || q.contains("import ") || q.contains("use ")
-            || q.contains("cargo") || q.contains("nix ")
-            || q.contains("flake") || q.contains("flake.")
-            || q.contains(".rs") || q.contains(".py") || q.contains(".nix")
-            || q.contains(".cpp") || q.contains(".cxx") || q.contains(".c ")
-            || q.contains(".ts") || q.contains(".js") || q.contains(".go")
-            || q.contains("mod ") || q.contains("trait ") || q.contains("impl ");
+            || q.contains("fn ")
+            || q.contains("def ")
+            || q.contains("class ")
+            || q.contains("struct ")
+            || q.contains("import ")
+            || q.contains("use ")
+            || q.contains("cargo")
+            || q.contains("nix ")
+            || q.contains("flake")
+            || q.contains("flake.")
+            || q.contains(".rs")
+            || q.contains(".py")
+            || q.contains(".nix")
+            || q.contains(".cpp")
+            || q.contains(".cxx")
+            || q.contains(".c ")
+            || q.contains(".ts")
+            || q.contains(".js")
+            || q.contains(".go")
+            || q.contains("mod ")
+            || q.contains("trait ")
+            || q.contains("impl ");
 
         if has_code_signal && has_substance {
             return ComplexityClass::Complex;

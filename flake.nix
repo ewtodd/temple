@@ -55,7 +55,7 @@
       pkgs = nixpkgsFor.${system};
     in {
       default = pkgs.mkShell {
-        packages = with pkgs; [ cargo rustc gcc pkg-config openssl sqlite ];
+        packages = with pkgs; [ cargo rustc rustfmt clippy gcc pkg-config openssl sqlite ];
         RUST_BACKTRACE = "1";
         PKG_CONFIG_PATH = with pkgs; lib.makeSearchPath "lib/pkgconfig" [
           openssl.dev

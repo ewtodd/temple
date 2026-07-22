@@ -72,9 +72,15 @@ result/bin/temple            # TUI client, another terminal
 | `/help` | help |
 | `:q` | quit |
 | `↑` `↓` | input history recall |
+| `Shift+Tab` | cycle permission mode |
 | `Ctrl+G` | open prompt in `$EDITOR` |
 | `Ctrl+L` | clear chat |
 | `PgUp/PgDn`, `Ctrl+U/D` | scroll |
+
+The current permission mode is always visible in the status bar
+(`[default]`, `[ask]`, `[lockdown]`, `[YOLO]`). The client also enforces
+its own consent layer: writes outside the working directory and non-safe
+shell commands prompt locally with y/N, regardless of the server's mode.
 
 Each assistant reply gets a stats footer:
 
@@ -82,6 +88,10 @@ Each assistant reply gets a stats footer:
 renco › fixed the borrow error in main.rs.
        ⏱ qwen3.6-27b-coding · 41.2 tok/s · 12.4k ctx · 12.4k+890 tok · 21.6s
 ```
+
+For multi-step work the agent maintains a persistent task list (the `todo`
+tool) — visible as a checklist in the TUI and on Signal, and restored on
+session resume.
 
 ## Signal bot
 
@@ -91,20 +101,23 @@ Commands work the same as the TUI:
 ```
 /sessions              → list recent sessions
 /session <prefix>      → resume a session
-/new e-play tls         → new session in ~/tls on e-play@e-desktop
+/new e-play tls        → new session in ~/tls on e-play@e-desktop
 /quick                 → back to quick mode
+/mode [mode]           → show or set permission mode
 /help                  → all commands
 ```
 
-Responses get a preamble showing the active session:
+Responses get a preamble showing the active session and its permission mode:
 ```
-📋 e-play@e-desktop · a1b2c3 · fixing the parser
+📋 e-play@e-desktop · a1b2c3 · fixing the parser [ask]
 
 list the files in this directory...
 ```
 
-Read receipts, typing bubbles, and "still consulting the oracle..." status
-updates keep you informed while renco works.
+Code blocks arrive as Signal monospace blocks, tables keep their column
+alignment, and task lists render as checklists. Read receipts, typing
+bubbles, and "still consulting the oracle..." status updates keep you
+informed while renco works.
 
 ## NixOS module
 
@@ -177,7 +190,9 @@ Secrets (API keys, tokens, phone numbers) come from agenix via
   resident.
 - **Cron**: 03:00 skills extraction (model call → `skills.md`), 04:00
   smart `nix flake update` (GitHub compare API, reverts if risky),
-  Sunday 05:00 personality self-update. All events notify Signal users.
+  Sunday 05:00 personality self-update — all local time, with per-job
+  catch-up so a missed window still runs once that day. All events notify
+  Signal users.
 
 ## Fleet layout
 

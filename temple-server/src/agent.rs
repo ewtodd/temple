@@ -49,6 +49,12 @@ impl PermissionResolver {
             let _ = tx.send(granted);
         }
     }
+
+    /// Drop a pending request without resolving it — used when the waiter
+    /// timed out or was cancelled, so the map doesn't leak entries.
+    pub async fn forget(&self, request_id: Uuid) {
+        self.pending.lock().await.remove(&request_id);
+    }
 }
 
 /// Events the agent loop emits toward the client.
@@ -66,6 +72,8 @@ pub enum AgentEvent {
     /// A stream that already produced deltas failed and is being retried —
     /// clients should discard the partial message they accumulated.
     StreamReset,
+    /// The session's todo list changed (full replacement).
+    TodoUpdated(Vec<temple_protocol::TodoItem>),
     /// Server requests the client to execute a local tool
     ToolRequestNeeded {
         request_id: Uuid,
@@ -150,6 +158,8 @@ struct SessionCtx {
     /// True when the user explicitly picked a model via /model — routing
     /// is bypassed and this model is used directly.  /model auto clears it.
     model_override: bool,
+    /// Coding-session task list, persisted with the session.
+    todos: Vec<temple_protocol::TodoItem>,
 }
 
 pub struct Agent {
@@ -160,8 +170,16 @@ pub struct Agent {
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
-    /// Per-session cancellation tokens for in-progress agent loops
-    cancel_tokens: Mutex<HashMap<Uuid, CancellationToken>>,
+    /// Per-session cancellation tokens for in-progress agent loops.
+    /// The generation counter guards against a stale loop deleting the
+    /// NEW loop's token during cleanup (remove only if generation matches).
+    cancel_tokens: Mutex<HashMap<Uuid, (u64, CancellationToken)>>,
+    /// Global generation counter for cancel tokens.
+    token_generation: std::sync::atomic::AtomicU64,
+    /// Per-session loop locks — one agent loop runs per session at a time.
+    /// A second message cancels the first loop's token and then waits for
+    /// the lock, so the two loops never interleave history writes.
+    loop_locks: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// Pending tool requests: request_id → oneshot sender for the result
     pending_tools: Mutex<HashMap<Uuid, oneshot::Sender<String>>>,
     pub models: ModelConfig,
@@ -180,12 +198,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(
-        litellm: LiteLLM,
-        mcp: McpClient,
-        memory: Arc<Memory>,
-        models: ModelConfig,
-    ) -> Self {
+    pub fn new(litellm: LiteLLM, mcp: McpClient, memory: Arc<Memory>, models: ModelConfig) -> Self {
         Self {
             litellm,
             // Local model client — no API key needed, localhost
@@ -195,12 +208,16 @@ impl Agent {
             permissions: Arc::new(PermissionResolver::new()),
             sessions: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
+            token_generation: std::sync::atomic::AtomicU64::new(0),
+            loop_locks: Mutex::new(HashMap::new()),
             pending_tools: Mutex::new(HashMap::new()),
             router_model: "qwen3-4b-instruct".to_string(),
             title_model: "qwen3-4b-instruct".to_string(),
             models,
             queue: crate::queue::RequestQueue::new(),
-            last_request: std::sync::Mutex::new(Instant::now() - std::time::Duration::from_secs(3600)),
+            last_request: std::sync::Mutex::new(
+                Instant::now() - std::time::Duration::from_secs(3600),
+            ),
             tools: Mutex::new(Vec::new()),
             ssh_targets: Vec::new(),
             ssh_key_path: None,
@@ -222,6 +239,37 @@ impl Agent {
         if let Some(tx) = self.pending_tools.lock().await.remove(&request_id) {
             let _ = tx.send(result);
         }
+    }
+
+    /// Drop a pending tool request without resolving it — used when the
+    /// waiter timed out or was cancelled, so the map doesn't leak entries.
+    pub async fn forget_tool(&self, request_id: Uuid) {
+        self.pending_tools.lock().await.remove(&request_id);
+    }
+
+    /// Wait for a client's tool result, interruptible by cancellation.
+    /// Cleans up the pending-tools entry on every exit path.
+    async fn wait_tool_result(
+        &self,
+        request_id: Uuid,
+        rx: oneshot::Receiver<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String, String> {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        let out = tokio::select! {
+            res = tokio::time::timeout(TIMEOUT, rx) => {
+                match res {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(_)) => Err("tool request channel closed".to_string()),
+                    Err(_) => Err("tool request timed out".to_string()),
+                }
+            }
+            _ = cancel_token.cancelled() => Err("cancelled by user".to_string()),
+        };
+        if out.is_err() {
+            self.forget_tool(request_id).await;
+        }
+        out
     }
 
     /// Set the local llama.cpp endpoint (called from main.rs with config)
@@ -252,7 +300,9 @@ impl Agent {
     /// isn't configured or no key path is set.
     pub fn make_ssh(&self, target_name: &str) -> Option<Arc<crate::ssh::SshExecutor>> {
         let target = self.ssh_targets.iter().find(|t| t.name == target_name)?;
-        let key = self.ssh_key_path.clone()
+        let key = self
+            .ssh_key_path
+            .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/temple/ssh_key"));
         Some(Arc::new(crate::ssh::SshExecutor::new(
             target.clone(),
@@ -293,10 +343,7 @@ impl Agent {
         // doesn't displace the real conversation cache.
         let req = ChatRequest {
             model: self.models.default_model.clone(),
-            messages: vec![
-                ChatMessage::system("ok"),
-                ChatMessage::user("."),
-            ],
+            messages: vec![ChatMessage::system("ok"), ChatMessage::user(".")],
             tools: None,
             stream: Some(false),
             stream_options: None,
@@ -339,6 +386,7 @@ impl Agent {
                 permission_mode: PermissionMode::Default,
                 project_context: None,
                 model_override: false,
+                todos: Vec::new(),
             },
         );
     }
@@ -355,19 +403,32 @@ impl Agent {
         let session_id = Uuid::new_v4();
         let (ssh, kind, cwd, full_name, account_name) = match ssh_target {
             Some(name) => {
-                let t = self.ssh_targets.iter().find(|t| {
-                    t.name == name
-                        || t.name.starts_with(&format!("{name}@"))
-                        || t.account == name
-                }).cloned()
-                .ok_or_else(|| format!(
-                    "unknown ssh target: {name} (available: {})",
-                    self.ssh_target_names().join(", ")
-                ))?;
-                let ssh = self.make_ssh(&t.name)
+                let t = self
+                    .ssh_targets
+                    .iter()
+                    .find(|t| {
+                        t.name == name
+                            || t.name.starts_with(&format!("{name}@"))
+                            || t.account == name
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown ssh target: {name} (available: {})",
+                            self.ssh_target_names().join(", ")
+                        )
+                    })?;
+                let ssh = self
+                    .make_ssh(&t.name)
                     .ok_or_else(|| "ssh key not configured".to_string())?;
                 let cwd = ssh.home_dir().await.unwrap_or_else(|_| "~".into());
-                (Some(ssh), SessionKind::Interactive, cwd, t.name, Some(t.account))
+                (
+                    Some(ssh),
+                    SessionKind::Interactive,
+                    cwd,
+                    t.name,
+                    Some(t.account),
+                )
             }
             None => (
                 None,
@@ -428,6 +489,7 @@ impl Agent {
                 permission_mode: PermissionMode::Default,
                 project_context: None,
                 model_override: false,
+                todos: Vec::new(),
             },
         );
         drop(sessions);
@@ -442,7 +504,10 @@ impl Agent {
         session_id: Uuid,
         owner: &str,
     ) -> Result<(temple_protocol::SessionMeta, Vec<(String, String)>), String> {
-        let row = self.memory.load_session(session_id).await
+        let row = self
+            .memory
+            .load_session(session_id)
+            .await
             .map_err(|e| format!("load session: {e}"))?
             .ok_or("session not found")?;
 
@@ -450,14 +515,33 @@ impl Agent {
             return Err("session belongs to another user".into());
         }
 
-        let history: Vec<ChatMessage> = serde_json::from_str(&row.history_json)
-            .unwrap_or_default();
+        let history: Vec<ChatMessage> = match serde_json::from_str(&row.history_json) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("session {session_id}: corrupt history JSON, starting fresh: {e}");
+                Vec::new()
+            }
+        };
+        let history = repair_dangling_tool_calls(history, session_id);
+
+        let todos: Vec<temple_protocol::TodoItem> =
+            serde_json::from_str(&row.todos_json).unwrap_or_default();
 
         let ssh = row.ssh_target.as_deref().and_then(|n| self.make_ssh(n));
-        let kind = SessionKind::Interactive;
+        let kind = match row.kind.as_str() {
+            "headless" => SessionKind::Headless,
+            _ => SessionKind::Interactive,
+        };
+        let permission_mode = match row.mode.as_str() {
+            "ask" => PermissionMode::Ask,
+            "lockdown" => PermissionMode::Lockdown,
+            "yolo" => PermissionMode::Yolo,
+            _ => PermissionMode::Default,
+        };
 
         // Build transcript of user/assistant text turns for client replay
-        let transcript: Vec<(String, String)> = history.iter()
+        let transcript: Vec<(String, String)> = history
+            .iter()
             .filter_map(|m| {
                 let content = m.content_text_owned()?;
                 if (m.role == "user" || m.role == "assistant")
@@ -496,9 +580,10 @@ impl Agent {
                 owner: row.username,
                 title: row.title,
                 persist: true,
-                permission_mode: PermissionMode::Default,
+                permission_mode,
                 project_context: None,
                 model_override: false,
+                todos,
             },
         );
 
@@ -510,7 +595,9 @@ impl Agent {
     pub async fn persist_session(&self, session_id: Uuid) {
         let row = {
             let sessions = self.sessions.lock().await;
-            let Some(s) = sessions.get(&session_id) else { return };
+            let Some(s) = sessions.get(&session_id) else {
+                return;
+            };
             if !s.persist {
                 return;
             }
@@ -527,6 +614,7 @@ impl Agent {
                 },
                 title: s.title.clone(),
                 history_json: serde_json::to_string(&s.history).unwrap_or_else(|_| "[]".into()),
+                todos_json: serde_json::to_string(&s.todos).unwrap_or_else(|_| "[]".into()),
             }
         };
         if let Err(e) = self.memory.save_session(&row).await {
@@ -536,7 +624,8 @@ impl Agent {
 
     /// Attach an SSH executor to an existing session.
     pub async fn attach_ssh(&self, session_id: Uuid, target_name: &str) -> Result<(), String> {
-        let ssh = self.make_ssh(target_name)
+        let ssh = self
+            .make_ssh(target_name)
             .ok_or_else(|| format!("unknown ssh target: {target_name}"))?;
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get_mut(&session_id) {
@@ -551,7 +640,9 @@ impl Agent {
 
     /// Check whether a session has an SSH executor attached.
     pub async fn has_ssh(&self, session_id: Uuid) -> bool {
-        self.sessions.lock().await
+        self.sessions
+            .lock()
+            .await
             .get(&session_id)
             .map(|s| s.ssh.is_some())
             .unwrap_or(false)
@@ -568,16 +659,15 @@ impl Agent {
                 if !(s.persist && s.title.is_none()) {
                     return None;
                 }
-                s.history.iter()
+                s.history
+                    .iter()
                     .find(|m| m.role == "user")
                     .and_then(|m| m.content_text_owned())
                     .map(|content| {
                         // Group messages are stored as "sender: text" —
                         // don't let the sender prefix leak into titles.
                         if s.username == "group" {
-                            content
-                                .splitn(2, ": ")
-                                .nth(1)
+                            content.split_once(": ").map(|x| x.1)
                                 .unwrap_or(&content)
                                 .to_string()
                         } else {
@@ -608,7 +698,10 @@ impl Agent {
         let excerpt: String = first_user_msg.chars().take(500).collect();
         // Use the router model (fast 4B co-resident with deepseek on
         // son-of-anton), falling back to researcher if unconfigured.
-        let title_model = self.models.router_model.as_deref()
+        let title_model = self
+            .models
+            .router_model
+            .as_deref()
             .unwrap_or(&self.models.researcher_model);
         let req = ChatRequest {
             model: title_model.to_string(),
@@ -616,7 +709,7 @@ impl Agent {
                 ChatMessage::system(
                     "Summarize the user's request as a short title (2-6 words). \
                      Reply with only the title — no quotes, no punctuation, \
-                     no explanation, no greeting."
+                     no explanation, no greeting.",
                 ),
                 ChatMessage::user(excerpt),
             ],
@@ -628,16 +721,22 @@ impl Agent {
         };
 
         let model_title = match self.litellm.chat(req).await {
-            Ok(resp) => resp.choices.first()
+            Ok(resp) => resp
+                .choices
+                .first()
                 .and_then(|c| c.message.content_text_owned())
-                .map(|t| t.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string())
+                .map(|t| {
+                    t.trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .trim()
+                        .to_string()
+                })
                 .filter(|t| {
                     let words = t.split_whitespace().count();
                     !t.is_empty()
                         && !t.contains('\n')
                         && t.chars().count() <= 60
-                        && words >= 2
-                        && words <= 8
+                        && (2..=8).contains(&words)
                 }),
             Err(e) => {
                 tracing::warn!("Title generation for {session_id} failed: {e}");
@@ -656,16 +755,34 @@ impl Agent {
         tracing::info!("Session {session_id} title: {title}");
     }
 
-    /// Get display metadata for an in-memory session (for preambles).
-    pub async fn session_display(&self, session_id: Uuid) -> Option<(Option<String>, Option<String>)> {
+    /// Get display metadata for an in-memory session (for preambles):
+    /// (ssh target name, title, permission mode).
+    pub async fn session_display(
+        &self,
+        session_id: Uuid,
+    ) -> Option<(Option<String>, Option<String>, PermissionMode)> {
         let sessions = self.sessions.lock().await;
-        sessions.get(&session_id)
-            .map(|s| (s.ssh_target_name.clone(), s.title.clone()))
+        sessions.get(&session_id).map(|s| {
+            (
+                s.ssh_target_name.clone(),
+                s.title.clone(),
+                s.permission_mode,
+            )
+        })
     }
 
     /// Check whether a session is currently loaded in memory.
     pub async fn has_session(&self, session_id: Uuid) -> bool {
         self.sessions.lock().await.contains_key(&session_id)
+    }
+
+    /// The session's working directory, if loaded.
+    pub async fn session_cwd(&self, session_id: Uuid) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|s| s.cwd.clone())
     }
 
     pub async fn close_session(&self, session_id: Uuid) {
@@ -677,8 +794,17 @@ impl Agent {
 
     /// Cancel an in-progress agent loop for this session.
     pub async fn cancel_chat(&self, session_id: Uuid) {
-        if let Some(token) = self.cancel_tokens.lock().await.remove(&session_id) {
+        if let Some((_, token)) = self.cancel_tokens.lock().await.remove(&session_id) {
             token.cancel();
+        }
+    }
+
+    /// Remove the session's token only if it is still the one this loop
+    /// registered — a stale loop must never delete the NEW loop's token.
+    async fn remove_token_if_current(&self, session_id: Uuid, generation: u64) {
+        let mut tokens = self.cancel_tokens.lock().await;
+        if matches!(tokens.get(&session_id), Some((g, _)) if *g == generation) {
+            tokens.remove(&session_id);
         }
     }
 
@@ -743,27 +869,59 @@ impl Agent {
     ) {
         let started = Instant::now();
 
-        // Register cancellation token for this session
+        // ── Per-session loop ownership ──
+        // One agent loop per session at a time. Registering a new token
+        // cancels the previous loop; the loop lock then waits for that loop
+        // to fully exit (its waits are cancel-interruptible) so the two
+        // never interleave history writes.
+        let loop_lock = {
+            let mut locks = self.loop_locks.lock().await;
+            locks
+                .entry(session_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+
+        // Register cancellation token for this session (cancels any
+        // in-progress loop for the same session).
         let cancel_token = CancellationToken::new();
+        let generation = self
+            .token_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut tokens = self.cancel_tokens.lock().await;
-            if let Some(old) = tokens.insert(session_id, cancel_token.clone()) {
+            if let Some((_, old)) = tokens.insert(session_id, (generation, cancel_token.clone())) {
                 old.cancel();
             }
         }
 
+        // Wait for the previous loop (if any) to finish unwinding.
+        let _loop_guard = loop_lock.lock().await;
+
         // Get session info
-        let (username, cwd, _is_initialized, session_model, session_kind, ssh_executor, model_override) = {
+        let (
+            username,
+            cwd,
+            _is_initialized,
+            session_model,
+            session_kind,
+            ssh_executor,
+            model_override,
+        ) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
-                self.cancel_tokens.lock().await.remove(&session_id);
+                self.remove_token_if_current(session_id, generation).await;
                 return;
             };
             s.history.push(ChatMessage::user(content));
             (
-                s.username.clone(), s.cwd.clone(), s.initialized,
-                s.model.clone(), s.kind, s.ssh.clone(),
+                s.username.clone(),
+                s.cwd.clone(),
+                s.initialized,
+                s.model.clone(),
+                s.kind,
+                s.ssh.clone(),
                 s.model_override,
             )
         };
@@ -784,10 +942,15 @@ impl Agent {
                 // Uses router_model if configured (small 4B model co-resident
                 // with deepseek on son-of-anton for ~50ms latency), falls back
                 // to researcher_model (gemma-4-31b on anton, ~500ms).
-                let classifier = self.models.router_model.as_deref()
+                let classifier = self
+                    .models
+                    .router_model
+                    .as_deref()
                     .unwrap_or(&self.models.researcher_model);
                 tracing::info!("Router heuristic: Medium — refining via {classifier}");
-                let refined = self.litellm.classify_query(classifier, content)
+                let refined = self
+                    .litellm
+                    .classify_query(classifier, content)
                     .await
                     .unwrap_or(ComplexityClass::Medium);
                 tracing::info!("Router refined: {refined:?}");
@@ -799,9 +962,15 @@ impl Agent {
         };
         let route = match (complexity, model_override) {
             (Some(c), _) => Router::route(c, &self.models, session_kind),
-            (None, true) => Route::Direct { model: session_model },
-            (None, _) if is_command => Route::Direct { model: session_model },
-            (None, _) => Route::Direct { model: self.models.default_model.clone() },
+            (None, true) => Route::Direct {
+                model: session_model,
+            },
+            (None, _) if is_command => Route::Direct {
+                model: session_model,
+            },
+            (None, _) => Route::Direct {
+                model: self.models.default_model.clone(),
+            },
         };
         let lane = match &route {
             Route::Direct { model } => model.clone(),
@@ -813,7 +982,11 @@ impl Agent {
         {
             let model_desc = match &route {
                 Route::Direct { model } => model.clone(),
-                Route::Pipeline { planner, executor, reviewer } => {
+                Route::Pipeline {
+                    planner,
+                    executor,
+                    reviewer,
+                } => {
                     format!("pipeline: {planner} → {executor} → {reviewer}")
                 }
             };
@@ -834,14 +1007,24 @@ impl Agent {
             });
         }
 
-        let priority = self.memory.get_user_priority(priority_user.unwrap_or(&username)).await.unwrap_or(-1);
+        let priority = self
+            .memory
+            .get_user_priority(priority_user.unwrap_or(&username))
+            .await
+            .unwrap_or(-1);
         let queue_start = Instant::now();
-        let (_queue_permit, queued) = self.queue.acquire(&lane, priority).await;
+        let (_queue_permit, queued) = tokio::select! {
+            res = self.queue.acquire(&lane, priority) => res,
+            _ = cancel_token.cancelled() => {
+                // Cancelled while waiting in the queue — bail before doing
+                // any work (prompt building, title generation all cost time
+                // the lane could spend on requests that weren't cancelled).
+                self.remove_token_if_current(session_id, generation).await;
+                return;
+            }
+        };
         if cancel_token.is_cancelled() {
-            // Cancelled while waiting in the queue — bail before doing any
-            // work (prompt building, title generation all cost time the
-            // lane could spend on requests that weren't cancelled).
-            self.cancel_tokens.lock().await.remove(&session_id);
+            self.remove_token_if_current(session_id, generation).await;
             return;
         }
         if queued {
@@ -860,10 +1043,11 @@ impl Agent {
 
         // Get or lazily detect project context (cached per-session)
         let project_context = {
-            let mut sessions = self.sessions.lock().await;
-            let needs_detect = sessions.get(&session_id)
+            let sessions = self.sessions.lock().await;
+            let needs_detect = sessions
+                .get(&session_id)
                 .and_then(|s| s.project_context.clone())
-                .unwrap_or_else(|| String::new());
+                .unwrap_or_else(String::new);
             // If cached, return it
             if !needs_detect.is_empty() || session_kind == SessionKind::Headless {
                 needs_detect
@@ -878,7 +1062,9 @@ impl Agent {
                 ctx
             }
         };
-        let base_system_prompt = self.build_system_prompt(&username, &cwd, session_kind, &project_context).await;
+        let base_system_prompt = self
+            .build_system_prompt(&username, &cwd, session_kind, &project_context)
+            .await;
 
         // Stats accumulators across all rounds
         let mut stats = StatsAccum::new();
@@ -886,30 +1072,54 @@ impl Agent {
         let (final_content, model_for_stats) = match &route {
             Route::Direct { model } => {
                 let mut tool_history = Vec::new();
-                let content = self.run_tool_loop(
-                    session_id, model, &base_system_prompt, &cancel_token,
-                    &scope, ssh_executor.as_ref(), emit, &mut stats, &mut tool_history,
-                ).await;
+                let content = self
+                    .run_tool_loop(
+                        session_id,
+                        model,
+                        &base_system_prompt,
+                        &cancel_token,
+                        &scope,
+                        ssh_executor.as_ref(),
+                        emit,
+                        &mut stats,
+                        &mut tool_history,
+                    )
+                    .await;
                 (content, model.clone())
             }
-            Route::Pipeline { planner, executor, reviewer } => {
+            Route::Pipeline {
+                planner,
+                executor,
+                reviewer,
+            } => {
                 self.run_pipeline(
-                    session_id, content, &base_system_prompt,
-                    planner, executor, reviewer,
-                    &cancel_token, &scope, ssh_executor.as_ref(), emit, &mut stats,
-                ).await
+                    session_id,
+                    content,
+                    &base_system_prompt,
+                    planner,
+                    executor,
+                    reviewer,
+                    &cancel_token,
+                    &scope,
+                    ssh_executor.as_ref(),
+                    emit,
+                    &mut stats,
+                )
+                .await
             }
         };
 
-        // Clean up cancellation token
-        self.cancel_tokens.lock().await.remove(&session_id);
+        // Clean up cancellation token (only if it's still ours — a newer
+        // loop may have already replaced it).
+        self.remove_token_if_current(session_id, generation).await;
 
         // Store assistant reply in history (needed for context in next turns)
         if !final_content.is_empty() {
             {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
-                    s.history.push(ChatMessage::assistant(Some(final_content.clone()), None));
+                    s.history
+                        .push(ChatMessage::assistant(Some(final_content.clone()), None));
                 }
             }
             // Fire-and-forget conversation persistence (don't block the lane)
@@ -918,15 +1128,24 @@ impl Agent {
             let final_owned = final_content.clone();
             let model_owned = model_for_stats.clone();
             tokio::spawn(async move {
-                let _ = memory.store_conversation(&ConversationEntry {
-                    role: "user".into(), content: content_owned,
-                    timestamp: chrono::Utc::now(), session_id, model_used: None,
-                }).await;
-                let _ = memory.store_conversation(&ConversationEntry {
-                    role: "assistant".into(), content: final_owned,
-                    timestamp: chrono::Utc::now(), session_id,
-                    model_used: Some(model_owned),
-                }).await;
+                let _ = memory
+                    .store_conversation(&ConversationEntry {
+                        role: "user".into(),
+                        content: content_owned,
+                        timestamp: chrono::Utc::now(),
+                        session_id,
+                        model_used: None,
+                    })
+                    .await;
+                let _ = memory
+                    .store_conversation(&ConversationEntry {
+                        role: "assistant".into(),
+                        content: final_owned,
+                        timestamp: chrono::Utc::now(),
+                        session_id,
+                        model_used: Some(model_owned),
+                    })
+                    .await;
             });
         }
 
@@ -957,14 +1176,30 @@ impl Agent {
     pub async fn cancel_all(&self) -> usize {
         let tokens = self.cancel_tokens.lock().await;
         let n = tokens.len();
-        for (_, t) in tokens.iter() {
+        for (_, (_, t)) in tokens.iter() {
             t.cancel();
         }
         n
     }
 
+    /// Graceful shutdown: cancel in-flight loops, persist every loaded
+    /// session, and give fire-and-forget persistence tasks a moment to
+    /// finish. Called on SIGTERM/SIGINT before process exit.
+    pub async fn shutdown(&self) {
+        let n = self.cancel_all().await;
+        if n > 0 {
+            tracing::info!("shutdown: cancelled {n} in-flight loop(s)");
+        }
+        let ids: Vec<Uuid> = self.sessions.lock().await.keys().copied().collect();
+        for id in ids {
+            self.persist_session(id).await;
+        }
+        tracing::info!("shutdown: sessions persisted");
+    }
+
     /// Run the planner→executor→reviewer pipeline for Complex queries.
     /// Returns (final_content, model_name_for_stats).
+    #[allow(clippy::too_many_arguments)] // Pipeline needs all four models + ctx.
     async fn run_pipeline(
         &self,
         session_id: Uuid,
@@ -987,7 +1222,8 @@ impl Agent {
         }
 
         emit(AgentEvent::ToolEvent {
-            name: "planner".into(), status: ToolStatus::Started,
+            name: "planner".into(),
+            status: ToolStatus::Started,
             detail: "decomposing prompt".into(),
         });
 
@@ -997,7 +1233,8 @@ impl Agent {
         }
 
         emit(AgentEvent::ToolEvent {
-            name: "planner".into(), status: ToolStatus::Finished,
+            name: "planner".into(),
+            status: ToolStatus::Finished,
             detail: plan.chars().take(200).collect(),
         });
 
@@ -1007,10 +1244,19 @@ impl Agent {
         );
 
         // ── 2. Executor: run the tool loop with the plan ──
-        let mut executor_output = self.run_tool_loop(
-            session_id, executor, &executor_prompt, cancel_token,
-            scope, ssh, emit, stats, &mut tool_history,
-        ).await;
+        let mut executor_output = self
+            .run_tool_loop(
+                session_id,
+                executor,
+                &executor_prompt,
+                cancel_token,
+                scope,
+                ssh,
+                emit,
+                stats,
+                &mut tool_history,
+            )
+            .await;
 
         // ── 3. Reviewer: evaluate the executor's output ──
         for revision_round in 0..MAX_REVISION_ROUNDS {
@@ -1019,13 +1265,14 @@ impl Agent {
             }
 
             emit(AgentEvent::ToolEvent {
-                name: "reviewer".into(), status: ToolStatus::Started,
+                name: "reviewer".into(),
+                status: ToolStatus::Started,
                 detail: format!("review round {}", revision_round + 1),
             });
 
-            let (approved, feedback) = self.call_reviewer(
-                reviewer, user_prompt, &executor_output, cancel_token,
-            ).await;
+            let (approved, feedback) = self
+                .call_reviewer(reviewer, user_prompt, &executor_output, cancel_token)
+                .await;
 
             if cancel_token.is_cancelled() {
                 break;
@@ -1033,35 +1280,48 @@ impl Agent {
 
             if approved {
                 emit(AgentEvent::ToolEvent {
-                    name: "reviewer".into(), status: ToolStatus::Finished,
+                    name: "reviewer".into(),
+                    status: ToolStatus::Finished,
                     detail: "approved".into(),
                 });
                 break;
             }
 
             emit(AgentEvent::ToolEvent {
-                name: "reviewer".into(), status: ToolStatus::Finished,
-                detail: format!("revision needed: {}", feedback.chars().take(200).collect::<String>()),
+                name: "reviewer".into(),
+                status: ToolStatus::Finished,
+                detail: format!(
+                    "revision needed: {}",
+                    feedback.chars().take(200).collect::<String>()
+                ),
             });
 
             // Inject revision feedback as a user message in session history
             {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
-                    s.history.push(ChatMessage::assistant(
-                        Some(executor_output.clone()), None,
-                    ));
-                    s.history.push(ChatMessage::user(&format!(
+                    s.history
+                        .push(ChatMessage::assistant(Some(executor_output.clone()), None));
+                    s.history.push(ChatMessage::user(format!(
                         "The reviewer has feedback on your work. Please revise:\n\n{feedback}"
                     )));
                 }
             }
 
             // Run executor again with the revision feedback
-            executor_output = self.run_tool_loop(
-                session_id, executor, &executor_prompt, cancel_token,
-                scope, ssh, emit, stats, &mut tool_history,
-            ).await;
+            executor_output = self
+                .run_tool_loop(
+                    session_id,
+                    executor,
+                    &executor_prompt,
+                    cancel_token,
+                    scope,
+                    ssh,
+                    emit,
+                    stats,
+                    &mut tool_history,
+                )
+                .await;
         }
 
         (executor_output, executor.to_string())
@@ -1085,7 +1345,7 @@ impl Agent {
                      - What commands to run\n\
                      - What the expected outcome looks like\n\
                      - Potential pitfalls to watch for\n\
-                     Output just the plan, no preamble."
+                     Output just the plan, no preamble.",
                 ),
                 ChatMessage::user(user_prompt),
             ],
@@ -1135,9 +1395,9 @@ impl Agent {
                      Respond with EXACTLY one of:\n\
                      - APPROVED\n\
                      - REVISE: <specific feedback on what to fix>\n\n\
-                     Be strict but fair. Only approve if the work is correct and complete."
+                     Be strict but fair. Only approve if the work is correct and complete.",
                 ),
-                ChatMessage::user(&format!(
+                ChatMessage::user(format!(
                     "## Original user request\n{user_prompt}\n\n\
                      ## Assistant's response\n{executor_output}"
                 )),
@@ -1181,6 +1441,7 @@ impl Agent {
     /// Run the streaming tool-use loop. Sends messages to the model, streams
     /// deltas to the client, executes tool calls, and returns the final
     /// content when the model produces a non-tool-call response.
+    #[allow(clippy::too_many_arguments)] // The tool loop genuinely needs all of these.
     async fn run_tool_loop(
         &self,
         session_id: Uuid,
@@ -1232,11 +1493,12 @@ impl Agent {
             let result = {
                 let mut last_err = String::new();
                 let mut stream_result: Option<crate::litellm::StreamResult> = None;
-                let mut stream_first_delta: Option<Instant> = None;
                 let stream_round_start = Instant::now();
 
                 for attempt in 0..MAX_STREAM_RETRIES {
-                    if cancel_token.is_cancelled() { break; }
+                    if cancel_token.is_cancelled() {
+                        break;
+                    }
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
                     let litellm = self.litellm.clone();
                     let req_clone = req.clone();
@@ -1246,7 +1508,10 @@ impl Agent {
 
                     let mut attempt_error: Option<String> = None;
                     let mut attempt_had_output = false;
-                    stream_first_delta = None;
+                    // Per-attempt first-delta timing — declared inside the
+                    // loop so a failed attempt's timestamp can't pollute
+                    // the successful attempt's prefill measurement.
+                    let mut stream_first_delta: Option<Instant> = None;
                     loop {
                         // select! on cancellation — a hung stream produces no
                         // events, so a recv-only loop never notices /reset
@@ -1258,7 +1523,9 @@ impl Agent {
                             },
                             _ = cancel_token.cancelled() => break,
                         };
-                        if cancel_token.is_cancelled() { break; }
+                        if cancel_token.is_cancelled() {
+                            break;
+                        }
                         match ev {
                             StreamEvent::Delta(d) => {
                                 attempt_had_output = true;
@@ -1267,8 +1534,14 @@ impl Agent {
                                 }
                                 emit(AgentEvent::Delta(d));
                             }
-                            StreamEvent::Done(r) => { stream_result = Some(r); break; }
-                            StreamEvent::Error(e) => { attempt_error = Some(e); break; }
+                            StreamEvent::Done(r) => {
+                                stream_result = Some(r);
+                                break;
+                            }
+                            StreamEvent::Error(e) => {
+                                attempt_error = Some(e);
+                                break;
+                            }
                         }
                     }
                     // Always abort the stream task — either it finished naturally
@@ -1279,11 +1552,14 @@ impl Agent {
                         let round_end = Instant::now();
                         match stream_first_delta {
                             Some(t_first) => {
-                                stats.total_prefill_ms += t_first.duration_since(stream_round_start).as_millis() as u64;
-                                stats.total_decode_ms += round_end.duration_since(t_first).as_millis() as u64;
+                                stats.total_prefill_ms +=
+                                    t_first.duration_since(stream_round_start).as_millis() as u64;
+                                stats.total_decode_ms +=
+                                    round_end.duration_since(t_first).as_millis() as u64;
                             }
                             None => {
-                                stats.total_prefill_ms += round_end.duration_since(stream_round_start).as_millis() as u64;
+                                stats.total_prefill_ms +=
+                                    round_end.duration_since(stream_round_start).as_millis() as u64;
                             }
                         }
                         break;
@@ -1292,15 +1568,26 @@ impl Agent {
                     last_err = attempt_error.unwrap_or("stream ended without result".into());
                     if attempt < MAX_STREAM_RETRIES - 1 {
                         let delay = std::time::Duration::from_millis(500 * (1 << attempt));
-                        tracing::warn!("Stream retry {}/{}: {} in {:?}", attempt+1, MAX_STREAM_RETRIES, last_err, delay);
+                        tracing::warn!(
+                            "Stream retry {}/{}: {} in {:?}",
+                            attempt + 1,
+                            MAX_STREAM_RETRIES,
+                            last_err,
+                            delay
+                        );
                         // The client accumulated a partial message from this
                         // attempt — tell it to discard before we re-stream.
                         if attempt_had_output {
                             emit(AgentEvent::StreamReset);
                         }
                         emit(AgentEvent::ToolEvent {
-                            name: "system".into(), status: ToolStatus::Finished,
-                            detail: format!("retry {}/{} after stream error", attempt+1, MAX_STREAM_RETRIES),
+                            name: "system".into(),
+                            status: ToolStatus::Finished,
+                            detail: format!(
+                                "retry {}/{} after stream error",
+                                attempt + 1,
+                                MAX_STREAM_RETRIES
+                            ),
                         });
                         tokio::time::sleep(delay).await;
                     }
@@ -1314,7 +1601,11 @@ impl Agent {
                             // with error turns or burn more rounds.
                             break;
                         }
-                        tracing::error!("All {} stream retries failed: {}", MAX_STREAM_RETRIES, last_err);
+                        tracing::error!(
+                            "All {} stream retries failed: {}",
+                            MAX_STREAM_RETRIES,
+                            last_err
+                        );
                         if round == MAX_TOOL_ROUNDS - 1 {
                             // Out of rounds — surface the failure instead of
                             // looping error junk back into history forever.
@@ -1326,7 +1617,8 @@ impl Agent {
                         let mut sessions = self.sessions.lock().await;
                         if let Some(s) = sessions.get_mut(&session_id) {
                             s.history.push(ChatMessage::assistant(
-                                Some(format!("(stream error: {last_err})")), None,
+                                Some(format!("(stream error: {last_err})")),
+                                None,
                             ));
                             s.history.push(ChatMessage::user(
                                 "The previous request failed due to a stream error. Try again or take a different approach."
@@ -1337,7 +1629,9 @@ impl Agent {
                 }
             };
 
-            if cancel_token.is_cancelled() { break; }
+            if cancel_token.is_cancelled() {
+                break;
+            }
 
             if let Some(u) = &result.usage {
                 stats.total_completion += u.completion_tokens;
@@ -1354,26 +1648,49 @@ impl Agent {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.history.push(ChatMessage::assistant(
-                        if result.content.is_empty() { None } else { Some(result.content.clone()) },
+                        if result.content.is_empty() {
+                            None
+                        } else {
+                            Some(result.content.clone())
+                        },
                         Some(result.tool_calls.clone()),
                     ));
                 }
             }
 
+            // Track which tool calls received results. Cancel mid-batch
+            // leaves the rest unanswered — without synthetic results the
+            // next API call 400s on dangling tool_calls and the session is
+            // permanently bricked (and the corruption persisted to the DB).
+            let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
             for tc in &result.tool_calls {
-                if cancel_token.is_cancelled() { break; }
+                if cancel_token.is_cancelled() {
+                    break;
+                }
                 let name = &tc.function.name;
                 let args_str = &tc.function.arguments;
 
-                // Stuck-loop detection
+                // Stuck-loop detection: count CONSECUTIVE identical calls
+                // at the tail of the history. Re-reading the same file
+                // after other work (a build, a test) is legitimate;
+                // hammering the exact same tool+args back-to-back with no
+                // progress is a stuck loop.
                 let signature = format!("{name}:{args_str}");
-                let repeat_count = tool_call_history.iter().filter(|s| **s == signature).count();
+                let repeat_count = tool_call_history
+                    .iter()
+                    .rev()
+                    .take_while(|s| **s == signature)
+                    .count();
                 tool_call_history.push(signature.clone());
                 if repeat_count >= STUCK_THRESHOLD {
                     tracing::warn!("Stuck loop: {name} {repeat_count}×");
                     emit(AgentEvent::ToolEvent {
-                        name: name.clone(), status: ToolStatus::Failed,
-                        detail: format!("stuck: {name} repeated {repeat_count}× — try different approach"),
+                        name: name.clone(),
+                        status: ToolStatus::Failed,
+                        detail: format!(
+                            "stuck: {name} repeated {repeat_count}× — try different approach"
+                        ),
                     });
                     let mut sessions = self.sessions.lock().await;
                     if let Some(s) = sessions.get_mut(&session_id) {
@@ -1382,21 +1699,34 @@ impl Agent {
                             format!("ERROR: {name} called {repeat_count}× with same args. Try a different approach."),
                         ));
                     }
+                    answered.insert(tc.id.as_str());
                     continue;
                 }
 
                 emit(AgentEvent::ToolEvent {
-                    name: name.clone(), status: ToolStatus::Started,
+                    name: name.clone(),
+                    status: ToolStatus::Started,
                     detail: summarize_args(args_str),
                 });
 
-                let output = self.execute_tool(session_id, name, args_str, scope.clone(), ssh, emit).await;
+                let output = self
+                    .execute_tool(
+                        session_id,
+                        name,
+                        args_str,
+                        scope.clone(),
+                        ssh,
+                        cancel_token,
+                        emit,
+                    )
+                    .await;
                 let (status, text) = match &output {
                     Ok(t) => (ToolStatus::Finished, truncate(t, MAX_TOOL_RESULT)),
                     Err(e) => (ToolStatus::Failed, truncate(e, MAX_TOOL_RESULT)),
                 };
                 emit(AgentEvent::ToolEvent {
-                    name: name.clone(), status,
+                    name: name.clone(),
+                    status,
                     detail: text.chars().take(200).collect(),
                 });
 
@@ -1404,16 +1734,36 @@ impl Agent {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.history.push(ChatMessage::tool_result(
-                        tc.id.clone(), name.clone(),
+                        tc.id.clone(),
+                        name.clone(),
                         truncate(&result_text, MAX_TOOL_RESULT),
                     ));
+                }
+                answered.insert(tc.id.as_str());
+            }
+
+            // Repair unanswered tool calls (cancel mid-batch, or a stuck-loop
+            // break) so history stays a valid tool-exchange sequence.
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    for tc in &result.tool_calls {
+                        if !answered.contains(tc.id.as_str()) {
+                            s.history.push(ChatMessage::tool_result(
+                                tc.id.clone(),
+                                tc.function.name.clone(),
+                                "ERROR: tool call skipped — request was cancelled.".to_string(),
+                            ));
+                        }
+                    }
                 }
             }
 
             if round == MAX_TOOL_ROUNDS - 1 {
-                final_content = format!(
-                    "(reached {MAX_TOOL_ROUNDS} tool rounds — summarizing)"
-                );
+                // Out of rounds — ask for a summary, then actually MAKE the
+                // call below (the old code pushed this message and exited,
+                // so the client got the literal "(reached N rounds)" string
+                // and the model never saw the request).
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.history.push(ChatMessage::user(
@@ -1423,15 +1773,98 @@ impl Agent {
             }
         }
 
+        // If rounds were exhausted without a final text response, do one
+        // last non-tool call so the model summarizes instead of the client
+        // receiving a marker string.
+        if final_content.is_empty() && !cancel_token.is_cancelled() {
+            let needs_summary = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(&session_id)
+                    .map(|s| {
+                        matches!(
+                            s.history.last(),
+                            Some(m) if m.role == "user"
+                        )
+                    })
+                    .unwrap_or(false)
+            };
+            if needs_summary {
+                let mut messages = vec![ChatMessage::system(system_prompt.to_string())];
+                {
+                    let sessions = self.sessions.lock().await;
+                    if let Some(s) = sessions.get(&session_id) {
+                        let mut start = s.history.len().saturating_sub(MAX_HISTORY);
+                        while start < s.history.len() && s.history[start].tool_call_id.is_some() {
+                            start += 1;
+                        }
+                        messages.extend(s.history[start..].iter().cloned());
+                    }
+                }
+                let req = ChatRequest {
+                    model: model.to_string(),
+                    messages,
+                    tools: None,
+                    stream: Some(true),
+                    stream_options: None,
+                    max_tokens: Some(4096),
+                    temperature: None,
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+                let litellm = self.litellm.clone();
+                let req_clone = req.clone();
+                let stream_handle = tokio::spawn(async move {
+                    litellm.chat_stream(req_clone, tx).await;
+                });
+                let mut text = String::new();
+                loop {
+                    let ev = tokio::select! {
+                        ev = rx.recv() => match ev {
+                            Some(ev) => ev,
+                            None => break,
+                        },
+                        _ = cancel_token.cancelled() => break,
+                    };
+                    match ev {
+                        StreamEvent::Delta(d) => {
+                            text.push_str(&d);
+                            emit(AgentEvent::Delta(d));
+                        }
+                        StreamEvent::Done(_) => break,
+                        StreamEvent::Error(e) => {
+                            tracing::warn!("summary call failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                stream_handle.abort();
+                if !text.trim().is_empty() {
+                    final_content = text;
+                } else {
+                    final_content = format!("(reached {MAX_TOOL_ROUNDS} tool rounds)");
+                }
+            }
+        }
+
         final_content
     }
 
     /// Build system prompt with personality, user memories, code rules, and CWD detection.
-    async fn build_system_prompt(&self, username: &str, cwd: &str, kind: SessionKind, project_context: &str) -> String {
+    async fn build_system_prompt(
+        &self,
+        username: &str,
+        cwd: &str,
+        kind: SessionKind,
+        project_context: &str,
+    ) -> String {
         let personality = self.memory.get_personality().await.unwrap_or_default();
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
-        let user_memories = self.memory.get_all_memory(username).await.unwrap_or_default();
+        let user_memories = self
+            .memory
+            .get_all_memory(username)
+            .await
+            .unwrap_or_default();
         let user_section = if user_memories.is_empty() {
             String::new()
         } else {
@@ -1491,6 +1924,10 @@ You have filesystem access, shell commands, persistent memory, web
 search/fetch, NixOS queries, arXiv, and library docs (context7). Use them when
 they help. Use `save_memory` to remember facts about the user, their
 preferences, ongoing projects, or anything worth recalling in future sessions.
+For multi-step work, maintain a task list with the `todo` tool: plan the
+steps up front, keep exactly one item in_progress while you do it, and mark
+it done before moving on. The list is visible to the user and survives
+session resume.
 {code_rules}
 {project_section}
 
@@ -1529,7 +1966,7 @@ Git conventions:
             }
         }
     }
-
+    #[allow(clippy::too_many_arguments)] // Tool dispatch needs every piece of context.
     async fn execute_tool(
         &self,
         session_id: Uuid,
@@ -1537,6 +1974,7 @@ Git conventions:
         args_json: &str,
         scope: Arc<Mutex<PermissionScope>>,
         ssh: Option<&Arc<crate::ssh::SshExecutor>>,
+        cancel_token: &CancellationToken,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String, String> {
         let args = LiteLLM::recover_tool_call(args_json)
@@ -1568,18 +2006,37 @@ Git conventions:
                 let path = args["path"].as_str().ok_or("missing path")?;
                 if let Some(ssh) = ssh {
                     let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(session_id, &resolved, AccessKind::Read, ssh, emit).await?;
+                    self.check_ssh_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::Read,
+                        ssh,
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     ssh.read_file(&resolved).await
                 } else {
                     let resolved = if std::path::Path::new(path).is_absolute() {
                         std::path::PathBuf::from(path)
                     } else {
                         let sessions = self.sessions.lock().await;
-                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        let cwd = sessions
+                            .get(&session_id)
+                            .map(|s| s.cwd.clone())
+                            .unwrap_or_else(|| ".".into());
                         drop(sessions);
                         std::path::Path::new(&cwd).join(path)
                     };
-                    self.check_perm(session_id, &resolved, AccessKind::Read, scope.clone(), emit).await?;
+                    self.check_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::Read,
+                        scope.clone(),
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1587,11 +2044,7 @@ Git conventions:
                         name: "read_file".to_string(),
                         args_json: args_json.to_string(),
                     });
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-                        Ok(Ok(result)) => Ok(result),
-                        Ok(Err(_)) => Err("tool request channel closed".into()),
-                        Err(_) => Err("tool request timed out".into()),
-                    }
+                    self.wait_tool_result(request_id, rx, cancel_token).await
                 }
             }
 
@@ -1600,18 +2053,37 @@ Git conventions:
                 let content = args["content"].as_str().ok_or("missing content")?;
                 if let Some(ssh) = ssh {
                     let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
+                    self.check_ssh_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::Write,
+                        ssh,
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     ssh.write_file(&resolved, content).await
                 } else {
                     let resolved = if std::path::Path::new(path).is_absolute() {
                         std::path::PathBuf::from(path)
                     } else {
                         let sessions = self.sessions.lock().await;
-                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        let cwd = sessions
+                            .get(&session_id)
+                            .map(|s| s.cwd.clone())
+                            .unwrap_or_else(|| ".".into());
                         drop(sessions);
                         std::path::Path::new(&cwd).join(path)
                     };
-                    self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
+                    self.check_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::Write,
+                        scope.clone(),
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1619,11 +2091,7 @@ Git conventions:
                         name: "write_file".to_string(),
                         args_json: args_json.to_string(),
                     });
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-                        Ok(Ok(result)) => Ok(result),
-                        Ok(Err(_)) => Err("tool request channel closed".into()),
-                        Err(_) => Err("tool request timed out".into()),
-                    }
+                    self.wait_tool_result(request_id, rx, cancel_token).await
                 }
             }
 
@@ -1631,18 +2099,37 @@ Git conventions:
                 let path = args["path"].as_str().unwrap_or(".");
                 if let Some(ssh) = ssh {
                     let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(session_id, &resolved, AccessKind::ReadDir, ssh, emit).await?;
+                    self.check_ssh_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::ReadDir,
+                        ssh,
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     ssh.list_dir(&resolved).await
                 } else {
                     let resolved = if std::path::Path::new(path).is_absolute() {
                         std::path::PathBuf::from(path)
                     } else {
                         let sessions = self.sessions.lock().await;
-                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        let cwd = sessions
+                            .get(&session_id)
+                            .map(|s| s.cwd.clone())
+                            .unwrap_or_else(|| ".".into());
                         drop(sessions);
                         std::path::Path::new(&cwd).join(path)
                     };
-                    self.check_perm(session_id, &resolved, AccessKind::ReadDir, scope.clone(), emit).await?;
+                    self.check_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::ReadDir,
+                        scope.clone(),
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1650,22 +2137,25 @@ Git conventions:
                         name: "list_dir".to_string(),
                         args_json: args_json.to_string(),
                     });
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-                        Ok(Ok(result)) => Ok(result),
-                        Ok(Err(_)) => Err("tool request channel closed".into()),
-                        Err(_) => Err("tool request timed out".into()),
-                    }
+                    self.wait_tool_result(request_id, rx, cancel_token).await
                 }
             }
 
             "execute_command" => {
                 let command = args["command"].as_str().ok_or("missing command")?;
                 if let Some(ssh) = ssh {
-                    // SSH sessions: Yolo is never allowed, dangerous commands always prompt
-                    if is_dangerous_command(command) {
-                        self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
-                    } else if !is_safe_command(command) {
-                        self.check_ssh_perm(session_id, command, AccessKind::Execute, ssh, emit).await?;
+                    // SSH sessions: Yolo is never allowed — dangerous and
+                    // non-safe commands always prompt.
+                    if !temple_protocol::command::is_safe_command(command) {
+                        self.check_ssh_perm(
+                            session_id,
+                            command,
+                            AccessKind::Execute,
+                            ssh,
+                            cancel_token,
+                            emit,
+                        )
+                        .await?;
                     }
                     // Run inside the session's working directory — each
                     // ssh call starts fresh in $HOME otherwise.
@@ -1681,12 +2171,11 @@ Git conventions:
                     // prompts for commands. Unsafe commands always prompt.
                     // Safe read-only commands are allowed automatically.
                     let must_check = {
-                        if is_dangerous_command(command) { true }
-                        else if !is_safe_command(command) { true }
-                        else {
+                        if !temple_protocol::command::is_safe_command(command) {
+                            true
+                        } else {
                             let sessions = self.sessions.lock().await;
-                            let mode = sessions.get(&session_id)
-                                .map(|s| s.permission_mode);
+                            let mode = sessions.get(&session_id).map(|s| s.permission_mode);
                             drop(sessions);
                             matches!(mode, Some(PermissionMode::Lockdown))
                         }
@@ -1694,7 +2183,15 @@ Git conventions:
                     if must_check {
                         // Use the command as the "path" for the prompt
                         let cmd_path = std::path::Path::new(command);
-                        self.check_perm(session_id, cmd_path, AccessKind::Execute, scope.clone(), emit).await?;
+                        self.check_perm(
+                            session_id,
+                            cmd_path,
+                            AccessKind::Execute,
+                            scope.clone(),
+                            cancel_token,
+                            emit,
+                        )
+                        .await?;
                     }
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
@@ -1703,11 +2200,7 @@ Git conventions:
                         name: "execute_command".to_string(),
                         args_json: args_json.to_string(),
                     });
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-                        Ok(Ok(result)) => Ok(result),
-                        Ok(Err(_)) => Err("tool request channel closed".into()),
-                        Err(_) => Err("tool request timed out".into()),
-                    }
+                    self.wait_tool_result(request_id, rx, cancel_token).await
                 }
             }
 
@@ -1716,11 +2209,14 @@ Git conventions:
                 let value = args["value"].as_str().ok_or("missing value")?;
                 let username = {
                     let sessions = self.sessions.lock().await;
-                    sessions.get(&session_id)
+                    sessions
+                        .get(&session_id)
                         .map(|s| s.username.clone())
                         .unwrap_or_else(|| "global".into())
                 };
-                self.memory.set_memory(key, value, &username).await
+                self.memory
+                    .set_memory(key, value, &username)
+                    .await
                     .map_err(|e| format!("save_memory: {e}"))?;
                 Ok(format!("Saved memory: {key} = {value}"))
             }
@@ -1730,16 +2226,22 @@ Git conventions:
                 let new_str = args["new_str"].as_str().unwrap_or("");
                 if let Some(ssh) = ssh {
                     let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(session_id, &resolved, AccessKind::Write, ssh, emit).await?;
+                    self.check_ssh_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::Write,
+                        ssh,
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     let content = ssh.read_file(&resolved).await?;
                     if !content.contains(old_str) {
                         return Err(format!("old_str not found in {resolved}"));
                     }
                     let count = content.matches(old_str).count();
                     if count > 1 {
-                        return Err(format!(
-                            "old_str found {count} times — must be unique"
-                        ));
+                        return Err(format!("old_str found {count} times — must be unique"));
                     }
                     let mut new_content = content.replacen(old_str, new_str, 1);
                     if content.ends_with('\n') && !new_content.ends_with('\n') {
@@ -1752,11 +2254,22 @@ Git conventions:
                         std::path::PathBuf::from(path)
                     } else {
                         let sessions = self.sessions.lock().await;
-                        let cwd = sessions.get(&session_id).map(|s| s.cwd.clone()).unwrap_or_else(|| ".".into());
+                        let cwd = sessions
+                            .get(&session_id)
+                            .map(|s| s.cwd.clone())
+                            .unwrap_or_else(|| ".".into());
                         drop(sessions);
                         std::path::Path::new(&cwd).join(path)
                     };
-                    self.check_perm(session_id, &resolved, AccessKind::Write, scope.clone(), emit).await?;
+                    self.check_perm(
+                        session_id,
+                        &resolved,
+                        AccessKind::Write,
+                        scope.clone(),
+                        cancel_token,
+                        emit,
+                    )
+                    .await?;
                     let request_id = Uuid::new_v4();
                     let rx = self.ask_tool(request_id).await;
                     emit(AgentEvent::ToolRequestNeeded {
@@ -1764,21 +2277,21 @@ Git conventions:
                         name: "edit_file".to_string(),
                         args_json: args_json.to_string(),
                     });
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-                        Ok(Ok(result)) => Ok(result),
-                        Ok(Err(_)) => Err("tool request channel closed".into()),
-                        Err(_) => Err("tool request timed out".into()),
-                    }
+                    self.wait_tool_result(request_id, rx, cancel_token).await
                 }
             }
             "recall_memory" => {
                 let username = {
                     let sessions = self.sessions.lock().await;
-                    sessions.get(&session_id)
+                    sessions
+                        .get(&session_id)
                         .map(|s| s.username.clone())
                         .unwrap_or_else(|| "global".into())
                 };
-                let memories = self.memory.get_all_memory(&username).await
+                let memories = self
+                    .memory
+                    .get_all_memory(&username)
+                    .await
                     .map_err(|e| format!("recall_memory: {e}"))?;
 
                 let key_filter = args["key"].as_str().unwrap_or("");
@@ -1786,7 +2299,8 @@ Git conventions:
                     memories
                 } else {
                     let kf = key_filter.to_lowercase();
-                    memories.into_iter()
+                    memories
+                        .into_iter()
                         .filter(|m| m.key.to_lowercase().contains(&kf))
                         .collect()
                 };
@@ -1802,6 +2316,20 @@ Git conventions:
                 Ok(out.trim_end().to_string())
             }
 
+            "todo" => {
+                let items = parse_todo_items(&args)?;
+                let rendered = render_todo_list(&items);
+                {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.todos = items.clone();
+                    }
+                }
+                emit(AgentEvent::TodoUpdated(items));
+                self.persist_session(session_id).await;
+                Ok(rendered)
+            }
+
             _ => self.mcp.call_tool(name, args).await,
         }
     }
@@ -1812,6 +2340,7 @@ Git conventions:
         path: &std::path::Path,
         access: AccessKind,
         scope: Arc<Mutex<PermissionScope>>,
+        cancel_token: &CancellationToken,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<(), String> {
         let verdict = {
@@ -1823,6 +2352,11 @@ Git conventions:
             Ok(()) => Ok(()),
             Err(needs_path) => {
                 let request_id = Uuid::new_v4();
+                // Register the oneshot BEFORE emitting — a fast client (or
+                // the Signal auto-deny path) could otherwise resolve a
+                // request that isn't in the map yet, and the reply would be
+                // silently dropped, stalling the loop for 300s.
+                let rx = self.permissions.ask(request_id).await;
                 emit(AgentEvent::PermissionNeeded(PermissionRequest {
                     request_id,
                     session_id,
@@ -1830,12 +2364,21 @@ Git conventions:
                     access,
                 }));
 
-                let rx = self.permissions.ask(request_id).await;
-                match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-                    Ok(Ok(true)) => Ok(()),
-                    Ok(Ok(false)) => Err(format!("permission denied: {}", needs_path.display())),
-                    _ => Err("permission request timed out".into()),
+                const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+                let out = tokio::select! {
+                    res = tokio::time::timeout(TIMEOUT, rx) => {
+                        match res {
+                            Ok(Ok(true)) => Ok(()),
+                            Ok(Ok(false)) => Err(format!("permission denied: {}", needs_path.display())),
+                            _ => Err("permission request timed out".to_string()),
+                        }
+                    }
+                    _ = cancel_token.cancelled() => Err("cancelled by user".to_string()),
+                };
+                if out.is_err() {
+                    self.permissions.forget(request_id).await;
                 }
+                out
             }
         }
     }
@@ -1848,6 +2391,7 @@ Git conventions:
         target: &str,
         access: AccessKind,
         ssh: &crate::ssh::SshExecutor,
+        cancel_token: &CancellationToken,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<(), String> {
         // Get the remote home dir to check against
@@ -1860,6 +2404,7 @@ Git conventions:
 
         // Not in allowed dirs — prompt the user
         let request_id = Uuid::new_v4();
+        let rx = self.permissions.ask(request_id).await;
         emit(AgentEvent::PermissionNeeded(PermissionRequest {
             request_id,
             session_id,
@@ -1867,12 +2412,21 @@ Git conventions:
             access,
         }));
 
-        let rx = self.permissions.ask(request_id).await;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => Err(format!("permission denied: {target}")),
-            _ => Err("permission request timed out".into()),
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        let out = tokio::select! {
+            res = tokio::time::timeout(TIMEOUT, rx) => {
+                match res {
+                    Ok(Ok(true)) => Ok(()),
+                    Ok(Ok(false)) => Err(format!("permission denied: {target}")),
+                    _ => Err("permission request timed out".to_string()),
+                }
+            }
+            _ = cancel_token.cancelled() => Err("cancelled by user".to_string()),
+        };
+        if out.is_err() {
+            self.permissions.forget(request_id).await;
         }
+        out
     }
 
     /// Weekly personality update: analyze recent conversations, ask the brain
@@ -2052,7 +2606,118 @@ fn local_tools() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "todo".into(),
+                description: "Maintain a task list for this session. Use it for multi-step work: plan the steps, mark one in_progress while you do it, then done. Pass the FULL list every call — it replaces the previous list. Pass an empty list to clear. The list persists across session resume and is visible to the user.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "The complete task list, replacing the previous one.",
+                            "items": {
+                                "type": "object",
+                                "required": ["content", "status"],
+                                "properties": {
+                                    "content": {"type": "string", "description": "Task description."},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                                },
+                            },
+                        },
+                    },
+                }),
+            },
+        },
     ]
+}
+
+/// Parse the todo tool's `items` argument into a validated list.
+fn parse_todo_items(args: &serde_json::Value) -> Result<Vec<temple_protocol::TodoItem>, String> {
+    let raw = args["items"].as_array().ok_or("missing items array")?;
+    let mut items = Vec::with_capacity(raw.len());
+    for (i, entry) in raw.iter().enumerate() {
+        let content = entry["content"]
+            .as_str()
+            .ok_or_else(|| format!("items[{i}]: missing content"))?;
+        if content.trim().is_empty() {
+            return Err(format!("items[{i}]: content is empty"));
+        }
+        let status = match entry["status"].as_str().unwrap_or("pending") {
+            "pending" => temple_protocol::TodoStatus::Pending,
+            "in_progress" => temple_protocol::TodoStatus::InProgress,
+            "done" => temple_protocol::TodoStatus::Done,
+            other => return Err(format!("items[{i}]: invalid status '{other}'")),
+        };
+        items.push(temple_protocol::TodoItem {
+            content: content.to_string(),
+            status,
+        });
+    }
+    Ok(items)
+}
+
+/// Render a todo list as a compact checklist for the model.
+fn render_todo_list(items: &[temple_protocol::TodoItem]) -> String {
+    if items.is_empty() {
+        return "Todo list cleared.".into();
+    }
+    let done = items
+        .iter()
+        .filter(|i| i.status == temple_protocol::TodoStatus::Done)
+        .count();
+    let mut out = format!("Todo list ({done}/{} done):\n", items.len());
+    for item in items {
+        let mark = match item.status {
+            temple_protocol::TodoStatus::Pending => "[ ]",
+            temple_protocol::TodoStatus::InProgress => "[~]",
+            temple_protocol::TodoStatus::Done => "[x]",
+        };
+        out.push_str(&format!("{mark} {}\n", item.content));
+    }
+    out.trim_end().to_string()
+}
+
+/// Repair a loaded history whose final tool-exchange is incomplete:
+/// assistant messages carrying tool_calls with no matching tool_result
+/// (a legacy cancel-mid-batch corruption). Appends synthetic error results
+/// so the API accepts the history again, and drops any trailing tool
+/// results that have no parent tool_call (orphaned by the same bug).
+fn repair_dangling_tool_calls(mut history: Vec<ChatMessage>, session_id: Uuid) -> Vec<ChatMessage> {
+    // Collect every tool_call id issued and every tool_result id answered.
+    let mut issued: Vec<(String, String)> = Vec::new(); // (id, name) in order
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &history {
+        if let Some(calls) = &m.tool_calls {
+            for tc in calls {
+                issued.push((tc.id.clone(), tc.function.name.clone()));
+            }
+        }
+        if let Some(id) = &m.tool_call_id {
+            answered.insert(id.clone());
+        }
+    }
+    let missing: Vec<(String, String)> = issued
+        .into_iter()
+        .filter(|(id, _)| !answered.contains(id))
+        .collect();
+    if missing.is_empty() {
+        return history;
+    }
+    tracing::warn!(
+        "session {session_id}: repairing {} dangling tool call(s) in loaded history",
+        missing.len()
+    );
+    for (id, name) in missing {
+        history.push(ChatMessage::tool_result(
+            id,
+            name,
+            "ERROR: tool call was interrupted — no result was recorded.".to_string(),
+        ));
+    }
+    history
 }
 
 /// Detect project type from CWD contents and return language-specific context.
@@ -2061,22 +2726,28 @@ async fn detect_project_context(cwd: &str) -> String {
     let mut detected: Vec<String> = Vec::new();
 
     // Check for Rust
-    if tokio::fs::try_exists(cwd_path.join("Cargo.toml")).await.unwrap_or(false) {
+    if tokio::fs::try_exists(cwd_path.join("Cargo.toml"))
+        .await
+        .unwrap_or(false)
+    {
         detected.push("Rust project detected (Cargo.toml found). Follow Rust conventions.".into());
     }
 
     // Check for Nix flake
-    if tokio::fs::try_exists(cwd_path.join("flake.nix")).await.unwrap_or(false) {
-        detected.push("Nix flake detected. Use nix run/nix shell/nix build. Never nix-shell.".into());
+    if tokio::fs::try_exists(cwd_path.join("flake.nix"))
+        .await
+        .unwrap_or(false)
+    {
+        detected
+            .push("Nix flake detected. Use nix run/nix shell/nix build. Never nix-shell.".into());
     }
 
     // Check for ROOT/C++
-    let has_cpp = tokio::fs::try_exists(cwd_path.join("CMakeLists.txt")).await.unwrap_or(false);
+    let has_cpp = tokio::fs::try_exists(cwd_path.join("CMakeLists.txt"))
+        .await
+        .unwrap_or(false);
     let has_cpp_ext = if !has_cpp {
-        let mut entries = match tokio::fs::read_dir(cwd_path).await {
-            Ok(e) => Some(e),
-            Err(_) => None,
-        };
+        let mut entries = tokio::fs::read_dir(cwd_path).await.ok();
         let mut found = false;
         if let Some(entries) = entries.as_mut() {
             while let Ok(Some(e)) = entries.next_entry().await {
@@ -2096,13 +2767,14 @@ async fn detect_project_context(cwd: &str) -> String {
     }
 
     // Check for Python
-    let has_py = tokio::fs::try_exists(cwd_path.join("pyproject.toml")).await.unwrap_or(false)
-        || tokio::fs::try_exists(cwd_path.join("setup.py")).await.unwrap_or(false);
+    let has_py = tokio::fs::try_exists(cwd_path.join("pyproject.toml"))
+        .await
+        .unwrap_or(false)
+        || tokio::fs::try_exists(cwd_path.join("setup.py"))
+            .await
+            .unwrap_or(false);
     let has_py_ext = if !has_py {
-        let mut entries = match tokio::fs::read_dir(cwd_path).await {
-            Ok(e) => Some(e),
-            Err(_) => None,
-        };
+        let mut entries = tokio::fs::read_dir(cwd_path).await.ok();
         let mut found = false;
         if let Some(entries) = entries.as_mut() {
             while let Ok(Some(e)) = entries.next_entry().await {
@@ -2189,72 +2861,4 @@ fn format_code_rules(project_section: &str) -> String {
     } else {
         format!("\n{}", rules.join("\n\n"))
     }
-}
-
-/// Read-only commands that are safe to run without prompting.
-/// Interpreters (python etc.) are NOT here — they run arbitrary code.
-const SAFE_COMMANDS: &[&str] = &[
-    "ls", "cat", "head", "tail", "grep", "rg", "find", "fd", "tree",
-    "pwd", "whoami", "hostname", "uname", "date", "uptime",
-    "wc", "sort", "uniq", "diff", "cmp", "file", "stat", "du", "df",
-    "git", "cargo", "rustc", "nix", "nixos-version",
-    "echo", "printf", "which", "type", "env", "printenv",
-    "test", "true", "false",
-    "head", "less", "more",
-    "man", "info",
-    "ps", "top", "htop", "free", "lspci", "lsusb", "lsblk",
-];
-
-/// Patterns that indicate a dangerous command — always prompt.
-const DANGEROUS_PATTERNS: &[&str] = &[
-    "rm -rf", "rm -fr", "rm -r /", "rm -rf /",
-    "mkfs", "dd if=", "dd of=/dev/",
-    "shutdown", "reboot", "halt", "poweroff",
-    ":(){", "fork bomb",
-    "> /dev/sd", "> /dev/nvme", "> /dev/mmc",
-    "chmod -R 777", "chmod 777",
-    "systemctl stop", "systemctl disable",
-    "kill -9", "killall",
-    "pkill", "kill -KILL",
-    "iptables -F", "ip6tables -F",
-    "mount", "umount",
-    "fdisk", "parted", "wipefs",
-    "shred", "scrub",
-    "git push --force", "git push -f",
-    "nix-collect-garbage -d",
-    "chmod", "chown",
-    "visudo",
-    "passwd",
-    "useradd", "userdel", "usermod",
-    "groupadd", "groupdel",
-];
-
-/// Returns true if the command is safe to run without a permission prompt.
-/// Every pipeline/chain segment must start with a safe command — checking
-/// only the first word lets `ls && rm -r ~` or `cat x | sh` through.
-/// Redirection, substitution, and multi-line commands always prompt.
-fn is_safe_command(command: &str) -> bool {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed.contains(['>', '<', '`', '\n'])
-        || trimmed.contains("$(")
-        || trimmed.contains("${")
-    {
-        return false;
-    }
-    let segments: Vec<&str> = trimmed
-        .split(['|', ';', '&'])
-        .filter_map(|seg| seg.trim().split_whitespace().next())
-        .filter(|first| !first.is_empty())
-        .collect();
-    !segments.is_empty() && segments.iter().all(|first| SAFE_COMMANDS.contains(first))
-}
-
-/// Returns true if the command matches a dangerous pattern and should
-/// always prompt, even in Yolo mode.
-fn is_dangerous_command(command: &str) -> bool {
-    let lower = command.to_lowercase();
-    DANGEROUS_PATTERNS.iter().any(|&pat| lower.contains(pat))
 }

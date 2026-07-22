@@ -78,7 +78,11 @@ impl ChatMessage {
         }
     }
 
-    pub fn tool_result(tool_call_id: impl Into<String>, name: impl Into<String>, content: String) -> Self {
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: String,
+    ) -> Self {
         Self {
             role: "tool".into(),
             content: Some(MessageContent::Text(content)),
@@ -164,6 +168,7 @@ pub struct ChatResponse {
 pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
+    #[allow(dead_code)] // Kept on the wire result for diagnostics.
     pub finish_reason: Option<String>,
 }
 
@@ -181,6 +186,7 @@ pub struct StreamResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
+    #[allow(dead_code)] // Kept on the wire result for diagnostics.
     pub finish_reason: Option<String>,
 }
 
@@ -273,7 +279,10 @@ impl LiteLLM {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("litellm {status}: {}", body.chars().take(500).collect::<String>()));
+            return Err(format!(
+                "litellm {status}: {}",
+                body.chars().take(500).collect::<String>()
+            ));
         }
         resp.json::<ChatResponse>()
             .await
@@ -288,7 +297,9 @@ impl LiteLLM {
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) {
         req.stream = Some(true);
-        req.stream_options = Some(StreamOptions { include_usage: true });
+        req.stream_options = Some(StreamOptions {
+            include_usage: true,
+        });
 
         let result = self.stream_inner(req, tx.clone()).await;
         if let Err(e) = result {
@@ -315,7 +326,10 @@ impl LiteLLM {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("litellm {status}: {}", body.chars().take(500).collect::<String>()));
+            return Err(format!(
+                "litellm {status}: {}",
+                body.chars().take(500).collect::<String>()
+            ));
         }
 
         let mut content = String::new();
@@ -324,6 +338,12 @@ impl LiteLLM {
         // tool call accumulators: index -> (id, name, args)
         let mut tool_accum: std::collections::BTreeMap<usize, (String, String, String)> =
             std::collections::BTreeMap::new();
+        // Completion markers: a healthy stream ends with data: [DONE] (and
+        // a finish_reason in the final chunk). Without one of these, a
+        // clean TCP close (proxy restart, crashed backend) is
+        // indistinguishable from a complete response — we'd ship truncated
+        // content as final. Track both; error out if neither arrives.
+        let mut saw_done_marker = false;
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
@@ -337,20 +357,34 @@ impl LiteLLM {
             let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
                 Ok(Some(chunk)) => chunk.map_err(|e| format!("stream read: {e}"))?,
                 Ok(None) => break,
-                Err(_) => return Err(format!(
-                    "stream idle for {}s — backend hung",
-                    IDLE_TIMEOUT.as_secs()
-                )),
+                Err(_) => {
+                    return Err(format!(
+                        "stream idle for {}s — backend hung",
+                        IDLE_TIMEOUT.as_secs()
+                    ))
+                }
             };
             let bytes = chunk;
             buffer.extend_from_slice(&bytes);
 
-            // Process complete SSE events (separated by \n\n). Split on raw
-            // bytes — decoding each chunk with from_utf8_lossy corrupts
-            // multi-byte UTF-8 that straddles a chunk boundary (which also
-            // breaks tool-call argument JSON).
-            while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
-                let event_bytes: Vec<u8> = buffer.drain(..end + 2).collect();
+            // Process complete SSE events (separated by \n\n, or \r\n\r\n
+            // for CRLF-framed proxies). Split on raw bytes — decoding each
+            // chunk with from_utf8_lossy corrupts multi-byte UTF-8 that
+            // straddles a chunk boundary (which also breaks tool-call
+            // argument JSON).
+            loop {
+                let end = buffer
+                    .windows(2)
+                    .position(|w| w == b"\n\n")
+                    .map(|p| (p, 2usize))
+                    .or_else(|| {
+                        buffer
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| (p, 4usize))
+                    });
+                let Some((pos, sep_len)) = end else { break };
+                let event_bytes: Vec<u8> = buffer.drain(..pos + sep_len).collect();
                 let event_text = String::from_utf8_lossy(&event_bytes);
 
                 for line in event_text.lines() {
@@ -359,6 +393,7 @@ impl LiteLLM {
                     };
                     let data = data.trim();
                     if data == "[DONE]" {
+                        saw_done_marker = true;
                         continue;
                     }
                     let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) else {
@@ -382,9 +417,9 @@ impl LiteLLM {
                         if let Some(tcs) = choice.delta.tool_calls {
                             for tc in tcs {
                                 let idx = tc.index.unwrap_or(0);
-                                let entry = tool_accum
-                                    .entry(idx)
-                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                let entry = tool_accum.entry(idx).or_insert_with(|| {
+                                    (String::new(), String::new(), String::new())
+                                });
                                 if let Some(id) = tc.id {
                                     entry.0 = id;
                                 }
@@ -401,6 +436,17 @@ impl LiteLLM {
                     }
                 }
             }
+        }
+
+        // A stream that ends with no completion marker was truncated —
+        // treat it as an error so the retry loop regenerates instead of
+        // shipping partial content as final.
+        if !saw_done_marker && finish_reason.is_none() {
+            return Err(format!(
+                "stream ended without [DONE]/finish_reason (truncated — {} bytes of content, {} tool call(s) accumulated)",
+                content.len(),
+                tool_accum.len()
+            ));
         }
 
         let tool_calls: Vec<ToolCall> = tool_accum

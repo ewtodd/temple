@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod command;
+
 // ── Session & Connection ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,8 +28,10 @@ pub struct SessionInfo {
 // ── Permissions ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum PermissionMode {
     /// Unrestricted access to CWD
+    #[default]
     Default,
     /// Always prompts for dirs outside CWD
     Ask,
@@ -36,6 +40,7 @@ pub enum PermissionMode {
     /// Full system access, no prompts
     Yolo,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRequest {
@@ -68,7 +73,9 @@ pub struct PermissionResponse {
 #[serde(tag = "type")]
 pub enum ClientMessage {
     OpenSession(SessionOpen),
-    CloseSession { session_id: Uuid },
+    CloseSession {
+        session_id: Uuid,
+    },
     ChatInput {
         session_id: Uuid,
         content: String,
@@ -79,13 +86,18 @@ pub enum ClientMessage {
         granted: bool,
     },
     ListModels,
-    SetModel { session_id: Uuid, model: String },
+    SetModel {
+        session_id: Uuid,
+        model: String,
+    },
     SetPermissionMode {
         session_id: Uuid,
         mode: PermissionMode,
     },
     /// Cancel an in-progress agent loop for this session
-    CancelChat { session_id: Uuid },
+    CancelChat {
+        session_id: Uuid,
+    },
     /// Result of a tool execution requested by the server
     ToolResult {
         request_id: Uuid,
@@ -95,14 +107,22 @@ pub enum ClientMessage {
     /// List persisted sessions for the authenticated user
     ListSessions,
     /// Resume a persisted session (loads history + SSH target)
-    ResumeSession { session_id: Uuid },
+    ResumeSession {
+        session_id: Uuid,
+    },
     /// Create a new session, optionally bound to an SSH target
     /// (e.g. "e-work@e-desktop"). No target = local/quick session.
-    NewSession { ssh_target: Option<String> },
+    NewSession {
+        ssh_target: Option<String>,
+    },
     /// Delete a persisted session by id or index from the last listing
-    DeleteSession { session_id: Uuid },
+    DeleteSession {
+        session_id: Uuid,
+    },
     /// Clear all sessions for a specific account (e.g. "e-play")
-    ClearSessions { account: String },
+    ClearSessions {
+        account: String,
+    },
     Ping,
 }
 
@@ -113,7 +133,9 @@ pub enum ServerMessage {
         session_id: Uuid,
         info: SessionInfo,
     },
-    SessionClosed { session_id: Uuid },
+    SessionClosed {
+        session_id: Uuid,
+    },
     /// Streaming content delta from the model
     ChatDelta {
         session_id: Uuid,
@@ -146,11 +168,15 @@ pub enum ServerMessage {
     },
     Pong,
     /// Agent loop was cancelled by the user
-    ChatCancelled { session_id: Uuid },
+    ChatCancelled {
+        session_id: Uuid,
+    },
     /// The in-progress assistant message is being regenerated after a stream
     /// error — the client should drop the partial assistant entry; the
     /// deltas that follow rebuild it from scratch.
-    ChatReset { session_id: Uuid },
+    ChatReset {
+        session_id: Uuid,
+    },
     /// Server is shutting down
     Shutdown,
     /// Persisted sessions for the authenticated user
@@ -180,6 +206,11 @@ pub enum ServerMessage {
         request_id: Uuid,
         session_id: Uuid,
         result: String, // Ok result or "Error: ..." prefix
+    },
+    /// The agent's todo list for this session changed (full replacement).
+    TodoUpdate {
+        session_id: Uuid,
+        items: Vec<TodoItem>,
     },
     /// Chat statistics (sent after final delta)
     ChatStats {
@@ -214,6 +245,22 @@ pub enum ToolStatus {
     Started,
     Finished,
     Failed,
+}
+
+// ── Todo list (coding-session task tracking) ──────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
 }
 
 // ── Model info ────────────────────────────────────────────────────────

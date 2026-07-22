@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
-use clap_complete::{self, Generator, Shell};
-use iocraft::prelude::*;
+use clap_complete::{self, Shell};
 use crossterm::event::MouseButton;
+use iocraft::prelude::*;
 use temple_protocol::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
@@ -52,16 +52,52 @@ impl Cli {
 
 // ── Chat entries ──
 
+/// A pending y/N prompt. Two kinds: server-side permission requests
+/// (reply goes back over the wire) and client-side tool consent (the
+/// server asked us to run something dangerous locally — the reply
+/// executes or denies it right here).
+#[derive(Debug, Clone)]
+enum PromptKind {
+    /// Server asked permission for a path/command — y/N goes to the server.
+    Server { request_id: Uuid, session_id: Uuid },
+    /// Server asked the CLIENT to execute something risky — y executes it
+    /// locally and returns the ToolResult; N denies it.
+    Local {
+        request_id: Uuid,
+        session_id: Uuid,
+        name: String,
+        args_json: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PromptState {
+    text: String,
+    at: std::time::Instant,
+    kind: PromptKind,
+}
+
 #[derive(Debug, Clone)]
 enum ChatEntry {
     /// User message
     User(String),
     /// Assistant message (streams in), with optional stats footer
-    Assistant { content: String, stats: Option<String> },
+    Assistant {
+        content: String,
+        stats: Option<String>,
+    },
     /// System/info line
     System(String),
     /// Tool activity
-    Tool { name: String, status: ToolStatus, detail: String },
+    Tool {
+        name: String,
+        status: ToolStatus,
+        detail: String,
+    },
+    /// Session task list (replaced in place on each update)
+    Todo {
+        items: Vec<temple_protocol::TodoItem>,
+    },
 }
 
 #[derive(Default)]
@@ -71,7 +107,7 @@ struct AppState {
     status: String,
     model: String,
     prompt: String,
-    permission: Option<(Uuid, Uuid, String, std::time::Instant)>,
+    permission: Option<PromptState>,
     running: bool,
     editor_pending: bool,
     /// Working directory for local tool execution
@@ -100,14 +136,21 @@ struct AppState {
     work_started: Option<std::time::Instant>,
     /// total display lines at last render (scroll anchoring)
     last_total: usize,
+    /// Current permission mode (from server), shown in the status bar and
+    /// cycled with Shift+Tab.
+    mode: PermissionMode,
 }
 
 // ── Background WebSocket thread ──
 
+#[allow(clippy::too_many_arguments)] // Connection setup needs each of these.
 fn spawn_ws(
-    server: String, cwd: String, client_id: String,
+    server: String,
+    cwd: String,
+    client_id: String,
     token: Option<String>,
     do_continue: bool,
+    force_tls: bool,
     state: Arc<Mutex<AppState>>,
     ui_cmd: mpsc::Receiver<ClientMessage>,
 ) {
@@ -120,10 +163,10 @@ fn spawn_ws(
                     .unwrap_or_else(|_| std::path::PathBuf::from(&cwd))
                     .to_string_lossy()
                     .into(),
-                hostname: whoami::hostname(),
+                hostname: whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()),
                 username: whoami::username(),
             };
-            let (mut conn, _) = match client::connect(&server, &token, sess).await {
+            let (mut conn, _) = match client::connect(&server, &token, sess, force_tls).await {
                 Ok(c) => c,
                 Err(e) => {
                     let mut s = state.lock().unwrap();
@@ -146,111 +189,75 @@ fn spawn_ws(
                     // Handle ToolRequest outside the lock to avoid holding
                     // std::sync::MutexGuard (which is !Send) across .await
                     if let ServerMessage::ToolRequest { request_id, session_id, ref name, ref args_json } = msg {
-                        let cwd = { s.lock().unwrap().cwd.clone() };
-                        let tx_result = tx_session.clone();
+                        // Session binding: ignore tool requests for sessions
+                        // other than the active one — a misbehaving server
+                        // must not drive tools through a stale channel.
+                        let (cwd, active_sid) = {
+                            let g = s.lock().unwrap();
+                            (g.cwd.clone(), g.session_id)
+                        };
+                        if session_id != active_sid {
+                            let _ = tx_session.send(ClientMessage::ToolResult {
+                                request_id, session_id,
+                                result: "Error: tool request for inactive session".into(),
+                            });
+                            continue;
+                        }
+
+                        // ── Client-side consent gate ──
+                        // The server's permission system gates server-side
+                        // operations; this gate is the last line of defense
+                        // for THIS machine. Reads are always allowed (low
+                        // risk, and the server gates them anyway). Writes
+                        // outside the sandbox root and non-safe commands get
+                        // a local y/N prompt regardless of the server's mode.
                         let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
-                        let result = match name.as_str() {
-                            "read_file" => {
+                        let needs_consent = match name.as_str() {
+                            "write_file" | "edit_file" => {
                                 let path = args["path"].as_str().unwrap_or("");
                                 match resolve_tool_path(path, &cwd) {
-                                    Err(e) => format!("Error: {e}"),
-                                    Ok(resolved) => match tokio::fs::read_to_string(&resolved).await {
-                                        Ok(content) => format!("{content}\n[read {path}]"),
-                                        Err(e) => format!("Error: {e}"),
-                                    },
-                                }
-                            }
-                            "write_file" => {
-                                let path = args["path"].as_str().unwrap_or("");
-                                let content = args["content"].as_str().unwrap_or("");
-                                match resolve_tool_path(path, &cwd) {
-                                    Err(e) => format!("Error: {e}"),
-                                    Ok(resolved) => {
-                                        if let Some(parent) = resolved.parent() {
-                                            tokio::fs::create_dir_all(parent).await.ok();
-                                        }
-                                        match tokio::fs::write(&resolved, content).await {
-                                            Ok(()) => format!("wrote {} ({} bytes)", resolved.display(), content.len()),
-                                            Err(e) => format!("Error: {e}"),
-                                        }
-                                    },
-                                }
-                            }
-                            "list_dir" => {
-                                let path = args["path"].as_str().unwrap_or(".");
-                                match resolve_tool_path(path, &cwd) {
-                                    Err(e) => format!("Error: {e}"),
-                                    Ok(resolved) => match tokio::fs::read_dir(&resolved).await {
-                                        Err(e) => format!("Error: {e}"),
-                                        Ok(mut entries) => {
-                                            let mut out = Vec::new();
-                                            while let Ok(Some(e)) = entries.next_entry().await {
-                                                let name = e.file_name().to_string_lossy().to_string();
-                                                let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                                                out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
-                                            }
-                                            out.join("\n")
-                                        }
-                                    },
+                                    Ok(resolved) => !resolved.starts_with(&cwd),
+                                    Err(_) => true,
                                 }
                             }
                             "execute_command" => {
                                 let command = args["command"].as_str().unwrap_or("");
-                                match tokio::process::Command::new("sh")
-                                    .arg("-c")
-                                    .arg(command)
-                                    .current_dir(&cwd)
-                                    .output()
-                                    .await
-                                {
-                                    Err(e) => format!("Error: {}", e),
-                                    Ok(output) => {
-                                        let stdout = String::from_utf8_lossy(&output.stdout);
-                                        let stderr = String::from_utf8_lossy(&output.stderr);
-                                        let mut out = String::new();
-                                        if !stdout.is_empty() { out.push_str(&stdout); }
-                                        if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{}", stderr)); }
-                                        if !output.status.success() {
-                                            out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
-                                        }
-                                        if out.is_empty() { out.push_str("(no output)"); }
-                                        out
-                                    }
-                                }
+                                !temple_protocol::command::is_safe_command(command)
                             }
-                            "edit_file" => {
-                                let path = args["path"].as_str().unwrap_or("");
-                                let old_str = args["old_str"].as_str().unwrap_or("");
-                                let new_str = args["new_str"].as_str().unwrap_or("");
-                                match resolve_tool_path(path, &cwd) {
-                                    Err(e) => format!("Error: {e}"),
-                                    Ok(resolved) => match tokio::fs::read_to_string(&resolved).await {
-                                        Err(e) => format!("Error: {e}"),
-                                        Ok(content) => {
-                                            if !content.contains(old_str) {
-                                                format!("Error: old_str not found in {}", resolved.display())
-                                            } else {
-                                                let count = content.matches(old_str).count();
-                                                if count > 1 {
-                                                    format!("Error: old_str found {count} times — must be unique")
-                                                } else {
-                                                    let mut n = content.replacen(old_str, new_str, 1);
-                                                    if content.ends_with('\n') && !n.ends_with('\n') {
-                                                        n.push('\n');
-                                                    }
-                                                    match tokio::fs::write(&resolved, &n).await {
-                                                        Err(e) => format!("Error: {e}"),
-                                                        Ok(()) => format!("edited {} (replaced 1 occurrence)", resolved.display()),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    },
-                                }
-                            }
-                            _ => format!("Error: unknown tool {}", name),
+                            _ => false,
                         };
-                        let _ = tx_result.send(ClientMessage::ToolResult { request_id, session_id, result });
+
+                        if needs_consent {
+                            let text = match name.as_str() {
+                                "execute_command" => format!("run: {}", args["command"].as_str().unwrap_or("")),
+                                _ => format!("{}: {}", name, args["path"].as_str().unwrap_or("")),
+                            };
+                            let mut g = s.lock().unwrap();
+                            // One local prompt at a time — deny the newcomer
+                            // rather than silently dropping the older one.
+                            if g.permission.is_some() {
+                                let _ = tx_session.send(ClientMessage::ToolResult {
+                                    request_id, session_id,
+                                    result: format!("Error: {name} denied — another prompt is pending"),
+                                });
+                                continue;
+                            }
+                            g.permission = Some(PromptState {
+                                text,
+                                at: std::time::Instant::now(),
+                                kind: PromptKind::Local {
+                                    request_id,
+                                    session_id,
+                                    name: name.clone(),
+                                    args_json: args_json.clone(),
+                                },
+                            });
+                            g.status = "permission? (y/N)".into();
+                            continue;
+                        }
+
+                        let result = execute_local_tool(name, args_json, &cwd).await;
+                        let _ = tx_session.send(ClientMessage::ToolResult { request_id, session_id, result });
                         continue;
                     }
 
@@ -258,7 +265,12 @@ fn spawn_ws(
                     match msg {
                         ServerMessage::SessionOpened { session_id, info } => {
                             s.session_id = session_id;
-                            s.cwd = info.cwd.clone();
+                            // NOTE: deliberately NOT trusting info.cwd as the
+                            // tool sandbox root — the client confines tools to
+                            // its own startup directory (s.cwd, set once at
+                            // launch). A server-supplied root would let a
+                            // compromised server authorize writes anywhere.
+                            s.mode = info.permissions;
                             s.entries.push(ChatEntry::System(format!(
                                 "session on {}", info.hostname
                             )));
@@ -375,20 +387,41 @@ fn spawn_ws(
                         }
                         ServerMessage::PermissionRequired(r) => {
                             if r.session_id != s.session_id { continue; }
-                            s.permission = Some((
-                                r.request_id,
-                                r.session_id,
-                                r.path,
-                                std::time::Instant::now(),
-                            ));
+                            s.permission = Some(PromptState {
+                                text: r.path.clone(),
+                                at: std::time::Instant::now(),
+                                kind: PromptKind::Server {
+                                    request_id: r.request_id,
+                                    session_id: r.session_id,
+                                },
+                            });
                             s.status = "permission? (y/N)".into();
                         }
                         ServerMessage::PermissionResult(_) => {
                             s.permission = None;
                             s.status = "ready".into();
                         }
-                        ServerMessage::ModeChanged { mode, .. } => {
-                            s.entries.push(ChatEntry::System(format!("mode → {mode:?}")));
+                        ServerMessage::ModeChanged { session_id, mode } => {
+                            if session_id != s.session_id { continue; }
+                            s.mode = mode;
+                            s.entries.push(ChatEntry::System(format!("mode → {}", mode_tag(mode))));
+                        }
+                        ServerMessage::TodoUpdate { session_id, items } => {
+                            if session_id != s.session_id { continue; }
+                            if items.is_empty() {
+                                // List cleared — drop the panel entirely.
+                                s.entries.retain(|e| !matches!(e, ChatEntry::Todo { .. }));
+                                continue;
+                            }
+                            // Replace the most recent todo panel in place so
+                            // the list doesn't spam one block per update.
+                            if let Some(ChatEntry::Todo { items: existing }) =
+                                s.entries.iter_mut().rev().find(|e| matches!(e, ChatEntry::Todo { .. }))
+                            {
+                                *existing = items;
+                            } else {
+                                s.entries.push(ChatEntry::Todo { items });
+                            }
                         }
                         ServerMessage::Shutdown => {
                             s.working = false;
@@ -447,13 +480,24 @@ fn spawn_ws(
                                 s.entries.push(ChatEntry::System(format!(
                                     "sessions ({}):", sessions.len()
                                 )));
+                                // Aligned columns: id8 · target · title —
+                                // target width is fixed so titles line up.
+                                let target_w = sessions.iter()
+                                    .map(|m| m.ssh_target.as_deref().unwrap_or("quick").chars().count())
+                                    .max()
+                                    .unwrap_or(5)
+                                    .min(20);
                                 for (i, m) in sessions.iter().enumerate() {
                                     let id8: String = m.id.simple().to_string()
                                         .chars().take(8).collect();
                                     let target = m.ssh_target.as_deref().unwrap_or("quick");
                                     let title = m.title.as_deref().unwrap_or("(untitled)");
+                                    let target_padded = format!(
+                                        "{target:<width$}",
+                                        width = target_w
+                                    );
                                     s.entries.push(ChatEntry::System(format!(
-                                        "  [{i}] {id8} · {target} · {title}"
+                                        "  [{i}] {id8} · {target_padded} · {title}"
                                     )));
                                 }
                                 s.entries.push(ChatEntry::System(
@@ -466,6 +510,12 @@ fn spawn_ws(
                             s.session_id = session_id;
                             s.working = false;
                             s.work_started = None;
+                            s.mode = match meta.mode.as_str() {
+                                "ask" => PermissionMode::Ask,
+                                "lockdown" => PermissionMode::Lockdown,
+                                "yolo" => PermissionMode::Yolo,
+                                _ => PermissionMode::Default,
+                            };
                             // Restore input history so ↑ recalls prompts
                             // typed in the resumed session.
                             s.input_history = transcript.iter()
@@ -571,8 +621,16 @@ fn extract_selection(lines: &[String], sel: ((usize, usize), (usize, usize))) ->
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate().take(el + 1).skip(sl) {
         let chars: Vec<char> = line.chars().collect();
-        let from = if i == sl { display_col_to_char_idx(line, sc).min(chars.len()) } else { 0 };
-        let to = if i == el { display_col_to_char_idx(line, ec).min(chars.len()) } else { chars.len() };
+        let from = if i == sl {
+            display_col_to_char_idx(line, sc).min(chars.len())
+        } else {
+            0
+        };
+        let to = if i == el {
+            display_col_to_char_idx(line, ec).min(chars.len())
+        } else {
+            chars.len()
+        };
         if to > from {
             out.push_str(&chars[from..to].iter().collect::<String>());
         }
@@ -606,6 +664,17 @@ fn osc52_copy(text: &str) {
 /// until an existing parent dir is found, canonicalizes that, then
 /// re-joins the tail — the resolved path is always under cwd or /tmp.
 fn resolve_tool_path(path: &str, cwd: &str) -> Result<std::path::PathBuf, String> {
+    resolve_tool_path_for(path, cwd, false)
+}
+
+/// `for_write` tightens the sandbox: /tmp is allowed for reads but never
+/// for writes — world-writable shared dirs are too easy to abuse (clobber
+/// another process's socket, drop a file a cron job executes).
+fn resolve_tool_path_for(
+    path: &str,
+    cwd: &str,
+    for_write: bool,
+) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(path);
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -639,19 +708,172 @@ fn resolve_tool_path(path: &str, cwd: &str) -> Result<std::path::PathBuf, String
         }
     }
 
-    let canonical_base = std::fs::canonicalize(&candidate)
-        .map_err(|e| format!("cannot resolve {abs:?}: {e}"))?;
+    let canonical_base =
+        std::fs::canonicalize(&candidate).map_err(|e| format!("cannot resolve {abs:?}: {e}"))?;
     let resolved = canonical_base.join(&suffix);
-    let cwd_canon =
-        std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
 
-    if resolved.starts_with(&cwd_canon) || resolved.starts_with("/tmp") {
+    if resolved.starts_with(&cwd_canon) || (!for_write && resolved.starts_with("/tmp")) {
         Ok(resolved)
     } else {
         Err(format!(
             "{path:?} escapes working directory ({})",
             cwd_canon.display()
         ))
+    }
+}
+
+/// Max bytes read from a file (protects the client from OOM on huge
+/// files — the server truncates further anyway).
+const MAX_READ_BYTES: usize = 1 << 20; // 1 MiB
+/// Max bytes captured per stream from a command.
+const MAX_CMD_OUTPUT: usize = 256 << 10; // 256 KiB
+/// Client-side command timeout — a hung command must never wedge the
+/// reader loop. The server caps at 120s for SSH; match that here.
+const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Execute a server-requested tool against the local filesystem, confined
+/// to `cwd`. Consent for risky operations is handled by the caller (the
+/// ToolRequest handler) — this function assumes the operation is allowed.
+async fn execute_local_tool(name: &str, args_json: &str, cwd: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+    match name {
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            match resolve_tool_path(path, cwd) {
+                Err(e) => format!("Error: {e}"),
+                Ok(resolved) => match tokio::fs::File::open(&resolved).await {
+                    Err(e) => format!("Error: {e}"),
+                    Ok(f) => {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = Vec::with_capacity(8192);
+                        let mut capped = f.take(MAX_READ_BYTES as u64 + 1);
+                        match capped.read_to_end(&mut buf).await {
+                            Err(e) => format!("Error: {e}"),
+                            Ok(_) => {
+                                let truncated = buf.len() as u64 > MAX_READ_BYTES as u64;
+                                buf.truncate(MAX_READ_BYTES);
+                                let mut out = String::from_utf8_lossy(&buf).to_string();
+                                if truncated {
+                                    out.push_str("\n[truncated at 1 MiB]");
+                                }
+                                out.push_str(&format!("\n[read {path}]"));
+                                out
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        "write_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let content = args["content"].as_str().unwrap_or("");
+            match resolve_tool_path_for(path, cwd, true) {
+                Err(e) => format!("Error: {e}"),
+                Ok(resolved) => {
+                    if let Some(parent) = resolved.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+                    match tokio::fs::write(&resolved, content).await {
+                        Ok(()) => format!("wrote {} ({} bytes)", resolved.display(), content.len()),
+                        Err(e) => format!("Error: {e}"),
+                    }
+                }
+            }
+        }
+        "list_dir" => {
+            let path = args["path"].as_str().unwrap_or(".");
+            match resolve_tool_path(path, cwd) {
+                Err(e) => format!("Error: {e}"),
+                Ok(resolved) => match tokio::fs::read_dir(&resolved).await {
+                    Err(e) => format!("Error: {e}"),
+                    Ok(mut entries) => {
+                        let mut out = Vec::new();
+                        while let Ok(Some(e)) = entries.next_entry().await {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                            out.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                        }
+                        out.join("\n")
+                    }
+                },
+            }
+        }
+        "execute_command" => {
+            let command = args["command"].as_str().unwrap_or("");
+            let child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(cwd)
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(CMD_TIMEOUT, child).await {
+                Err(_) => format!("Error: command timed out after {}s", CMD_TIMEOUT.as_secs()),
+                Ok(Err(e)) => format!("Error: {e}"),
+                Ok(Ok(output)) => {
+                    let cap = |bytes: &[u8]| -> String {
+                        if bytes.len() > MAX_CMD_OUTPUT {
+                            let mut s =
+                                String::from_utf8_lossy(&bytes[..MAX_CMD_OUTPUT]).to_string();
+                            s.push_str("\n[truncated]");
+                            s
+                        } else {
+                            String::from_utf8_lossy(bytes).to_string()
+                        }
+                    };
+                    let stdout = cap(&output.stdout);
+                    let stderr = cap(&output.stderr);
+                    let mut out = String::new();
+                    if !stdout.is_empty() {
+                        out.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        out.push_str(&format!("\n[stderr]\n{stderr}"));
+                    }
+                    if !output.status.success() {
+                        out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+                    }
+                    if out.is_empty() {
+                        out.push_str("(no output)");
+                    }
+                    out
+                }
+            }
+        }
+        "edit_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let old_str = args["old_str"].as_str().unwrap_or("");
+            let new_str = args["new_str"].as_str().unwrap_or("");
+            match resolve_tool_path_for(path, cwd, true) {
+                Err(e) => format!("Error: {e}"),
+                Ok(resolved) => match tokio::fs::read_to_string(&resolved).await {
+                    Err(e) => format!("Error: {e}"),
+                    Ok(content) => {
+                        if !content.contains(old_str) {
+                            format!("Error: old_str not found in {}", resolved.display())
+                        } else {
+                            let count = content.matches(old_str).count();
+                            if count > 1 {
+                                format!("Error: old_str found {count} times — must be unique")
+                            } else {
+                                let mut n = content.replacen(old_str, new_str, 1);
+                                if content.ends_with('\n') && !n.ends_with('\n') {
+                                    n.push('\n');
+                                }
+                                match tokio::fs::write(&resolved, &n).await {
+                                    Err(e) => format!("Error: {e}"),
+                                    Ok(()) => format!(
+                                        "edited {} (replaced 1 occurrence)",
+                                        resolved.display()
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        _ => format!("Error: unknown tool {name}"),
     }
 }
 
@@ -745,6 +967,27 @@ enum LineKind {
     Stats,
 }
 
+/// Short text tag for the permission mode, used in the status bar and
+/// /mode feedback. Matches the Signal bot's preamble tag.
+fn mode_tag(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::Ask => "ask",
+        PermissionMode::Lockdown => "lockdown",
+        PermissionMode::Yolo => "YOLO",
+    }
+}
+
+/// Cycle order for Shift+Tab.
+fn next_mode(mode: PermissionMode) -> PermissionMode {
+    match mode {
+        PermissionMode::Default => PermissionMode::Ask,
+        PermissionMode::Ask => PermissionMode::Lockdown,
+        PermissionMode::Lockdown => PermissionMode::Yolo,
+        PermissionMode::Yolo => PermissionMode::Default,
+    }
+}
+
 /// Render an assistant message body into display lines:
 /// - wraps long lines to `width`
 /// - ``` fenced blocks become indented code lines
@@ -769,13 +1012,19 @@ fn render_markdown_lite(content: &str, width: usize) -> Vec<StyledLine> {
         } else {
             // normal text: word-wrap
             for chunk in wrap_text(raw_line, width.max(10)) {
-                out.push(StyledLine { text: chunk, kind: LineKind::Normal });
+                out.push(StyledLine {
+                    text: chunk,
+                    kind: LineKind::Normal,
+                });
             }
         }
     }
 
     if out.is_empty() {
-        out.push(StyledLine { text: String::new(), kind: LineKind::Normal });
+        out.push(StyledLine {
+            text: String::new(),
+            kind: LineKind::Normal,
+        });
     }
     out
 }
@@ -863,7 +1112,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let mut system = hooks.use_context_mut::<SystemContext>();
 
     // Periodic re-render for streaming updates
-    let mut tick = hooks.use_state(|| 0u64);
+    let tick = hooks.use_state(|| 0u64);
     hooks.use_future({
         let mut t = tick;
         async move {
@@ -894,7 +1143,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         match event {
             TerminalEvent::FullscreenMouse(m) => {
                 let mut s = state_h.lock().unwrap();
-                let chat_top = 1usize + if s.entries.len() < 3 { TEMPLE_ART.lines().count() } else { 0 };
+                let chat_top = 1usize + if s.entries.len() < 3 { TEMPLE_ART.lines().count() + 1 } else { 0 };
                 let line_idx = (m.row as usize).saturating_sub(chat_top);
 
                 match m.kind {
@@ -931,7 +1180,6 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     MouseEventKind::ScrollDown => { s.scroll = s.scroll.saturating_sub(3); }
                     _ => {}
                 }
-                return;
             }
             TerminalEvent::Key(k) => {
                 if k.kind == KeyEventKind::Release { return; }
@@ -939,33 +1187,72 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
             // Permission prompt
             if s.permission.is_some() {
+                let prompt = s.permission.clone().unwrap();
                 match k.code {
                     Char('y') | Char('Y') => {
-                        let (rid, sid, _, _) = s.permission.take().unwrap();
-                        cmd_h.send(ClientMessage::PermissionReply {
-                            request_id: rid, session_id: sid, granted: true,
-                        }).ok();
+                        s.permission = None;
                         s.status = "ready".into();
+                        match prompt.kind {
+                            PromptKind::Server { request_id, session_id } => {
+                                cmd_h.send(ClientMessage::PermissionReply {
+                                    request_id, session_id, granted: true,
+                                }).ok();
+                            }
+                            PromptKind::Local { request_id, session_id, name, args_json } => {
+                                // Consent granted — execute the tool locally
+                                // and return the result to the server.
+                                let cwd = s.cwd.clone();
+                                let tx = cmd_h.clone();
+                                tokio::spawn(async move {
+                                    let result = execute_local_tool(&name, &args_json, &cwd).await;
+                                    let _ = tx.send(ClientMessage::ToolResult {
+                                        request_id, session_id, result,
+                                    });
+                                });
+                            }
+                        }
                     }
                     Enter | Char('n') | Char('N') | Esc => {
-                        let (rid, sid, _, _) = s.permission.take().unwrap();
-                        cmd_h.send(ClientMessage::PermissionReply {
-                            request_id: rid, session_id: sid, granted: false,
-                        }).ok();
+                        s.permission = None;
                         s.status = "ready".into();
+                        match prompt.kind {
+                            PromptKind::Server { request_id, session_id } => {
+                                cmd_h.send(ClientMessage::PermissionReply {
+                                    request_id, session_id, granted: false,
+                                }).ok();
+                            }
+                            PromptKind::Local { request_id, session_id, name, .. } => {
+                                cmd_h.send(ClientMessage::ToolResult {
+                                    request_id, session_id,
+                                    result: format!("Error: {name} denied by user"),
+                                }).ok();
+                            }
+                        }
                     }
                     Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Deny + cancel the whole loop
-                        let (rid, sid, _, _) = s.permission.take().unwrap();
-                        cmd_h.send(ClientMessage::PermissionReply {
-                            request_id: rid, session_id: sid, granted: false,
-                        }).ok();
+                        s.permission = None;
+                        s.status = "ready".into();
+                        let cancel_sid = match prompt.kind {
+                            PromptKind::Server { request_id, session_id } => {
+                                cmd_h.send(ClientMessage::PermissionReply {
+                                    request_id, session_id, granted: false,
+                                }).ok();
+                                session_id
+                            }
+                            PromptKind::Local { request_id, session_id, name, .. } => {
+                                cmd_h.send(ClientMessage::ToolResult {
+                                    request_id, session_id,
+                                    result: format!("Error: {name} denied by user"),
+                                }).ok();
+                                session_id
+                            }
+                        };
                         cmd_h.send(ClientMessage::CancelChat {
-                            session_id: sid,
+                            session_id: cancel_sid,
                         }).ok();
                         s.working = false;
                         s.work_started = None;
-                        s.status = "ready".into();
                     }
                     _ => {}
                 }
@@ -998,6 +1285,15 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 }
                 Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     s.scroll = s.scroll.saturating_sub(10);
+                }
+                BackTab => {
+                    // Shift+Tab: cycle permission mode. The server confirms
+                    // with ModeChanged, which updates the status bar tag.
+                    let next = next_mode(s.mode);
+                    cmd_h.send(ClientMessage::SetPermissionMode {
+                        session_id: s.session_id,
+                        mode: next,
+                    }).ok();
                 }
                 Up => {
                     // Recall previous prompt (input history)
@@ -1060,7 +1356,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         "/help" => {
                             s.entries.push(ChatEntry::System(
-                                "/sessions · /session N · /new [target] [dir] · /delete N · /stop · /clear <user|account> · /models · /model X · /model auto · /mode X · /help · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
+                                "/sessions · /session N · /new [target] [dir] · /delete N · /stop · /clear <user|account> · /models · /model X · /model auto · /mode X · /help · Shift+Tab cycle mode · ↑↓ input history · Ctrl+C cancel · Ctrl+G editor · Ctrl+U/D scroll · :q quit".into(),
                             ));
                             return;
                         }
@@ -1194,17 +1490,41 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Permission prompts time out server-side after 300s — mirror that
     // locally so the keyboard doesn't wedge if PermissionResult never
     // arrives (server restart, dropped connection mid-prompt).
-    if let Some((rid, sid, _, at)) = &s.permission {
-        if at.elapsed() > Duration::from_secs(300) {
-            let (rid, sid) = (*rid, *sid);
+    if let Some(pstate) = &s.permission {
+        if pstate.at.elapsed() > Duration::from_secs(300) {
+            let kind = pstate.kind.clone();
             s.permission = None;
             s.status = "ready".into();
-            s.entries.push(ChatEntry::System("permission timed out — denied".into()));
-            cmd_tx.send(ClientMessage::PermissionReply {
-                request_id: rid,
-                session_id: sid,
-                granted: false,
-            }).ok();
+            s.entries
+                .push(ChatEntry::System("permission timed out — denied".into()));
+            match kind {
+                PromptKind::Server {
+                    request_id,
+                    session_id,
+                } => {
+                    cmd_tx
+                        .send(ClientMessage::PermissionReply {
+                            request_id,
+                            session_id,
+                            granted: false,
+                        })
+                        .ok();
+                }
+                PromptKind::Local {
+                    request_id,
+                    session_id,
+                    name,
+                    ..
+                } => {
+                    cmd_tx
+                        .send(ClientMessage::ToolResult {
+                            request_id,
+                            session_id,
+                            result: format!("Error: {name} timed out — denied"),
+                        })
+                        .ok();
+                }
+            }
         }
     }
 
@@ -1212,7 +1532,11 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let h = height.max(5) as usize;
 
     let show_art = s.entries.len() < 3;
-    let art_lines = if show_art { TEMPLE_ART.lines().count() } else { 0 };
+    let art_lines = if show_art {
+        TEMPLE_ART.lines().count()
+    } else {
+        0
+    };
 
     // Build all display lines with visual separation
     let mut lines: Vec<StyledLine> = Vec::new();
@@ -1222,7 +1546,10 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     for (idx, entry) in s.entries.iter().enumerate() {
         // Separator before each message (except the very first)
         if idx > 0 {
-            lines.push(StyledLine { text: sep.clone(), kind: LineKind::Separator });
+            lines.push(StyledLine {
+                text: sep.clone(),
+                kind: LineKind::Separator,
+            });
         }
 
         match entry {
@@ -1273,7 +1600,11 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     });
                 }
             }
-            ChatEntry::Tool { name, status, detail } => {
+            ChatEntry::Tool {
+                name,
+                status,
+                detail,
+            } => {
                 let (icon, kind) = match status {
                     ToolStatus::Started => ("⟳", LineKind::ToolStart),
                     ToolStatus::Finished => ("✓", LineKind::ToolDone),
@@ -1284,11 +1615,52 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     kind,
                 });
                 if !detail.is_empty() {
-                    let d: String = detail.chars().take(200).collect();
+                    // Smart truncation: single-line details show inline;
+                    // multi-line output shows the first line plus a size
+                    // hint, so a 5,000-line build log doesn't flood the
+                    // scrollback with a 200-char slab of its beginning.
+                    let d = if detail.contains('\n') && detail.len() > 120 {
+                        let first = detail.lines().next().unwrap_or("");
+                        let first: String = first.chars().take(100).collect();
+                        format!("{first} … ({} chars)", detail.len())
+                    } else {
+                        detail.chars().take(200).collect()
+                    };
                     for l in wrap_text(&d, content_width.saturating_sub(6)) {
                         lines.push(StyledLine {
                             text: format!("   │ {l}"),
                             kind: LineKind::ToolDetail,
+                        });
+                    }
+                }
+            }
+            ChatEntry::Todo { items } => {
+                let done = items
+                    .iter()
+                    .filter(|i| i.status == temple_protocol::TodoStatus::Done)
+                    .count();
+                lines.push(StyledLine {
+                    text: format!("   tasks ({done}/{})", items.len()),
+                    kind: LineKind::AgentHeader,
+                });
+                for item in items {
+                    let (icon, kind) = match item.status {
+                        temple_protocol::TodoStatus::Pending => ("▫", LineKind::Dim),
+                        temple_protocol::TodoStatus::InProgress => ("▸", LineKind::ToolStart),
+                        temple_protocol::TodoStatus::Done => ("✓", LineKind::ToolDone),
+                    };
+                    for (i, l) in wrap_text(&item.content, content_width.saturating_sub(6))
+                        .iter()
+                        .enumerate()
+                    {
+                        let prefix = if i == 0 {
+                            format!("   {icon} ")
+                        } else {
+                            "     ".into()
+                        };
+                        lines.push(StyledLine {
+                            text: format!("{prefix}{l}"),
+                            kind,
                         });
                     }
                 }
@@ -1299,8 +1671,11 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Prompt box content — wrapped so the box can expand as you type.
     // Inner width: borders (2) + "│ " prefix (2).
     let prompt_inner_w = w.saturating_sub(4).max(1);
-    let prompt_lines: Vec<String> = if let Some((_, _, ref path, _)) = &s.permission {
-        wrap_text(&format!("Allow {}? (y/N)", sanitize(path)), prompt_inner_w)
+    let prompt_lines: Vec<String> = if let Some(ref pstate) = s.permission {
+        wrap_text(
+            &format!("Allow {}? (y/N)", sanitize(&pstate.text)),
+            prompt_inner_w,
+        )
     } else if s.prompt.is_empty() {
         vec![String::new()]
     } else {
@@ -1311,8 +1686,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     const MAX_PROMPT_ROWS: usize = 4;
     let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
     let prompt_h = shown_rows + 2; // + border rows
-    let prompt_window: Vec<String> =
-        prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
+    let prompt_window: Vec<String> = prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
 
     // Scroll window
     let status_h = 1usize;
@@ -1330,11 +1704,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     s.scroll = scroll;
     s.last_total = total;
     let start = max_scroll.saturating_sub(scroll);
-    let visible: Vec<StyledLine> = lines
-        .into_iter()
-        .skip(start)
-        .take(view_h)
-        .collect();
+    let visible: Vec<StyledLine> = lines.into_iter().skip(start).take(view_h).collect();
 
     // Store plain text of visible lines for mouse hit-testing.
     s.last_lines = visible.iter().map(|l| l.text.clone()).collect();
@@ -1345,10 +1715,9 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let s_working = s.working;
     let s_work_started = s.work_started;
     let s_prompt_len = s.prompt.len();
+    let s_mode = s.mode;
     let banner = match &s.banner {
-        Some((text, at)) if at.elapsed() < std::time::Duration::from_secs(3) => {
-            Some(text.clone())
-        }
+        Some((text, at)) if at.elapsed() < std::time::Duration::from_secs(3) => Some(text.clone()),
         _ => None,
     };
     drop(s);
@@ -1357,12 +1726,22 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
     if show_art {
         for line in TEMPLE_ART.lines() {
-            children.push(element! {
-                View(height: 1u16, overflow: Overflow::Hidden) {
-                    Text(content: line.to_string())
+            children.push(
+                element! {
+                    View(height: 1u16, overflow: Overflow::Hidden) {
+                        Text(content: line.to_string())
+                    }
                 }
-            }.into());
+                .into(),
+            );
         }
+        // Key hints under the art — the discoverability gap between a new
+        // user staring at an empty chat and /help.
+        children.push(element! {
+            View(height: 1u16, overflow: Overflow::Hidden) {
+                Text(content: "  /help · Shift+Tab mode · Ctrl+G editor · Ctrl+L clear".to_string(), color: Color::DarkGrey)
+            }
+        }.into());
     }
 
     // Status line (banner takes over briefly)
@@ -1371,26 +1750,44 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     } else if s_permission.is_some() {
         " permission? (y/N)".to_string()
     } else {
-        let model_info = if s_model.is_empty() { String::new() } else { format!(" · {s_model}") };
-        let scroll_info = if scroll > 0 { format!(" · ↑{scroll}") } else { String::new() };
-        let char_info = if s_prompt_len > 0 && !s_working { format!(" · ch:{s_prompt_len}") } else { String::new() };
+        let model_info = if s_model.is_empty() {
+            String::new()
+        } else {
+            format!(" · {s_model}")
+        };
+        let mode_info = format!(" [{}]", mode_tag(s_mode));
+        let scroll_info = if scroll > 0 {
+            format!(" · ↑{scroll}")
+        } else {
+            String::new()
+        };
+        let char_info = if s_prompt_len > 0 && !s_working {
+            format!(" · ch:{s_prompt_len}")
+        } else {
+            String::new()
+        };
         if s_working {
             let frame = SPINNER[(tick_val as usize / 2) % SPINNER.len()];
             let secs = s_work_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            format!(" {frame} working… {secs}s{model_info}{scroll_info}")
+            format!(" {frame} working… {secs}s{model_info}{mode_info}{scroll_info}")
         } else {
-            format!(" {s_status}{model_info}{scroll_info}{char_info}")
+            format!(" {s_status}{model_info}{mode_info}{scroll_info}{char_info}")
         }
     };
-    children.push(element! {
-        View(height: 1u16, overflow: Overflow::Hidden) {
-            Text(content: status_text)
+    children.push(
+        element! {
+            View(height: 1u16, overflow: Overflow::Hidden) {
+                Text(content: status_text)
+            }
         }
-    }.into());
+        .into(),
+    );
 
     // Chat lines (highlight selection with a subtle background)
     for (i, l) in visible.iter().enumerate() {
-        let in_sel = selection.map(|((sl, _), (el, _))| i >= sl && i <= el).unwrap_or(false);
+        let in_sel = selection
+            .map(|((sl, _), (el, _))| i >= sl && i <= el)
+            .unwrap_or(false);
         let color = match l.kind {
             LineKind::Normal => None,
             LineKind::Code => Some(Color::Grey),
@@ -1430,21 +1827,24 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     }
 
     // Prompt box — bordered, expands up to MAX_PROMPT_ROWS then scrolls
-    children.push(element! {
-        View(
-            height: prompt_h as u16,
-            overflow: Overflow::Hidden,
-            border_style: BorderStyle::Round,
-            border_color: Color::DarkGrey,
-            background_color: Color::Black,
-        ) {
-            #(prompt_window.iter().enumerate().map(|(i, l)| element! {
-                View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
-                    Text(content: format!("│ {}", l))
-                }
-            }.into()).collect::<Vec<AnyElement<'static>>>().into_iter())
+    children.push(
+        element! {
+            View(
+                height: prompt_h as u16,
+                overflow: Overflow::Hidden,
+                border_style: BorderStyle::Round,
+                border_color: Color::DarkGrey,
+                background_color: Color::Black,
+            ) {
+                #(prompt_window.iter().enumerate().map(|(i, l)| element! {
+                    View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
+                        Text(content: format!("│ {}", l))
+                    }
+                }.into()).collect::<Vec<AnyElement<'static>>>().into_iter())
+            }
         }
-    }.into());
+        .into(),
+    );
 
     element! {
         View(
@@ -1460,13 +1860,28 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 }
 
 fn main() {
+    // Restore the terminal on panic — iocraft leaves the tty in raw mode +
+    // alternate screen + mouse capture if anything unwinds, bricking the
+    // user's shell until `reset`.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+        default_hook(info);
+    }));
+
     let cli = Cli::parse();
     cli.print_completions();
 
-    let cwd = std::fs::canonicalize(&cli.cwd)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&cli.cwd));
+    let cwd =
+        std::fs::canonicalize(&cli.cwd).unwrap_or_else(|_| std::path::PathBuf::from(&cli.cwd));
     let cwd_str = cwd.to_string_lossy().to_string();
-    let client_id = cli.client_id.unwrap_or_else(whoami::hostname);
+    let client_id = cli.client_id.unwrap_or_else(|| whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()));
 
     let state = Arc::new(Mutex::new(AppState {
         session_id: Uuid::nil(),
@@ -1477,7 +1892,7 @@ fn main() {
         permission: None,
         running: true,
         editor_pending: false,
-        cwd: ".".into(),
+        cwd: cwd_str.clone(),
         scroll: 0,
         sel_anchor: None,
         selection: None,
@@ -1490,26 +1905,69 @@ fn main() {
         working: false,
         work_started: None,
         last_total: 0,
+        mode: PermissionMode::Default,
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();
-    spawn_ws(cli.server, cwd_str, client_id, cli.token, cli.r#continue, state.clone(), cmd_rx);
+    spawn_ws(
+        cli.server,
+        cwd_str,
+        client_id,
+        cli.token,
+        cli.r#continue,
+        cli.tls,
+        state.clone(),
+        cmd_rx,
+    );
 
     smol::block_on(async {
         loop {
             {
                 let s = state.lock().unwrap();
-                if !s.running { break; }
+                if !s.running {
+                    break;
+                }
                 if s.editor_pending {
                     let prompt = s.prompt.clone();
                     drop(s);
 
                     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
-                    let tmp = std::env::temp_dir().join("temple_prompt.md");
-                    std::fs::write(&tmp, &prompt).ok();
+                    // Unique per-instance tempfile with owner-only perms —
+                    // a fixed shared path is a symlink attack and two
+                    // concurrent temple instances clobber each other.
+                    let tmp = std::env::temp_dir().join(format!(
+                        "temple_prompt_{}_{}.md",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    ));
+                    {
+                        use std::io::Write;
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.create_new(true).write(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            opts.mode(0o600);
+                        }
+                        match opts.open(&tmp) {
+                            Ok(mut f) => {
+                                f.write_all(prompt.as_bytes()).ok();
+                            }
+                            Err(_) => {
+                                let mut s = state.lock().unwrap();
+                                s.editor_pending = false;
+                                continue;
+                            }
+                        }
+                    }
                     std::process::Command::new(&editor).arg(&tmp).status().ok();
                     let edited = std::fs::read_to_string(&tmp)
-                        .unwrap_or_default().trim_end().to_string();
+                        .unwrap_or_default()
+                        .trim_end()
+                        .to_string();
                     std::fs::remove_file(&tmp).ok();
 
                     let mut s = state.lock().unwrap();

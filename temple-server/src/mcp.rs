@@ -35,23 +35,37 @@ impl McpClient {
 
         // 1. initialize
         let (session_id, _) = self
-            .rpc(&endpoint, None, "initialize", json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "temple", "version": "0.1"},
-            }))
+            .rpc(
+                &endpoint,
+                None,
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "temple", "version": "0.1"},
+                }),
+            )
             .await?;
 
         // 2. initialized notification (no id → notification)
-        self.notify(&endpoint, session_id.as_deref(), "notifications/initialized")
-            .await?;
+        self.notify(
+            &endpoint,
+            session_id.as_deref(),
+            "notifications/initialized",
+        )
+        .await?;
 
         // 3. tools/call
         let (_, result) = self
-            .rpc(&endpoint, session_id.as_deref(), "tools/call", json!({
-                "name": bare_name,
-                "arguments": arguments,
-            }))
+            .rpc(
+                &endpoint,
+                session_id.as_deref(),
+                "tools/call",
+                json!({
+                    "name": bare_name,
+                    "arguments": arguments,
+                }),
+            )
             .await?;
 
         // Extract text content from result
@@ -72,9 +86,10 @@ impl McpClient {
         method: &str,
         params: Value,
     ) -> Result<(Option<String>, Option<Value>), String> {
+        let id: u64 = rand::random();
         let body = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": id,
             "method": method,
             "params": params,
         });
@@ -104,13 +119,16 @@ impl McpClient {
         }
 
         let text = resp.text().await.map_err(|e| format!("MCP read: {e}"))?;
-        let parsed = parse_sse_json(&text)?;
+        let parsed = parse_sse_json_for_id(&text, id)?;
 
         if let Some(err) = parsed.get("error") {
             return Err(format!("MCP RPC error: {err}"));
         }
 
-        Ok((new_session.or_else(|| session_id.map(|s| s.to_string())), parsed.get("result").cloned()))
+        Ok((
+            new_session.or_else(|| session_id.map(|s| s.to_string())),
+            parsed.get("result").cloned(),
+        ))
     }
 
     async fn notify(
@@ -141,21 +159,32 @@ impl McpClient {
     }
 }
 
-/// Parse an SSE body and return the first JSON-RPC message payload.
-fn parse_sse_json(text: &str) -> Result<Value, String> {
+/// Parse an SSE body and return the JSON-RPC message whose `id` matches
+/// our request. Streamable-HTTP MCP servers can emit progress
+/// notifications and other messages before the actual result — taking the
+/// first parseable line returns the WRONG payload (e.g. a notification
+/// with no `result`, yielding a spurious "empty result" error).
+fn parse_sse_json_for_id(text: &str, id: u64) -> Result<Value, String> {
     // SSE format: "event: message\ndata: {...}\n\n"
     for line in text.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                return Ok(v);
+                if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                    return Ok(v);
+                }
             }
         }
     }
     // Maybe it's raw JSON without SSE framing
     if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
-        return Ok(v);
+        if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+            return Ok(v);
+        }
     }
-    Err(format!("MCP: unparseable response: {}", text.chars().take(200).collect::<String>()))
+    Err(format!(
+        "MCP: no response for request id in body: {}",
+        text.chars().take(200).collect::<String>()
+    ))
 }
 
 /// Extract human-readable text from an MCP tool result.

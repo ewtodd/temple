@@ -1,7 +1,8 @@
-use std::path::Path;
 use crate::memory::Memory;
+use std::path::Path;
 
 /// A user authenticated via token.
+#[allow(dead_code)] // admin/priority consumed by queue routing on other paths.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub username: String,
@@ -15,19 +16,35 @@ pub struct AuthUser {
 /// Parse the optional trailing fields of a token-file line:
 /// `token:username:phone[:admin[:priority]]`
 fn parse_extras(parts: &[&str]) -> (bool, i32) {
-    let admin = parts.get(3)
+    let admin = parts
+        .get(3)
         .map(|a| a.trim().eq_ignore_ascii_case("yes"))
         .unwrap_or(false);
-    let priority = parts.get(4)
+    let priority = parts
+        .get(4)
         .and_then(|p| p.trim().parse::<i32>().ok())
         .unwrap_or(-1);
     (admin, priority)
 }
 
+/// Constant-time token comparison — a short-circuiting byte compare leaks
+/// the match position over the WebSocket handshake timing.
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Check a token against the auth_token_file.
 pub fn check_token(token_file: &Path, token: &str) -> Result<AuthUser, String> {
-    let content = std::fs::read_to_string(token_file)
-        .map_err(|e| format!("read token file: {e}"))?;
+    let content =
+        std::fs::read_to_string(token_file).map_err(|e| format!("read token file: {e}"))?;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -37,7 +54,7 @@ pub fn check_token(token_file: &Path, token: &str) -> Result<AuthUser, String> {
         if parts.len() < 3 {
             continue;
         }
-        if parts[0] == token {
+        if token_eq(parts[0], token) {
             let (admin, priority) = parse_extras(&parts);
             return Ok(AuthUser {
                 username: parts[1].to_string(),
@@ -51,6 +68,7 @@ pub fn check_token(token_file: &Path, token: &str) -> Result<AuthUser, String> {
 }
 
 /// A loaded user from the token file — used for sending welcome messages.
+#[allow(dead_code)] // token/admin/priority used when generating + verifying.
 #[derive(Debug, Clone)]
 pub struct TokenUser {
     pub username: String,
@@ -65,10 +83,12 @@ pub async fn load_signal_users(
     memory: &Memory,
     config: &crate::config::Config,
 ) -> Result<Vec<TokenUser>, String> {
-    let token_file = config.auth_token_file.as_ref()
+    let token_file = config
+        .auth_token_file
+        .as_ref()
         .ok_or("auth_token_file not set")?;
-    let content = std::fs::read_to_string(token_file)
-        .map_err(|e| format!("read token file: {e}"))?;
+    let content =
+        std::fs::read_to_string(token_file).map_err(|e| format!("read token file: {e}"))?;
     let mut users = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -107,7 +127,9 @@ pub async fn load_signal_users(
             }
         }
         let (admin, priority) = parse_extras(&parts);
-        memory.upsert_signal_user_phone(username, phone, admin, priority).await
+        memory
+            .upsert_signal_user_phone(username, phone, admin, priority)
+            .await
             .map_err(|e| format!("upsert signal user: {e}"))?;
         users.push(TokenUser {
             username: username.to_string(),

@@ -200,8 +200,7 @@ impl Config {
     pub fn load(path: Option<&std::path::Path>) -> Self {
         if let Some(path) = path {
             if path.exists() {
-                let data = std::fs::read_to_string(path)
-                    .expect("Failed to read config file");
+                let data = std::fs::read_to_string(path).expect("Failed to read config file");
                 toml::from_str(&data).expect("Failed to parse config file")
             } else {
                 eprintln!("Config file not found at {path:?}, using defaults");
@@ -216,8 +215,7 @@ impl Config {
             ] {
                 let p = std::path::Path::new(p);
                 if p.exists() {
-                    let data = std::fs::read_to_string(p)
-                        .expect("Failed to read config file");
+                    let data = std::fs::read_to_string(p).expect("Failed to read config file");
                     return toml::from_str(&data).expect("Failed to parse config file");
                 }
             }

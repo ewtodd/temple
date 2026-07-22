@@ -1,9 +1,10 @@
+use crate::config::SshTarget;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use crate::config::SshTarget;
 
 /// SSH client for remote tool execution on workstations.
 /// Connects via bastion (ProxyJump) to reach LAN hosts behind the firewall.
+#[allow(dead_code)] // bastion/key_path retained for future per-target overrides.
 pub struct SshExecutor {
     target: SshTarget,
     bastion: Option<String>,
@@ -29,9 +30,12 @@ impl SshExecutor {
             "/var/lib/temple/.ssh/config".into(),
             // Fail fast on unreachable hosts; kill the session if the
             // link goes silent (woke host fell back asleep, relay died).
-            "-o".into(), "ConnectTimeout=10".into(),
-            "-o".into(), "ServerAliveInterval=15".into(),
-            "-o".into(), "ServerAliveCountMax=3".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+            "-o".into(),
+            "ServerAliveInterval=15".into(),
+            "-o".into(),
+            "ServerAliveCountMax=3".into(),
             alias,
             remote_command.into(),
         ]
@@ -40,10 +44,13 @@ impl SshExecutor {
     /// Execute a command on the remote host.
     pub async fn execute(&self, command: &str) -> Result<String, String> {
         let args = self.ssh_args(command);
-        // Hard cap — an unbounded hang here wedges the global request queue.
+        // Hard cap — an unbounded hang here wedges the global request
+        // queue. kill_on_drop ensures the ssh child actually dies when the
+        // timeout drops the future; otherwise orphaned ssh processes
+        // accumulate on every hang.
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            Command::new("ssh").args(&args).output(),
+            Command::new("ssh").args(&args).kill_on_drop(true).output(),
         )
         .await
         .map_err(|_| "ssh timed out after 120s".to_string())?
@@ -52,12 +59,18 @@ impl SshExecutor {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut out = String::new();
-        if !stdout.is_empty() { out.push_str(&stdout); }
-        if !stderr.is_empty() { out.push_str(&format!("\n[stderr]\n{stderr}")); }
+        if !stdout.is_empty() {
+            out.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            out.push_str(&format!("\n[stderr]\n{stderr}"));
+        }
         if !output.status.success() {
             out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
         }
-        if out.is_empty() { out.push_str("(no output)"); }
+        if out.is_empty() {
+            out.push_str("(no output)");
+        }
         Ok(out)
     }
 
@@ -71,7 +84,8 @@ impl SshExecutor {
     /// Write content to a file on the remote host.
     pub async fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         // Create parent dirs, then write via stdin
-        let parent = Path::new(path).parent()
+        let parent = Path::new(path)
+            .parent()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let mkdir_cmd = if !parent.is_empty() {
@@ -104,6 +118,7 @@ impl SshExecutor {
     }
 
     /// Check if the host is reachable.
+    #[allow(dead_code)] // Used by health checks and /targets diagnostics.
     pub async fn ping(&self) -> Result<(), String> {
         self.execute("echo ok").await?;
         Ok(())

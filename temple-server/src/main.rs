@@ -14,7 +14,7 @@ mod signal;
 mod ssh;
 
 use clap::{CommandFactory, Parser};
-use clap_complete::{self, Generator, Shell};
+use clap_complete::{self, Shell};
 use std::sync::Arc;
 use temple_protocol::PermissionMode;
 use tokio::sync::Mutex;
@@ -79,13 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
     cli.print_completions();
 
     // Load config
     let cfg = config::Config::load(cli.config.as_deref());
     let cfg = if let Some(url) = cli.litellm_url {
-        config::Config { litellm_url: url, ..cfg }
+        config::Config {
+            litellm_url: url,
+            ..cfg
+        }
     } else {
         cfg
     };
@@ -138,12 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp = mcp::McpClient::new(&cfg.litellm_url, &api_key);
 
     // Initialize agent
-    let mut agent = agent::Agent::new(
-        litellm,
-        mcp,
-        memory.clone(),
-        cfg.models.clone(),
-    );
+    let mut agent = agent::Agent::new(litellm, mcp, memory.clone(), cfg.models.clone());
     agent.set_local_endpoint(&cfg.local_llama_url, &cfg.local_llama_model);
     agent.set_ssh_config(
         cfg.ssh_targets.clone(),
@@ -171,7 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::path::Path::new(&cfg2.data_dir_workspace()),
                     PermissionMode::Default,
                     &cfg2.allowed_dirs,
-                ).await,
+                )
+                .await,
             ));
 
             let agent_for_handler = agent.clone();
@@ -187,548 +186,859 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let active_for_handler = active_sessions.clone();
             // Pending permission requests: sender → (request_id, session_id, group)
-            let pending_perms: Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>> =
-                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            type PendingPerms =
+                Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>>;
+            let pending_perms: PendingPerms = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let perms_for_handler = pending_perms.clone();
-            let handler = Arc::new(move |sender: String, mut message: String, timestamp: u64, group_id: Option<String>, attachment_paths: Vec<(String, String)>| {
-                let agent = agent_for_handler.clone();
-                let scope = scope_for_handler.clone();
-                let signal = signal_for_handler.clone();
-                let memory = memory_for_handler.clone();
-                let token_file = auth_token_file.clone();
-                let workspace = data_dir_workspace.clone();
-                let active = active_for_handler.clone();
-                let perms = perms_for_handler.clone();
-                tokio::spawn(async move {
-                    tracing::info!("signal inbound from {sender}: {message:.60}");
+            let handler = Arc::new(
+                move |sender: String,
+                      mut message: String,
+                      timestamp: u64,
+                      group_id: Option<String>,
+                      attachment_paths: Vec<(String, String)>| {
+                    let agent = agent_for_handler.clone();
+                    let scope = scope_for_handler.clone();
+                    let signal = signal_for_handler.clone();
+                    let memory = memory_for_handler.clone();
+                    let token_file = auth_token_file.clone();
+                    let workspace = data_dir_workspace.clone();
+                    let active = active_for_handler.clone();
+                    let perms = perms_for_handler.clone();
+                    tokio::spawn(async move {
+                        tracing::info!("signal inbound from {sender}: {message:.60}");
 
-                    // Send read receipt immediately
-                    if timestamp > 0 {
-                        signal.send_read_receipt(&sender, timestamp).await.ok();
-                    }
+                        // Send read receipt immediately
+                        if timestamp > 0 {
+                            signal.send_read_receipt(&sender, timestamp).await.ok();
+                        }
 
-                    // Check if sender is a verified signal user
-                    let user = memory.find_signal_user(&sender).await
-                        .unwrap_or(None);
+                        // Check if sender is a verified signal user
+                        let user = memory.find_signal_user(&sender).await.unwrap_or(None);
 
-                    let username = match &user {
-                        Some((u, _, Some(_))) => u.clone(),
-                        Some((u, _, None)) => u.clone(),
-                        None => {
-                            if let Some(token) = message.strip_prefix("/verify ") {
-                                let token = token.trim();
-                                if let Some(ref token_file) = token_file {
-                                    if let Ok(auth_user) = auth::check_token(token_file, token) {
-                                        let _ = memory.set_signal_user_uuid(
-                                            &auth_user.username,
-                                            &sender,
-                                        ).await;
-                                        send_conv(&signal, &sender, &group_id, &format!(
-                                            "Verified! You are now registered as {}.",
-                                            auth_user.username
-                                        )).await;
-                                        notify_admins(&signal, &memory, &format!(
-                                            "{} (+{}...) just verified on Signal.",
-                                            auth_user.username, auth_user.phone.chars().take(6).collect::<String>()
-                                        )).await;
-                                        return;
-                                    }
+                        let username = match &user {
+                            Some((u, _, Some(_))) => u.clone(),
+                            Some((u, _, None)) => u.clone(),
+                            None => {
+                                if message.trim() == "/verify" {
+                                    // Bare /verify — the welcome message tells
+                                    // users to "send /verify", so they'll try
+                                    // this first. Tell them the full form.
+                                    send_conv(&signal, &sender, &group_id,
+                                    "to verify, send: /verify <token>\n(get your token from Ethan)").await;
+                                    return;
                                 }
-                                send_conv(&signal, &sender, &group_id, "token not recognized — check with Ethan and try again.").await;
-                                notify_admins(&signal, &memory, &format!(
+                                if let Some(token) = message.strip_prefix("/verify ") {
+                                    let token = token.trim();
+                                    if let Some(ref token_file) = token_file {
+                                        if let Ok(auth_user) = auth::check_token(token_file, token)
+                                        {
+                                            let _ = memory
+                                                .set_signal_user_uuid(&auth_user.username, &sender)
+                                                .await;
+                                            send_conv(
+                                                &signal,
+                                                &sender,
+                                                &group_id,
+                                                &format!(
+                                                    "Verified! You are now registered as {}.",
+                                                    auth_user.username
+                                                ),
+                                            )
+                                            .await;
+                                            notify_admins(
+                                                &signal,
+                                                &memory,
+                                                &format!(
+                                                    "{} (+{}...) just verified on Signal.",
+                                                    auth_user.username,
+                                                    auth_user
+                                                        .phone
+                                                        .chars()
+                                                        .take(6)
+                                                        .collect::<String>()
+                                                ),
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    }
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        "token not recognized — check with Ethan and try again.",
+                                    )
+                                    .await;
+                                    notify_admins(
+                                        &signal,
+                                        &memory,
+                                        &format!(
                                     "Someone from {sender} tried /verify with an invalid token."
-                                )).await;
+                                ),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                tracing::warn!(
+                                    "signal: ignoring message from unknown sender: {sender}"
+                                );
                                 return;
                             }
-                            tracing::warn!(
-                                "signal: ignoring message from unknown sender: {sender}"
-                            );
-                            return;
+                        };
+
+                        // If user's UUID wasn't set yet, set it now
+                        if let Some((_, _, None)) = &user {
+                            let _ = memory.set_signal_user_uuid(&username, &sender).await;
                         }
-                    };
 
-                    // If user's UUID wasn't set yet, set it now
-                    if let Some((_, _, None)) = &user {
-                        let _ = memory.set_signal_user_uuid(&username, &sender).await;
-                    }
-
-                    // ── Image attachments: describe with vision model, prepend to text ──
-                    // Fetch each attachment's bytes via signal-cli's getAttachment
-                    // JSON-RPC method (same socket we use for sends), then send
-                    // the image to the vision model as a multipart content array.
-                    if !attachment_paths.is_empty() {
-                        let vision_model = agent.models.router_model.as_deref()
-                            .unwrap_or(&agent.models.researcher_model);
-                        tracing::info!(
-                            "signal: describing {} image(s) via vision model {vision_model}",
-                            attachment_paths.len(),
-                        );
-                        let mut descriptions = Vec::new();
-                        for (id, content_type) in &attachment_paths {
-                            let bytes = match signal.get_attachment(id).await {
-                                Ok(b) => {
-                                    tracing::info!("signal: getAttachment {id} → {} bytes", b.len());
-                                    b
-                                }
-                                Err(e) => {
-                                    tracing::warn!("signal: getAttachment {id}: {e}");
-                                    continue;
-                                }
-                            };
-                            let ext = if content_type.contains("png") { "png" } else { "jpg" };
-                            let b64 = base64_encode(&bytes);
-                            let image_url = format!("data:image/{ext};base64,{b64}");
-                            match litellm_describe_image(&agent.litellm, vision_model, &image_url).await {
-                                Ok(desc) => {
-                                    if desc.trim().is_empty() {
-                                        tracing::warn!(
+                        // ── Image attachments: describe with vision model, prepend to text ──
+                        // Fetch each attachment's bytes via signal-cli's getAttachment
+                        // JSON-RPC method (same socket we use for sends), then send
+                        // the image to the vision model as a multipart content array.
+                        if !attachment_paths.is_empty() {
+                            let vision_model = agent
+                                .models
+                                .router_model
+                                .as_deref()
+                                .unwrap_or(&agent.models.researcher_model);
+                            tracing::info!(
+                                "signal: describing {} image(s) via vision model {vision_model}",
+                                attachment_paths.len(),
+                            );
+                            let mut descriptions = Vec::new();
+                            for (id, content_type) in &attachment_paths {
+                                let bytes = match signal.get_attachment(id).await {
+                                    Ok(b) => {
+                                        tracing::info!(
+                                            "signal: getAttachment {id} → {} bytes",
+                                            b.len()
+                                        );
+                                        b
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("signal: getAttachment {id}: {e}");
+                                        continue;
+                                    }
+                                };
+                                let ext = if content_type.contains("png") {
+                                    "png"
+                                } else {
+                                    "jpg"
+                                };
+                                let b64 = base64_encode(&bytes);
+                                let image_url = format!("data:image/{ext};base64,{b64}");
+                                match litellm_describe_image(
+                                    &agent.litellm,
+                                    vision_model,
+                                    &image_url,
+                                )
+                                .await
+                                {
+                                    Ok(desc) => {
+                                        if desc.trim().is_empty() {
+                                            tracing::warn!(
                                             "signal: vision model {vision_model} returned empty description for {id}"
                                         );
-                                    } else {
-                                        tracing::info!(
+                                        } else {
+                                            tracing::info!(
                                             "signal: vision description for {id} ({} chars): {:.80}",
                                             desc.len(),
                                             desc,
                                         );
-                                        descriptions.push(desc);
+                                            descriptions.push(desc);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("signal: image description failed: {e}")
                                     }
                                 }
-                                Err(e) => tracing::warn!("signal: image description failed: {e}"),
+                            }
+                            if !descriptions.is_empty() {
+                                let prefix = descriptions.join("\n");
+                                if message.is_empty() {
+                                    message = format!("[Image description:\n{prefix}]\n\n(respond to what's in the image)");
+                                } else {
+                                    message = format!("[Image description:\n{prefix}]\n\nUser also said: {message}");
+                                }
                             }
                         }
-                        if !descriptions.is_empty() {
-                            let prefix = descriptions.join("\n");
-                            if message.is_empty() {
-                                message = format!("[Image description:\n{prefix}]\n\n(respond to what's in the image)");
-                            } else {
-                                message = format!("[Image description:\n{prefix}]\n\nUser also said: {message}");
+
+                        let trimmed = message.trim();
+
+                        // Conversation key: group chats share one session,
+                        // DMs are per-sender.
+                        let conv_key = group_id.clone().unwrap_or_else(|| sender.clone());
+
+                        // ── Session commands ──
+
+                        // ── Pending permission reply (y/N) ──
+                        {
+                            let pending = perms.lock().await.get(&sender).cloned();
+                            if let Some((request_id, _sid, perm_group)) = pending {
+                                let lower = trimmed.to_lowercase();
+                                let granted = lower == "y" || lower == "yes" || lower == "allow";
+                                if granted || lower == "n" || lower == "no" || lower == "deny" {
+                                    perms.lock().await.remove(&sender);
+                                    agent.permissions.resolve(request_id, granted).await;
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &perm_group,
+                                        if granted { "ok, proceeding" } else { "denied" },
+                                    )
+                                    .await;
+                                    return;
+                                }
                             }
                         }
-                    }
 
-                    let trimmed = message.trim();
-
-                    // Conversation key: group chats share one session,
-                    // DMs are per-sender.
-                    let conv_key = group_id.clone().unwrap_or_else(|| sender.clone());
-
-                    // ── Session commands ──
-
-                    // ── Pending permission reply (y/N) ──
-                    {
-                        let pending = perms.lock().await.get(&sender).cloned();
-                        if let Some((request_id, _sid, perm_group)) = pending {
-                            let lower = trimmed.to_lowercase();
-                            let granted = lower == "y" || lower == "yes" || lower == "allow";
-                            if granted || lower == "n" || lower == "no" || lower == "deny" {
-                                perms.lock().await.remove(&sender);
-                                agent.permissions.resolve(request_id, granted).await;
-                                send_conv(&signal, &sender, &perm_group,
-                                    if granted { "ok, proceeding" } else { "denied" }
-                                ).await;
+                        if let Some(msg) = trimmed.strip_prefix("/broadcast ") {
+                            let body = msg.trim();
+                            if body.is_empty() {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "usage: /broadcast <message>",
+                                )
+                                .await;
                                 return;
                             }
-                        }
-                    }
-
-                    if let Some(msg) = trimmed.strip_prefix("/broadcast ") {
-                        let body = msg.trim();
-                        if body.is_empty() {
-                            send_conv(&signal, &sender, &group_id, "usage: /broadcast <message>").await;
-                            return;
-                        }
-                        // Admin check: sender must be in the admin list
-                        let admins = memory.get_admins().await.unwrap_or_default();
-                        let is_admin = admins.iter().any(|(phone, uuid)| {
-                            phone == &sender || uuid.as_deref() == Some(&sender)
-                        });
-                        if !is_admin {
-                            send_conv(&signal, &sender, &group_id, "admin only").await;
-                            return;
-                        }
-                        match memory.get_signal_users().await {
-                            Ok(users) => {
-                                let mut count = 0;
-                                for (_, phone, uuid) in &users {
-                                    let recipient = uuid.as_deref().unwrap_or(phone);
-                                    if signal.send(recipient, &format!("📢 renco: {body}")).await.is_ok() {
-                                        count += 1;
-                                    }
-                                }
-                                send_conv(&signal, &sender, &group_id, &format!("sent to {count} users")).await;
+                            // Admin check: sender must be in the admin list
+                            let admins = memory.get_admins().await.unwrap_or_default();
+                            let is_admin = admins.iter().any(|(phone, uuid)| {
+                                phone == &sender || uuid.as_deref() == Some(&sender)
+                            });
+                            if !is_admin {
+                                send_conv(&signal, &sender, &group_id, "admin only").await;
+                                return;
                             }
-                            Err(e) => { send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await; }
+                            match memory.get_signal_users().await {
+                                Ok(users) => {
+                                    let mut count = 0;
+                                    for (_, phone, uuid) in &users {
+                                        let recipient = uuid.as_deref().unwrap_or(phone);
+                                        if signal
+                                            .send(recipient, &format!("📢 renco: {body}"))
+                                            .await
+                                            .is_ok()
+                                        {
+                                            count += 1;
+                                        }
+                                    }
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("sent to {count} users"),
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}"))
+                                        .await;
+                                }
+                            }
+                            return;
                         }
-                        return;
-                    }
 
-                    if trimmed == "/help" {
-                        send_conv(&signal, &sender, &group_id,
-                            "commands:\n\
+                        if trimmed == "/help" {
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                "commands:\n\
                              /sessions — list your recent sessions\n\
                              /session <id-prefix> — resume a session\n\
                              /new <target> [dir] — new coding session\n\
                              /new — new session\n\
                              /quick — back to the default session\n\
+                             /mode [default|ask|lockdown|yolo] — show/set permission mode\n\
                              /stop — interrupt the running request\n\
                              /reset — cancel ALL in-flight requests (admin)\n\
                              /clear <user|account> — delete sessions for a user (admin)\n\
                              /targets — list ssh targets\n\
-                             /help — this"
-                        ).await;
-                        return;
-                    }
-
-                    if trimmed == "/stop" {
-                        let id = active.lock().await.get(&conv_key).copied();
-                        match id {
-                            Some(id) => {
-                                agent.cancel_chat(id).await;
-                                send_conv(&signal, &sender, &group_id, "⏹ stopped").await;
-                            }
-                            None => {
-                                send_conv(&signal, &sender, &group_id, "nothing running").await;
-                            }
-                        }
-                        return;
-                    }
-
-                    if trimmed == "/reset" {
-                        // Admin escape hatch: cancel every in-flight request
-                        // to drain a wedged queue without a restart.
-                        let admins = memory.get_admins().await.unwrap_or_default();
-                        let is_admin = admins.iter().any(|(phone, uuid)| {
-                            phone == &sender || uuid.as_deref() == Some(&sender)
-                        });
-                        if !is_admin {
-                            send_conv(&signal, &sender, &group_id, "admin only").await;
+                             /help — this",
+                            )
+                            .await;
                             return;
                         }
-                        let n = agent.cancel_all().await;
-                        send_conv(&signal, &sender, &group_id,
-                            &format!("cancelled {n} in-flight request(s) — queue drained")).await;
-                        return;
-                    }
 
-                    if let Some(account) = trimmed.strip_prefix("/clear ") {
-                        let account = account.trim();
-                        // /clear can wipe other people's sessions — admin only
-                        let admins = memory.get_admins().await.unwrap_or_default();
-                        let is_admin = admins.iter().any(|(phone, uuid)| {
-                            phone == &sender || uuid.as_deref() == Some(&sender)
-                        });
-                        if !is_admin {
-                            send_conv(&signal, &sender, &group_id, "admin only").await;
-                        } else if account.is_empty() {
-                            send_conv(&signal, &sender, &group_id, "usage: /clear <account> (e.g. /clear e-play)").await;
-                        } else {
-                            match memory.clear_sessions(account).await {
-                                Ok(n) => {
-                                    send_conv(&signal, &sender, &group_id, &format!("deleted {n} sessions for {account}")).await;
+                        if trimmed == "/stop" {
+                            let id = active.lock().await.get(&conv_key).copied();
+                            match id {
+                                Some(id) => {
+                                    agent.cancel_chat(id).await;
+                                    send_conv(&signal, &sender, &group_id, "⏹ stopped").await;
                                 }
-                                Err(e) => {
-                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
+                                None => {
+                                    send_conv(&signal, &sender, &group_id, "nothing running").await;
                                 }
                             }
+                            return;
                         }
-                        return;
-                    }
 
-                    if trimmed == "/targets" {
-                        let names = agent.ssh_target_names();
-                        let body = if names.is_empty() {
-                            "no ssh targets configured".to_string()
-                        } else {
-                            names.join("\n")
-                        };
-                        send_conv(&signal, &sender, &group_id, &body).await;
-                        return;
-                    }
-
-                    if trimmed == "/sessions" {
-                        match memory.list_sessions(&username, 10).await {
-                            Ok(rows) if !rows.is_empty() => {
-                                let mut body = String::from("recent sessions:\n");
-                                for r in &rows {
-                                    let id8: String = r.id.simple().to_string().chars().take(8).collect();
-                                    let target = r.ssh_target.as_deref().unwrap_or("quick");
-                                    let title = r.title.as_deref().unwrap_or("(untitled)");
-                                    body.push_str(&format!("• {id8} · {target} · {title}\n"));
-                                }
-                                body.push_str("\nresume with /session <id-prefix>");
-                                send_conv(&signal, &sender, &group_id, &body).await;
+                        if trimmed == "/reset" {
+                            // Admin escape hatch: cancel every in-flight request
+                            // to drain a wedged queue without a restart.
+                            let admins = memory.get_admins().await.unwrap_or_default();
+                            let is_admin = admins.iter().any(|(phone, uuid)| {
+                                phone == &sender || uuid.as_deref() == Some(&sender)
+                            });
+                            if !is_admin {
+                                send_conv(&signal, &sender, &group_id, "admin only").await;
+                                return;
                             }
-                            Ok(_) => {
-                                send_conv(&signal, &sender, &group_id, "no sessions yet — /new <target> to start one").await;
-                            }
-                            Err(e) => {
-                                send_conv(&signal, &sender, &group_id, &format!("error listing sessions: {e}")).await;
-                            }
+                            let n = agent.cancel_all().await;
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                &format!("cancelled {n} in-flight request(s) — queue drained"),
+                            )
+                            .await;
+                            return;
                         }
-                        return;
-                    }
 
-                    if let Some(prefix) = trimmed.strip_prefix("/session ") {
-                        let prefix = prefix.trim().to_lowercase();
-                        match memory.list_sessions(&username, 50).await {
-                            Ok(rows) => {
-                                let found = rows.iter().find(|r| {
-                                    r.id.simple().to_string().starts_with(&prefix)
-                                });
-                                match found {
-                                    Some(r) => {
-                                        let sid = r.id;
-                                        // Load into memory if not already there
-                                        if !agent.has_session(sid).await {
-                                            if let Err(e) = agent.resume_session(sid, &username).await {
-                                                send_conv(&signal, &sender, &group_id, &format!("resume failed: {e}")).await;
-                                                return;
-                                            }
-                                        }
-                                        active.lock().await.insert(conv_key.clone(), sid);
-                                        // Auto-attach SSH if needed — Signal sessions
-                                        // need SSH to execute tools (no TUI client).
-                                        if !agent.has_ssh(sid).await {
-                                            if let Some(t) = agent.ssh_targets.iter()
-                                                .find(|t| t.owner == username)
-                                            {
-                                                if let Err(e) = agent.attach_ssh(sid, &t.name).await {
-                                                    tracing::warn!("attach_ssh for {sid}: {e}");
-                                                } else {
-                                                    tracing::info!("auto-attached SSH {} to session {sid}", t.name);
-                                                }
-                                            }
-                                        }
+                        if let Some(account) = trimmed.strip_prefix("/clear ") {
+                            let account = account.trim();
+                            // /clear can wipe other people's sessions — admin only
+                            let admins = memory.get_admins().await.unwrap_or_default();
+                            let is_admin = admins.iter().any(|(phone, uuid)| {
+                                phone == &sender || uuid.as_deref() == Some(&sender)
+                            });
+                            if !is_admin {
+                                send_conv(&signal, &sender, &group_id, "admin only").await;
+                            } else if account.is_empty() {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "usage: /clear <account> (e.g. /clear e-play)",
+                                )
+                                .await;
+                            } else {
+                                match memory.clear_sessions(account).await {
+                                    Ok(n) => {
+                                        send_conv(
+                                            &signal,
+                                            &sender,
+                                            &group_id,
+                                            &format!("deleted {n} sessions for {account}"),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        send_conv(
+                                            &signal,
+                                            &sender,
+                                            &group_id,
+                                            &format!("error: {e}"),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            return;
+                        }
+
+                        if trimmed == "/targets" {
+                            let names = agent.ssh_target_names();
+                            let body = if names.is_empty() {
+                                "no ssh targets configured".to_string()
+                            } else {
+                                names.join("\n")
+                            };
+                            send_conv(&signal, &sender, &group_id, &body).await;
+                            return;
+                        }
+
+                        if trimmed == "/sessions" {
+                            // In groups, only list the group's SHARED sessions —
+                            // a member's personal session titles must never leak
+                            // into the group chat.
+                            let list_owner = if group_id.is_some() {
+                                "group"
+                            } else {
+                                &username
+                            };
+                            match memory.list_sessions(list_owner, 10).await {
+                                Ok(rows) if !rows.is_empty() => {
+                                    let mut body = String::from("recent sessions:\n");
+                                    for r in &rows {
+                                        let id8: String =
+                                            r.id.simple().to_string().chars().take(8).collect();
                                         let target = r.ssh_target.as_deref().unwrap_or("quick");
                                         let title = r.title.as_deref().unwrap_or("(untitled)");
-                                        send_conv(&signal, &sender, &group_id, &format!(
-                                            "📋 resumed {target} · {title}"
-                                        )).await;
+                                        body.push_str(&format!("• {id8} · {target} · {title}\n"));
                                     }
-                                    None => {
-                                        send_conv(&signal, &sender, &group_id, "no session matching that prefix").await;
-                                    }
+                                    body.push_str("\nresume with /session <id-prefix>");
+                                    send_conv(&signal, &sender, &group_id, &body).await;
+                                }
+                                Ok(_) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        "no sessions yet — /new <target> to start one",
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("error listing sessions: {e}"),
+                                    )
+                                    .await;
                                 }
                             }
-                            Err(e) => {
-                                send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
-                            }
-                        }
-                        return;
-                    }
-
-                    if trimmed == "/quick" {
-                        active.lock().await.remove(&conv_key);
-                        send_conv(&signal, &sender, &group_id, "📋 back to default session").await;
-                        return;
-                    }
-
-                    if trimmed == "/new" || trimmed.starts_with("/new ") {
-                        let rest = trimmed.strip_prefix("/new").unwrap().trim();
-                        let parts: Vec<&str> = rest.splitn(3, ' ').filter(|p| !p.is_empty()).collect();
-                        let target = parts.first().copied();
-                        let subdir = parts.get(1).copied();
-                        match agent.new_persisted_session(&username, target, subdir, None).await {
-                            Ok(sid) => {
-                                active.lock().await.insert(conv_key.clone(), sid);
-                                let id8: String = sid.simple().to_string().chars().take(8).collect();
-                                send_conv(&signal, &sender, &group_id, &format!(
-                                    "📋 new session {id8} · {}{}",
-                                    target.unwrap_or("quick"),
-                                    subdir.map(|d| format!(" · {d}")).unwrap_or_default(),
-                                )).await;
-                            }
-                            Err(e) => {
-                                send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
-                            }
-                        }
-                        return;
-                    }
-
-                    // ── Normal message → route to active or personal session ──
-
-                    // Pure acks need no queue slot and no model — instant
-                    // canned reply. (Skipped in groups: acks would spam
-                    // everyone.)
-                    if group_id.is_none() {
-                        let norm = trimmed.trim_end_matches(['.', '!']).to_lowercase();
-                        const ACKS: &[&str] = &[
-                            "ok", "k", "kk", "okay", "thanks", "thank you", "thx", "ty",
-                            "lol", "nice", "cool", "got it", "bet", "word", "👍", "❤️",
-                        ];
-                        if ACKS.contains(&norm.as_str()) {
-                            send_conv(&signal, &sender, &group_id, "👍").await;
                             return;
                         }
-                    }
 
-                    // Group chats share one session owned by "group"; DMs get
-                    // a per-user session. The lock is held across the
-                    // get-or-create so rapid consecutive messages can't
-                    // create two sessions for one conversation.
-                    let target_session = {
-                        let mut active_lock = active.lock().await;
-                        match active_lock.get(&conv_key) {
-                            Some(id) => *id,
-                            None => {
-                                let new_id = uuid::Uuid::new_v4();
-                                let session_user: &str =
-                                    if group_id.is_some() { "group" } else { &username };
-                                agent.open_session(
-                                    new_id,
-                                    session_user,
-                                    &workspace,
-                                    router::SessionKind::Interactive,
-                                    None,
-                                ).await;
-                                active_lock.insert(conv_key.clone(), new_id);
-                                new_id
-                            }
-                        }
-                    };
-
-                    // Send typing indicator
-                    let typing_result = match &group_id {
-                        Some(g) => signal.send_typing_group(g).await,
-                        None => signal.send_typing(&sender).await,
-                    };
-                    if let Err(e) = typing_result {
-                        tracing::warn!("send_typing: {e}");
-                    }
-
-                    // Keep the typing bubble alive (expires after 15s) and
-                    // send a "still consulting" note every 5 minutes.
-                    let signal_for_timer = signal.clone();
-                    let sender_for_timer = sender.clone();
-                    let group_for_timer = group_id.clone();
-                    let timer_handle = tokio::spawn(async move {
-                        let mut ticks: u32 = 0;
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                            ticks += 1;
-                            match &group_for_timer {
-                                Some(g) => { signal_for_timer.send_typing_group(g).await.ok(); }
-                                None => { signal_for_timer.send_typing(&sender_for_timer).await.ok(); }
-                            }
-                            if ticks % 30 == 0 {
-                                send_conv(
-                                    &signal_for_timer,
-                                    &sender_for_timer,
-                                    &group_for_timer,
-                                    "still consulting the oracle...",
-                                ).await;
-                            }
-                        }
-                    });
-
-                    let sender_for_emit = sender.clone();
-                    let signal_for_emit = signal.clone();
-                    let perms_for_emit = perms.clone();
-                    let group_for_emit = group_id.clone();
-                    let agent_for_emit = agent.clone();
-                    let response = Arc::new(std::sync::Mutex::new(String::new()));
-                    let resp = response.clone();
-                    let emit = move |ev: agent::AgentEvent| {
-                        match ev {
-                            agent::AgentEvent::PermissionNeeded(req) => {
-                                // Intercept — send a Signal prompt and store the
-                                // request so the reply resolves it.
-                                let path = req.path.chars().take(200).collect::<String>();
-                                tokio::spawn({
-                                    let signal = signal_for_emit.clone();
-                                    let sender = sender_for_emit.clone();
-                                    let perms = perms_for_emit.clone();
-                                    let group = group_for_emit.clone();
-                                    let agent = agent_for_emit.clone();
-                                    let request_id = req.request_id;
-                                    let session_id = req.session_id;
-                                    async move {
-                                        // One pending prompt per user —
-                                        // auto-deny an older unanswered one
-                                        // so it can't stall for 300s.
-                                        let old = perms.lock().await.insert(
-                                            sender.clone(),
-                                            (request_id, session_id, group.clone()),
-                                        );
-                                        if let Some((old_id, _, _)) = old {
-                                            agent.permissions.resolve(old_id, false).await;
+                        if let Some(prefix) = trimmed.strip_prefix("/session ") {
+                            let prefix = prefix.trim().to_lowercase();
+                            // In groups, only the group's shared sessions may be
+                            // resumed — mapping a group onto a member's PERSONAL
+                            // session would write every member's messages into
+                            // that user's private history.
+                            let list_owner = if group_id.is_some() {
+                                "group"
+                            } else {
+                                &username
+                            };
+                            match memory.list_sessions(list_owner, 50).await {
+                                Ok(rows) => {
+                                    let found = rows
+                                        .iter()
+                                        .find(|r| r.id.simple().to_string().starts_with(&prefix));
+                                    match found {
+                                        Some(r) => {
+                                            let sid = r.id;
+                                            // Load into memory if not already there
+                                            if !agent.has_session(sid).await {
+                                                if let Err(e) =
+                                                    agent.resume_session(sid, list_owner).await
+                                                {
+                                                    send_conv(
+                                                        &signal,
+                                                        &sender,
+                                                        &group_id,
+                                                        &format!("resume failed: {e}"),
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
+                                            }
+                                            active.lock().await.insert(conv_key.clone(), sid);
+                                            // Auto-attach SSH if needed — Signal sessions
+                                            // need SSH to execute tools (no TUI client).
+                                            if !agent.has_ssh(sid).await {
+                                                if let Some(t) = agent
+                                                    .ssh_targets
+                                                    .iter()
+                                                    .find(|t| t.owner == username)
+                                                {
+                                                    if let Err(e) =
+                                                        agent.attach_ssh(sid, &t.name).await
+                                                    {
+                                                        tracing::warn!("attach_ssh for {sid}: {e}");
+                                                    } else {
+                                                        tracing::info!(
+                                                            "auto-attached SSH {} to session {sid}",
+                                                            t.name
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            let target = r.ssh_target.as_deref().unwrap_or("quick");
+                                            let title = r.title.as_deref().unwrap_or("(untitled)");
+                                            send_conv(
+                                                &signal,
+                                                &sender,
+                                                &group_id,
+                                                &format!("📋 resumed {target} · {title}"),
+                                            )
+                                            .await;
                                         }
-                                        send_conv(&signal, &sender, &group, &format!(
-                                            "Allow {path}? Reply y or N (300s timeout)"
-                                        )).await;
+                                        None => {
+                                            send_conv(
+                                                &signal,
+                                                &sender,
+                                                &group_id,
+                                                "no session matching that prefix",
+                                            )
+                                            .await;
+                                        }
                                     }
-                                });
+                                }
+                                Err(e) => {
+                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}"))
+                                        .await;
+                                }
                             }
-                            agent::AgentEvent::ToolRequestNeeded { request_id, name, .. } => {
-                                // Signal sessions have no local tool executor
-                                // (tools run via SSH or a TUI client) — fail
-                                // fast instead of stalling the request queue
-                                // for the 300s timeout.
-                                let agent = agent_for_emit.clone();
-                                tokio::spawn(async move {
-                                    agent.resolve_tool(request_id, format!(
+                            return;
+                        }
+
+                        if trimmed == "/quick" {
+                            active.lock().await.remove(&conv_key);
+                            send_conv(&signal, &sender, &group_id, "📋 back to default session")
+                                .await;
+                            return;
+                        }
+
+                        if trimmed == "/mode" || trimmed.starts_with("/mode ") {
+                            let arg = trimmed.strip_prefix("/mode").unwrap().trim();
+                            let target_session = active.lock().await.get(&conv_key).copied();
+                            let Some(sid) = target_session else {
+                                send_conv(&signal, &sender, &group_id,
+                                "no coding session active — /new one first (mode lives per-session)").await;
+                                return;
+                            };
+                            if arg.is_empty() {
+                                let (_, _, mode) = agent.session_display(sid).await.unwrap_or((
+                                    None,
+                                    None,
+                                    temple_protocol::PermissionMode::Default,
+                                ));
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    &format!(
+                                        "mode: [{}] (default · ask · lockdown · yolo)",
+                                        mode_tag(mode)
+                                    ),
+                                )
+                                .await;
+                                return;
+                            }
+                            let mode = match arg.to_lowercase().as_str() {
+                                "default" => temple_protocol::PermissionMode::Default,
+                                "ask" => temple_protocol::PermissionMode::Ask,
+                                "lockdown" => temple_protocol::PermissionMode::Lockdown,
+                                "yolo" => temple_protocol::PermissionMode::Yolo,
+                                _ => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!(
+                                            "unknown mode: {arg} (default · ask · lockdown · yolo)"
+                                        ),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
+                            agent.set_session_mode(sid, mode).await;
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                &format!("mode → [{}]", mode_tag(mode)),
+                            )
+                            .await;
+                            return;
+                        }
+
+                        if trimmed == "/new" || trimmed.starts_with("/new ") {
+                            let rest = trimmed.strip_prefix("/new").unwrap().trim();
+                            let parts: Vec<&str> =
+                                rest.splitn(3, ' ').filter(|p| !p.is_empty()).collect();
+                            let target = parts.first().copied();
+                            let subdir = parts.get(1).copied();
+                            // Groups create shared "group"-owned sessions so the
+                            // conversation context belongs to the group, not to
+                            // whoever happened to create it.
+                            let session_owner = if group_id.is_some() {
+                                "group"
+                            } else {
+                                &username
+                            };
+                            match agent
+                                .new_persisted_session(session_owner, target, subdir, None)
+                                .await
+                            {
+                                Ok(sid) => {
+                                    active.lock().await.insert(conv_key.clone(), sid);
+                                    let id8: String =
+                                        sid.simple().to_string().chars().take(8).collect();
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!(
+                                            "📋 new session {id8} · {}{}",
+                                            target.unwrap_or("quick"),
+                                            subdir.map(|d| format!(" · {d}")).unwrap_or_default(),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}"))
+                                        .await;
+                                }
+                            }
+                            return;
+                        }
+
+                        // ── Normal message → route to active or personal session ──
+
+                        // Pure acks need no queue slot and no model — instant
+                        // canned reply. (Skipped in groups: acks would spam
+                        // everyone.)
+                        if group_id.is_none() {
+                            let norm = trimmed.trim_end_matches(['.', '!']).to_lowercase();
+                            const ACKS: &[&str] = &[
+                                "ok",
+                                "k",
+                                "kk",
+                                "okay",
+                                "thanks",
+                                "thank you",
+                                "thx",
+                                "ty",
+                                "lol",
+                                "nice",
+                                "cool",
+                                "got it",
+                                "bet",
+                                "word",
+                                "👍",
+                                "❤️",
+                            ];
+                            if ACKS.contains(&norm.as_str()) {
+                                send_conv(&signal, &sender, &group_id, "👍").await;
+                                return;
+                            }
+                        }
+
+                        // Group chats share one session owned by "group"; DMs get
+                        // a per-user session. The lock is held across the
+                        // get-or-create so rapid consecutive messages can't
+                        // create two sessions for one conversation.
+                        let target_session = {
+                            let mut active_lock = active.lock().await;
+                            match active_lock.get(&conv_key) {
+                                Some(id) => *id,
+                                None => {
+                                    let new_id = uuid::Uuid::new_v4();
+                                    let session_user: &str = if group_id.is_some() {
+                                        "group"
+                                    } else {
+                                        &username
+                                    };
+                                    agent
+                                        .open_session(
+                                            new_id,
+                                            session_user,
+                                            &workspace,
+                                            router::SessionKind::Interactive,
+                                            None,
+                                        )
+                                        .await;
+                                    active_lock.insert(conv_key.clone(), new_id);
+                                    new_id
+                                }
+                            }
+                        };
+
+                        // Send typing indicator
+                        let typing_result = match &group_id {
+                            Some(g) => signal.send_typing_group(g).await,
+                            None => signal.send_typing(&sender).await,
+                        };
+                        if let Err(e) = typing_result {
+                            tracing::warn!("send_typing: {e}");
+                        }
+
+                        // Keep the typing bubble alive (expires after 15s) and
+                        // send a "still consulting" note every 5 minutes.
+                        let signal_for_timer = signal.clone();
+                        let sender_for_timer = sender.clone();
+                        let group_for_timer = group_id.clone();
+                        let timer_handle = tokio::spawn(async move {
+                            let mut ticks: u32 = 0;
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                ticks += 1;
+                                match &group_for_timer {
+                                    Some(g) => {
+                                        signal_for_timer.send_typing_group(g).await.ok();
+                                    }
+                                    None => {
+                                        signal_for_timer.send_typing(&sender_for_timer).await.ok();
+                                    }
+                                }
+                                if ticks.is_multiple_of(30) {
+                                    send_conv(
+                                        &signal_for_timer,
+                                        &sender_for_timer,
+                                        &group_for_timer,
+                                        "still consulting the oracle...",
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
+
+                        let sender_for_emit = sender.clone();
+                        let signal_for_emit = signal.clone();
+                        let perms_for_emit = perms.clone();
+                        let group_for_emit = group_id.clone();
+                        let agent_for_emit = agent.clone();
+                        let response = Arc::new(std::sync::Mutex::new(String::new()));
+                        let resp = response.clone();
+                        let emit = move |ev: agent::AgentEvent| {
+                            match ev {
+                                agent::AgentEvent::PermissionNeeded(req) => {
+                                    // Intercept — send a Signal prompt and store the
+                                    // request so the reply resolves it.
+                                    let path = req.path.chars().take(200).collect::<String>();
+                                    tokio::spawn({
+                                        let signal = signal_for_emit.clone();
+                                        let sender = sender_for_emit.clone();
+                                        let perms = perms_for_emit.clone();
+                                        let group = group_for_emit.clone();
+                                        let agent = agent_for_emit.clone();
+                                        let request_id = req.request_id;
+                                        let session_id = req.session_id;
+                                        async move {
+                                            // One pending prompt per user —
+                                            // auto-deny an older unanswered one
+                                            // so it can't stall for 300s.
+                                            let old = perms.lock().await.insert(
+                                                sender.clone(),
+                                                (request_id, session_id, group.clone()),
+                                            );
+                                            if let Some((old_id, _, _)) = old {
+                                                agent.permissions.resolve(old_id, false).await;
+                                            }
+                                            send_conv(
+                                                &signal,
+                                                &sender,
+                                                &group,
+                                                &format!(
+                                                    "Allow {path}? Reply y or N (300s timeout)"
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                    });
+                                }
+                                agent::AgentEvent::ToolRequestNeeded {
+                                    request_id, name, ..
+                                } => {
+                                    // Signal sessions have no local tool executor
+                                    // (tools run via SSH or a TUI client) — fail
+                                    // fast instead of stalling the request queue
+                                    // for the 300s timeout.
+                                    let agent = agent_for_emit.clone();
+                                    tokio::spawn(async move {
+                                        agent.resolve_tool(request_id, format!(
                                         "Error: tool {name} needs an SSH target or TUI client — none attached to this session"
                                     )).await;
-                                });
-                            }
-                            agent::AgentEvent::Delta(d) => {
-                                response.lock().unwrap().push_str(&d);
-                            }
-                            agent::AgentEvent::StreamReset => {
-                                // Partial response from a failed stream
-                                // attempt — drop it, a retry follows.
-                                response.lock().unwrap().clear();
-                            }
-                            agent::AgentEvent::ToolEvent { name, detail, .. }
-                                if name == "routing" || name == "queue" =>
-                            {
-                                // Immediate status: model + queue-position
-                                // ack, and the "your turn" notice.
-                                tokio::spawn({
-                                    let signal = signal_for_emit.clone();
-                                    let sender = sender_for_emit.clone();
-                                    let group = group_for_emit.clone();
-                                    async move {
-                                        send_conv(&signal, &sender, &group, &detail).await;
+                                    });
+                                }
+                                agent::AgentEvent::Delta(d) => {
+                                    response.lock().unwrap().push_str(&d);
+                                }
+                                agent::AgentEvent::StreamReset => {
+                                    // Partial response from a failed stream
+                                    // attempt — drop it, a retry follows.
+                                    response.lock().unwrap().clear();
+                                }
+                                agent::AgentEvent::ToolEvent { name, detail, .. }
+                                    if name == "routing" || name == "queue" =>
+                                {
+                                    // Immediate status: model + queue-position
+                                    // ack, and the "your turn" notice.
+                                    tokio::spawn({
+                                        let signal = signal_for_emit.clone();
+                                        let sender = sender_for_emit.clone();
+                                        let group = group_for_emit.clone();
+                                        async move {
+                                            send_conv(&signal, &sender, &group, &detail).await;
+                                        }
+                                    });
+                                }
+                                agent::AgentEvent::TodoUpdated(items)
+                                    if !items.is_empty() => {
+                                        let done = items
+                                            .iter()
+                                            .filter(|i| {
+                                                i.status == temple_protocol::TodoStatus::Done
+                                            })
+                                            .count();
+                                        let mut msg =
+                                            format!("📋 tasks ({done}/{}):\n", items.len());
+                                        for item in &items {
+                                            let mark = match item.status {
+                                                temple_protocol::TodoStatus::Pending => "▫️",
+                                                temple_protocol::TodoStatus::InProgress => "▸",
+                                                temple_protocol::TodoStatus::Done => "▪️",
+                                            };
+                                            msg.push_str(&format!("{mark} {}\n", item.content));
+                                        }
+                                        tokio::spawn({
+                                            let signal = signal_for_emit.clone();
+                                            let sender = sender_for_emit.clone();
+                                            let group = group_for_emit.clone();
+                                            async move {
+                                                send_conv(&signal, &sender, &group, msg.trim_end())
+                                                    .await;
+                                            }
+                                        });
                                     }
-                                });
+                                _ => {}
                             }
-                            _ => {}
-                        }
-                    };
-                    // Group messages are prefixed so the model knows who is
-                    // speaking; queue priority is the individual sender's.
-                    let content = match &group_id {
-                        Some(_) => format!("{username}: {message}"),
-                        None => message.clone(),
-                    };
-                    agent
-                        .process_chat(target_session, &content, scope, &emit, Some(&username))
-                        .await;
-
-                    // Stop the "still consulting" timer
-                    timer_handle.abort();
-
-                    let text = resp.lock().unwrap().clone();
-                    if !text.trim().is_empty() {
-                        // Preamble for non-quick sessions
-                        let full = {
-                            let (target, title) = agent.session_display(target_session)
-                                .await
-                                .unwrap_or((None, None));
-                            let id8: String = target_session.simple().to_string().chars().take(8).collect();
-                            format!(
-                                "📋 {} · {}{}\n\n{}",
-                                target.as_deref().unwrap_or("temple"),
-                                id8,
-                                title.map(|t| format!(" · {t}")).unwrap_or_default(),
-                                text
-                            )
                         };
-                        send_conv(&signal, &sender, &group_id, &full).await;
-                    }
-                });
-            });
+                        // Group messages are prefixed so the model knows who is
+                        // speaking; queue priority is the individual sender's.
+                        let content = match &group_id {
+                            Some(_) => format!("{username}: {message}"),
+                            None => message.clone(),
+                        };
+                        agent
+                            .process_chat(target_session, &content, scope, &emit, Some(&username))
+                            .await;
+
+                        // Stop the "still consulting" timer
+                        timer_handle.abort();
+
+                        let text = resp.lock().unwrap().clone();
+                        if !text.trim().is_empty() {
+                            // Preamble for non-quick sessions
+                            let full = {
+                                let (target, title, mode) =
+                                    agent.session_display(target_session).await.unwrap_or((
+                                        None,
+                                        None,
+                                        temple_protocol::PermissionMode::Default,
+                                    ));
+                                let id8: String = target_session
+                                    .simple()
+                                    .to_string()
+                                    .chars()
+                                    .take(8)
+                                    .collect();
+                                format!(
+                                    "📋 {} · {}{} [{}]\n\n{}",
+                                    target.as_deref().unwrap_or("temple"),
+                                    id8,
+                                    title.map(|t| format!(" · {t}")).unwrap_or_default(),
+                                    mode_tag(mode),
+                                    text
+                                )
+                            };
+                            send_conv(&signal, &sender, &group_id, &full).await;
+                        }
+                    });
+                },
+            );
 
             signal.receive_loop(handler).await;
         });
@@ -746,7 +1056,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // First-contact sends to a number get rate
                             // limited by Signal (24h) — respect the backoff
                             // instead of extending it on every restart.
-                            let retry_at = memory.get_memory("welcome_retry_after", &u.username)
+                            let retry_at = memory
+                                .get_memory("welcome_retry_after", &u.username)
                                 .await
                                 .unwrap_or(None)
                                 .and_then(|s| s.parse::<i64>().ok());
@@ -759,21 +1070,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                             }
-                            if let Err(e) = signal.send(
-                                &u.phone,
-                                "You've been added to renco! Send /verify to complete setup.",
-                            ).await {
+                            if let Err(e) = signal
+                                .send(
+                                    &u.phone,
+                                    "You've been added to renco! Send /verify to complete setup.",
+                                )
+                                .await
+                            {
                                 tracing::warn!("welcome message to {} failed: {e}", u.phone);
                                 if let Some(secs) = parse_retry_after(&e) {
                                     let deadline = chrono::Utc::now().timestamp() + secs;
-                                    let _ = memory.set_memory(
-                                        "welcome_retry_after",
-                                        &deadline.to_string(),
-                                        &u.username,
-                                    ).await;
+                                    let _ = memory
+                                        .set_memory(
+                                            "welcome_retry_after",
+                                            &deadline.to_string(),
+                                            &u.username,
+                                        )
+                                        .await;
                                 }
                             } else {
-                                let _ = memory.set_memory("welcome_retry_after", "0", &u.username).await;
+                                // Success — mark with a far-future timestamp
+                                // so the rate-limit skip check holds
+                                // permanently. ("0" never satisfied
+                                // `now < ts`, so every restart re-sent the
+                                // welcome message.)
+                                let _ = memory
+                                    .set_memory(
+                                        "welcome_retry_after",
+                                        &i64::MAX.to_string(),
+                                        &u.username,
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -802,8 +1129,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notify_admins(&signal, &memory, "Temple server started, renco is online.").await;
     }
 
-    // Run the WebSocket server
-    server::run_server(agent, memory, cfg).await
+    // Run the WebSocket server, with graceful shutdown on SIGTERM/SIGINT:
+    // cancel in-flight loops and persist sessions before exiting, so no
+    // history or cron work is lost mid-write.
+    let shutdown_agent = agent.clone();
+    tokio::select! {
+        res = server::run_server(agent, memory, cfg) => res,
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received — draining");
+            shutdown_agent.shutdown().await;
+            Ok(())
+        }
+    }
+}
+
+/// Resolve once on SIGTERM or SIGINT.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            // Fall back to ctrl-c only
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 /// Generate a random 32-byte auth token, write `token:username:phone` to the
@@ -830,17 +1184,18 @@ fn generate_and_save_token(
         })
         .collect();
 
-    let token_file = cfg.auth_token_file.as_ref()
+    let token_file = cfg
+        .auth_token_file
+        .as_ref()
         .ok_or("auth_token_file not set in config — cannot generate token")?;
 
     // ':' is the field separator and newlines are the record separator —
     // either would corrupt the token file.
     for (field, value) in [("username", username), ("phone", phone)] {
-        if value.is_empty()
-            || value.contains(':')
-            || value.chars().any(char::is_whitespace)
-        {
-            return Err(format!("invalid {field}: must be non-empty with no ':' or whitespace").into());
+        if value.is_empty() || value.contains(':') || value.chars().any(char::is_whitespace) {
+            return Err(
+                format!("invalid {field}: must be non-empty with no ':' or whitespace").into(),
+            );
         }
     }
 
@@ -856,7 +1211,8 @@ fn generate_and_save_token(
     };
     let existing = std::fs::read_to_string(token_file).unwrap_or_default();
     // Remove any existing line for this username (re-generating replaces)
-    let lines: Vec<&str> = existing.lines()
+    let lines: Vec<&str> = existing
+        .lines()
         .filter(|l| {
             let parts: Vec<&str> = l.splitn(3, ':').collect();
             parts.len() < 2 || parts[1] != username
@@ -888,7 +1244,10 @@ async fn send_conv(
         None => signal.send_multi(sender, &text).await,
     };
     if let Err(e) = result {
-        tracing::warn!("signal send_conv to {}: {e}", group_id.as_deref().unwrap_or(sender));
+        tracing::warn!(
+            "signal send_conv to {}: {e}",
+            group_id.as_deref().unwrap_or(sender)
+        );
     }
 }
 
@@ -903,7 +1262,22 @@ fn parse_retry_after(err: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::Memory, message: &str) {
+/// Short text tag for the permission mode, used in the Signal preamble.
+/// Matches the TUI status-bar tag.
+fn mode_tag(mode: temple_protocol::PermissionMode) -> &'static str {
+    match mode {
+        temple_protocol::PermissionMode::Default => "default",
+        temple_protocol::PermissionMode::Ask => "ask",
+        temple_protocol::PermissionMode::Lockdown => "lockdown",
+        temple_protocol::PermissionMode::Yolo => "YOLO",
+    }
+}
+
+async fn notify_admins(
+    signal: &crate::signal::Signal,
+    memory: &crate::memory::Memory,
+    message: &str,
+) {
     match memory.get_admins().await {
         Ok(admins) if !admins.is_empty() => {
             for (phone, uuid) in &admins {
@@ -954,9 +1328,12 @@ async fn litellm_describe_image(
         temperature: Some(0.3),
     };
 
-    let resp = litellm.chat(req).await
+    let resp = litellm
+        .chat(req)
+        .await
         .map_err(|e| format!("vision model: {e}"))?;
-    resp.choices.first()
+    resp.choices
+        .first()
         .and_then(|c| c.message.content_text_owned())
         .ok_or_else(|| "no response from vision model".into())
 }

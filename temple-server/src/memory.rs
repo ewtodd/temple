@@ -67,6 +67,7 @@ impl Memory {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
+                account TEXT,
                 ssh_target TEXT,
                 cwd TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'default',
@@ -78,30 +79,36 @@ impl Memory {
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
             ",
         )?;
 
         // Detect columns that already exist (pre-migration-version databases
-        // may have had blind ALTER TABLE on every startup). If a column
-        // exists at its target version, bump user_version past that migration.
+        // may have had blind ALTER TABLE on every startup). Each check must
+        // cover the migration's FULL effect — a partial match must NOT bump
+        // the version, or later migrations get skipped.
         let has_column = |table: &str, col: &str| -> bool {
             let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).ok();
-            stmt.as_mut().map_or(false, |s| {
+            stmt.as_mut().is_some_and(|s| {
                 s.query_map([], |row| row.get::<_, String>(1))
                     .ok()
-                    .map_or(false, |rows| {
+                    .is_some_and(|rows| {
                         rows.filter_map(|r| r.ok()).any(|name| name == col)
                     })
             })
         };
 
-        if has_column("sessions", "account") && user_version < 1 {
-            // Index may also already exist — create it idempotently
-            let _ = conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account)");
-            user_version = user_version.max(1);
+        if user_version < 1 && has_column("sessions", "account") {
+            user_version = 1;
         }
-        if (has_column("signal_users", "admin") || has_column("signal_users", "priority")) && user_version < 2 {
-            user_version = user_version.max(2);
+        if user_version < 2
+            && has_column("signal_users", "admin")
+            && has_column("signal_users", "priority")
+        {
+            user_version = 2;
+        }
+        if user_version < 3 && has_column("sessions", "todos") {
+            user_version = 3;
         }
 
         // Persist the detected starting point
@@ -109,26 +116,36 @@ impl Memory {
             let _ = conn.execute_batch(&format!("PRAGMA user_version = {user_version}"));
         }
 
-        // ── Incremental migrations (only run once) ──
+        // ── Incremental migrations (only run once, each transactional) ──
         let migrate = |ver: i32, sql: &str| -> rusqlite::Result<()> {
             if user_version < ver {
-                conn.execute_batch(sql)?;
-                conn.execute_batch(&format!("PRAGMA user_version = {ver}"))?;
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(sql)?;
+                tx.execute_batch(&format!("PRAGMA user_version = {ver}"))?;
+                tx.commit()?;
                 tracing::info!("memory: migrated to version {ver}");
             }
             Ok(())
         };
 
         // Version 1: add account column to sessions + its index
-        migrate(1,
+        migrate(
+            1,
             "ALTER TABLE sessions ADD COLUMN account TEXT;\
-             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);"
+             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);",
         )?;
 
         // Version 2: add admin and priority columns to signal_users
-        migrate(2,
+        migrate(
+            2,
             "ALTER TABLE signal_users ADD COLUMN admin TEXT DEFAULT 'no';\
-             ALTER TABLE signal_users ADD COLUMN priority INTEGER DEFAULT -1;"
+             ALTER TABLE signal_users ADD COLUMN priority INTEGER DEFAULT -1;",
+        )?;
+
+        // Version 3: add todos column to sessions (per-session task lists)
+        migrate(
+            3,
+            "ALTER TABLE sessions ADD COLUMN todos TEXT NOT NULL DEFAULT '[]';",
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -152,14 +169,21 @@ impl Memory {
         Ok(())
     }
 
+    #[allow(dead_code)] // Public API for session inspection tooling.
     pub async fn get_session_history(
         &self,
         session_id: Uuid,
         limit: i64,
     ) -> rusqlite::Result<Vec<ConversationEntry>> {
         let conn = self.conn.lock().await;
+        // Newest N rows, returned in chronological order — `ORDER BY id ASC
+        // LIMIT N` would return the conversation's BEGINNING, not its most
+        // recent context.
         let mut stmt = conn.prepare(
-            "SELECT session_id, role, content, timestamp, model_used FROM conversations WHERE session_id = ?1 ORDER BY id ASC LIMIT ?2",
+            "SELECT session_id, role, content, timestamp, model_used FROM (\
+                SELECT id, session_id, role, content, timestamp, model_used \
+                FROM conversations WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2\
+             ) ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![session_id.to_string(), limit], |row| {
             Ok(ConversationEntry {
@@ -173,10 +197,8 @@ impl Memory {
             })
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -227,10 +249,8 @@ impl Memory {
             })
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -280,10 +300,8 @@ impl Memory {
             })
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -291,7 +309,10 @@ impl Memory {
     // ── Personality ──
 
     /// Get recent conversations across all sessions (for personality updates).
-    pub async fn get_recent_conversations(&self, limit: i64) -> rusqlite::Result<Vec<ConversationEntry>> {
+    pub async fn get_recent_conversations(
+        &self,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<ConversationEntry>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT session_id, role, content, timestamp, model_used FROM conversations ORDER BY id DESC LIMIT ?1",
@@ -308,10 +329,8 @@ impl Memory {
             })
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -380,11 +399,7 @@ impl Memory {
     }
 
     /// Record a verified UUID for a signal user.
-    pub async fn set_signal_user_uuid(
-        &self,
-        username: &str,
-        uuid: &str,
-    ) -> rusqlite::Result<()> {
+    pub async fn set_signal_user_uuid(&self, username: &str, uuid: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE signal_users SET uuid = ?2, verified_at = ?3 WHERE username = ?1",
@@ -394,11 +409,11 @@ impl Memory {
     }
 
     /// Get all verified signal users (phone + UUID).
-    pub async fn get_signal_users(&self) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+    pub async fn get_signal_users(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT username, phone, uuid FROM signal_users",
-        )?;
+        let mut stmt = conn.prepare("SELECT username, phone, uuid FROM signal_users")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -407,10 +422,8 @@ impl Memory {
             ))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -426,11 +439,7 @@ impl Memory {
         )?;
         let mut rows = stmt.query(params![identifier])?;
         match rows.next()? {
-            Some(row) => Ok(Some((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-            ))),
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
             None => Ok(None),
         }
     }
@@ -441,8 +450,8 @@ impl Memory {
     pub async fn save_session(&self, s: &PersistedSession) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO sessions (id, username, ssh_target, account, cwd, mode, kind, title, history, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10) \
+            "INSERT INTO sessions (id, username, ssh_target, account, cwd, mode, kind, title, history, todos, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11) \
              ON CONFLICT(id) DO UPDATE SET \
                ssh_target = EXCLUDED.ssh_target, \
                account = EXCLUDED.account, \
@@ -450,6 +459,7 @@ impl Memory {
                mode = EXCLUDED.mode, \
                title = EXCLUDED.title, \
                history = EXCLUDED.history, \
+               todos = EXCLUDED.todos, \
                updated_at = EXCLUDED.updated_at",
             params![
                 s.id.to_string(),
@@ -461,6 +471,7 @@ impl Memory {
                 s.kind,
                 s.title,
                 s.history_json,
+                s.todos_json,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
@@ -471,7 +482,7 @@ impl Memory {
     pub async fn load_session(&self, id: Uuid) -> rusqlite::Result<Option<PersistedSession>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, username, ssh_target, account, cwd, mode, kind, title, history FROM sessions WHERE id = ?1",
+            "SELECT id, username, ssh_target, account, cwd, mode, kind, title, history, todos FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.to_string()])?;
         match rows.next()? {
@@ -485,6 +496,7 @@ impl Memory {
                 kind: row.get(6)?,
                 title: row.get(7)?,
                 history_json: row.get(8)?,
+                todos_json: row.get(9)?,
             })),
             None => Ok(None),
         }
@@ -514,10 +526,8 @@ impl Memory {
             })
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -528,35 +538,50 @@ impl Memory {
     /// account column silently deletes nothing for them.
     pub async fn clear_sessions(&self, account: &str) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().await;
-        let n = conn.execute(
+        // Delete the conversations too — otherwise they're orphaned forever.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM conversations WHERE session_id IN (\
+                SELECT id FROM sessions WHERE account = ?1 OR username = ?1\
+             )",
+            params![account],
+        )?;
+        let n = tx.execute(
             "DELETE FROM sessions WHERE account = ?1 OR username = ?1",
             params![account],
         )?;
+        tx.commit()?;
         Ok(n)
     }
 
     /// Delete a single session by id. Also removes its conversation history.
     pub async fn delete_session(&self, id: Uuid) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM conversations WHERE session_id = ?1", params![id.to_string()])?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id.to_string()])?;
+        // Transactional — a crash between the two DELETEs must not orphan
+        // history rows.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM conversations WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Get all admin users' phone numbers + UUIDs.
     pub async fn get_admins(&self) -> rusqlite::Result<Vec<(String, Option<String>)>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT phone, uuid FROM signal_users WHERE admin = 'yes'",
-        )?;
+        let mut stmt = conn.prepare("SELECT phone, uuid FROM signal_users WHERE admin = 'yes'")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                results.push(r);
-            }
+        for r in rows.flatten() {
+            results.push(r);
         }
         Ok(results)
     }
@@ -575,10 +600,12 @@ pub struct PersistedSession {
     pub kind: String,
     pub title: Option<String>,
     pub history_json: String,
+    pub todos_json: String,
 }
 
 /// Summary for session listing.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // username/account used by list endpoints downstream.
 pub struct SessionSummary {
     pub id: Uuid,
     pub username: String,

@@ -12,7 +12,10 @@ with lib;
 let
   cfg = config.services.temple-server;
   toml = pkgs.formats.toml { };
-  configFile = toml.generate "temple-config.toml" {
+
+  # pkgs.formats.toml cannot serialize null — build the model/ssh sections
+  # with only the keys that are actually set.
+  configFile = toml.generate "temple-config.toml" ({
     listen = cfg.listen;
     litellm_url = cfg.litellmUrl;
     db_path = "${cfg.dataDir}/memory.db";
@@ -42,7 +45,8 @@ let
       reviewer_model = cfg.reviewerModel;
       critical_model = cfg.criticalModel;
       researcher_model = cfg.researcherModel;
-      router_model = cfg.routerModel;
+      # Documented fallback: routerModel unset → researcherModel.
+      router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
     };
     ssh_targets = map (t: {
       name = t.name;
@@ -52,12 +56,28 @@ let
       owner = t.owner;
       allowed_dirs = t.allowedDirs;
     }) cfg.sshTargets;
-    ssh_bastion = cfg.sshBastion;
-    ssh_key_path = cfg.sshKeyPath;
     local_llama_url = cfg.localLlamaUrl;
     local_llama_model = cfg.localLlamaModel;
-  };
+  }
+  // optionalAttrs (cfg.sshBastion != null) { ssh_bastion = cfg.sshBastion; }
+  // optionalAttrs (cfg.sshKeyPath != null) { ssh_key_path = cfg.sshKeyPath; });
+
   port = toString (lib.last (lib.splitString ":" cfg.listen));
+
+  # Parse "user@host:port" (any part optional) for the bastion Host block.
+  bastionParts = if cfg.sshBastion == null then null else
+    let
+      b = cfg.sshBastion;
+      hasAt = builtins.match ".*@.*" b != null;
+      userHost = if hasAt then lib.splitString "@" b else [ "deploy" b ];
+      user = builtins.head userHost;
+      hostPort = lib.last userHost;
+      hp = lib.splitString ":" hostPort;
+    in {
+      inherit user;
+      host = builtins.head hp;
+      port = if builtins.length hp > 1 then lib.last hp else "2222";
+    };
 in
 {
   options.services.temple-server = {
@@ -130,9 +150,8 @@ in
       description = ''
         Model used for complexity classification during query routing.
         Should be a small fast model (4B-class) co-resident with the
-        default/executor model on the same GPU host. Defaults to
-        researcherModel if unset. Point this at a 4B model loaded
-        alongside deepseek on son-of-anton for ~50ms classification.
+        default/executor model on the same GPU host. Falls back to
+        researcherModel when unset.
       '';
     };
 
@@ -161,14 +180,19 @@ in
       type = types.nullOr types.str;
       default = null;
       example = "deploy@10.0.0.2:2222";
-      description = "Bastion host for ProxyJump SSH connections.";
+      description = "Bastion host for ProxyJump SSH connections (user@host:port).";
     };
 
     sshKeyPath = mkOption {
-      type = types.nullOr types.path;
+      # types.str, NOT types.path — a path literal would copy the private
+      # key into the world-readable nix store.
+      type = types.nullOr types.str;
       default = null;
       example = "/run/agenix/temple-ssh-key";
-      description = "SSH private key for connecting to workstations.";
+      description = ''
+        SSH private key for connecting to workstations. Must be a runtime
+        path (agenix secret, /var/lib/...), never a nix store path.
+      '';
     };
 
     defaultPermission = mkOption {
@@ -180,7 +204,7 @@ in
     dataDir = mkOption {
       type = types.path;
       default = "/var/lib/temple";
-      description = "State directory: memory DB, skills.md, etc.";
+      description = "State directory: memory DB, skills.md, ssh config.";
     };
 
     environmentFile = mkOption {
@@ -213,10 +237,6 @@ in
         default = "127.0.0.1:7583";
         description = "signal-cli daemon TCP socket address.";
       };
-
-      # Phone numbers (recipient + allowed senders) are secrets — they come
-      # from the signalEnvironmentFile as SIGNAL_RECIPIENT (your number).
-      # The recipient is also added as the sole allowed sender.
     };
 
     nextcloud = {
@@ -257,14 +277,28 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.sshTargets == [ ] || cfg.sshKeyPath != null;
+        message = "services.temple-server: sshTargets is non-empty but sshKeyPath is unset — SSH tool execution will fail in BatchMode.";
+      }
+      {
+        assertion = cfg.sshKeyPath == null || !(lib.hasPrefix "/nix/store" cfg.sshKeyPath);
+        message = "services.temple-server: sshKeyPath must not point into the nix store — private keys in the store are world-readable.";
+      }
+    ];
+
     environment.systemPackages = [ cfg.package ];
+    # Expose the generated config for inspection/debugging and to give CI
+    # a buildable artifact that exercises TOML generation (a null value
+    # fails at build time, not eval time).
     environment.etc."temple/config.toml".source = configFile;
 
     users.users.temple = {
       isSystemUser = true;
       group = "temple";
       description = "temple renco agent";
-      home = "/var/lib/temple";
+      home = cfg.dataDir;
       # A real shell is required: ssh executes ProxyCommand via the user's
       # login shell, and nologin breaks the wake-and-relay proxy with
       # "This account is currently not available." as the SSH banner.
@@ -279,7 +313,7 @@ in
       wants = [ "network-online.target" ];
 
       environment.RUST_LOG = "temple_server=info";
-      environment.HOME = "/var/lib/temple";
+      environment.HOME = cfg.dataDir;
 
       # ssh must be in PATH — SshExecutor spawns `ssh` (and the generated
       # config's ProxyCommand spawns another `ssh`) for remote tool execution.
@@ -290,25 +324,36 @@ in
         User = "temple";
         Group = "temple";
         ExecStart = concatStringsSep " " (
-          [
-            "${cfg.package}/bin/temple-server"
-            "--config ${configFile}"
-          ]
-          ++ cfg.extraArgs
+          [ (escapeShellArgs [ "${cfg.package}/bin/temple-server" "--config" (toString configFile) ]) ]
+          ++ map escapeShellArg cfg.extraArgs
         );
         Restart = "always";
         RestartSec = "5s";
 
         StateDirectory = "temple";
         StateDirectoryMode = "0750";
+        UMask = "0077";
 
+        # Hardening — the service needs: network (WS + outbound HTTPS/SSH),
+        # spawning ssh, and its state dir. Nothing else.
         NoNewPrivileges = true;
         ProtectSystem = "full";
         ProtectHome = "read-only";
         PrivateTmp = true;
+        PrivateDevices = true;
         ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
         ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
         RestrictSUIDSGID = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        RemoveIPC = true;
+        CapabilityBoundingSet = "";
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       }
       // (optionalAttrs (cfg.environmentFile != null) {
         EnvironmentFile = if builtins.isList cfg.environmentFile then cfg.environmentFile else [ cfg.environmentFile ];
@@ -316,51 +361,55 @@ in
     };
 
     # SSH config for the temple user. One Host alias per target
-    # (name with @ replaced by -, e.g. e-work@e-desktop → e-work-e-desktop)
-    # plus the bastion. Targets with a proxyCommand (wake-on-LAN relay)
-    # use it; others ProxyJump through the bastion.
+    # (name with @ replaced by -, e.g. e-work@e-desktop → e-work-e-desktop).
+    # Targets with a proxyCommand (wake-on-LAN relay) use it; others
+    # ProxyJump through the bastion. The bastion block is generated from
+    # cfg.sshBastion (user@host:port) and only emitted when configured.
     environment.etc."temple/ssh_config".text =
       let
         sanitize = name: builtins.replaceStrings [ "@" ] [ "-" ] name;
+        identityFile = if cfg.sshKeyPath != null then cfg.sshKeyPath else "${cfg.dataDir}/ssh_key";
         targetBlock = t: ''
           Host ${sanitize t.name}
             HostName ${t.host}
             Port ${toString t.port}
             User ${t.account}
-            IdentityFile ${if cfg.sshKeyPath != null then cfg.sshKeyPath else "/var/lib/temple/ssh_key"}
-            UserKnownHostsFile /var/lib/temple/.ssh/known_hosts
+            IdentityFile ${identityFile}
+            UserKnownHostsFile ${cfg.dataDir}/.ssh/known_hosts
             StrictHostKeyChecking accept-new
             BatchMode yes
             ConnectTimeout 15
           ${if t.proxyCommand != null then
             "  ProxyCommand ${t.proxyCommand}"
           else if cfg.sshBastion != null then
-            "  ProxyJump ${cfg.sshBastion}"
+            "  ProxyJump bastion"
           else ""}
+        '';
+        bastionBlock = optionalString (bastionParts != null) ''
+          Host bastion
+            HostName ${bastionParts.host}
+            Port ${bastionParts.port}
+            User ${bastionParts.user}
+            IdentityFile ${identityFile}
+            UserKnownHostsFile ${cfg.dataDir}/.ssh/known_hosts
+            StrictHostKeyChecking accept-new
+            BatchMode yes
+            ControlMaster auto
+            ControlPath ${cfg.dataDir}/.ssh/control-%r@%h-%p
+            ControlPersist 5m
         '';
       in
       ''
-        Host bastion
-          HostName 10.0.0.2
-          Port 2222
-          User deploy
-          IdentityFile ${if cfg.sshKeyPath != null then cfg.sshKeyPath else "/var/lib/temple/ssh_key"}
-          UserKnownHostsFile /var/lib/temple/.ssh/known_hosts
-          StrictHostKeyChecking accept-new
-          BatchMode yes
-          ControlMaster auto
-          ControlPath /var/lib/temple/.ssh/control-%r@%h-%p
-          ControlPersist 5m
-
+        ${bastionBlock}
         ${concatStringsSep "\n" (map targetBlock cfg.sshTargets)}
       '';
     systemd.tmpfiles.rules = [
-      "d /var/lib/temple/.ssh 0700 temple temple - -"
-      "L+ /var/lib/temple/.ssh/config - - - - /etc/temple/ssh_config"
+      "d ${cfg.dataDir}/.ssh 0700 temple temple - -"
+      "L+ ${cfg.dataDir}/.ssh/config - - - - /etc/temple/ssh_config"
     ];
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
-      (lib.toInt port)
+      (lib.toIntBase10 port)
     ];
   };
 }

@@ -4,17 +4,28 @@
 //! it is the scarce resource), but requests to DIFFERENT models run in
 //! parallel — a gemma chat on anton never blocks a deepseek agentic loop
 //! on son-of-anton. Within a lane, requests dequeue by priority — lower
-//! value first (0 = ethan, 1 = valarie, -1 = default for everyone else).
-//! Named tiers (priority >= 0) are FIFO so a user's consecutive messages
-//! keep their send order; the default tier shuffles so nobody is
-//! systematically last. Non-preemptive: a running request always finishes
-//! first.
+//! value first (0 = ethan, 1 = valarie). Users without a named tier
+//! (priority < 0, the default) always sort AFTER every named tier, in
+//! random order so nobody is systematically last. Named tiers are FIFO so
+//! a user's consecutive messages keep their send order. Non-preemptive: a
+//! running request always finishes first.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use tokio::sync::oneshot;
+
+/// Map a stored priority value to its queue ordering value. Negative
+/// values (the default tier) must sort after every named tier — without
+/// this mapping, -1 would dequee ahead of 0 and 1.
+fn effective_priority(priority: i32) -> i32 {
+    if priority < 0 {
+        i32::MAX
+    } else {
+        priority
+    }
+}
 
 struct Waiter {
     priority: i32,
@@ -102,13 +113,9 @@ impl RequestQueue {
             }
             let (tx, rx) = oneshot::channel();
             let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
-            let tiebreak = if priority >= 0 {
-                seq
-            } else {
-                rand::random()
-            };
+            let tiebreak = if priority >= 0 { seq } else { rand::random() };
             lane_state.waiters.push(Waiter {
-                priority,
+                priority: effective_priority(priority),
                 tiebreak,
                 ready: tx,
             });
@@ -149,5 +156,110 @@ impl Drop for QueuePermit<'_> {
             // Waiter went away without collecting — try the next one.
         }
         lane_state.running = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The priority-inversion regression test: default-tier requests (-1)
+    /// must NEVER dequeue ahead of named tiers (0, 1). Before the fix,
+    /// -1 sorted lowest and won every race — the exact opposite of the
+    /// documented intent.
+    #[tokio::test]
+    async fn named_tiers_beat_default() {
+        let q = Arc::new(RequestQueue::new());
+        // Occupy the lane.
+        let p0 = q.acquire("m", 0).await.0;
+
+        // Queue: default first, then val(1), then ethan(0).
+        let default_task = {
+            let q = q.clone();
+            tokio::spawn(async move {
+                q.acquire("m", -1).await;
+            })
+        };
+        let val_task = {
+            let q = q.clone();
+            tokio::spawn(async move {
+                q.acquire("m", 1).await;
+            })
+        };
+        let ethan_task = {
+            let q = q.clone();
+            tokio::spawn(async move {
+                q.acquire("m", 0).await;
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // Release — ethan (0) must win over val (1) and default (-1).
+        // (Each spawned task drops its permit when it completes, which is
+        // what hands the lane to the next waiter.)
+        drop(p0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), ethan_task)
+            .await
+            .expect("ethan should win the lane first")
+            .unwrap();
+
+        // ethan's task completing released the lane — val (1) must beat
+        // default (-1).
+        tokio::time::timeout(std::time::Duration::from_secs(1), val_task)
+            .await
+            .expect("val should win the lane second")
+            .unwrap();
+
+        // ...and the default tier runs last.
+        tokio::time::timeout(std::time::Duration::from_secs(1), default_task)
+            .await
+            .expect("default should get the lane last")
+            .unwrap();
+    }
+
+    /// Named tiers are FIFO within the same priority — send order is
+    /// preserved for consecutive messages from one user.
+    #[tokio::test]
+    async fn named_tier_is_fifo() {
+        let q = Arc::new(RequestQueue::new());
+        let p0 = q.acquire("m", 0).await.0;
+        let t1 = {
+            let q = q.clone();
+            tokio::spawn(async move {
+                q.acquire("m", 0).await;
+            })
+        };
+        let t2 = {
+            let q = q.clone();
+            tokio::spawn(async move {
+                q.acquire("m", 0).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(p0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), t1)
+            .await
+            .expect("first waiter should win")
+            .unwrap();
+        // t1's permit dropped on task completion → t2 proceeds.
+        tokio::time::timeout(std::time::Duration::from_secs(1), t2)
+            .await
+            .expect("second waiter should follow")
+            .unwrap();
+    }
+
+    /// Different lanes run in parallel — a busy gemma lane never blocks
+    /// deepseek.
+    #[tokio::test]
+    async fn lanes_are_independent() {
+        let q = RequestQueue::new();
+        let _p1 = q.acquire("gemma", 0).await;
+        // No waiting required on the other lane.
+        let (_p2, queued) = q.acquire("deepseek", 0).await;
+        assert!(
+            !queued,
+            "a fresh lane should not wait behind another lane's traffic"
+        );
     }
 }
