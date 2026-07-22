@@ -258,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !attachment_paths.is_empty() {
                         let vision_model = agent.models.router_model.as_deref()
                             .unwrap_or(&agent.models.researcher_model);
-                        let signal_host = signal.host().to_string();
+                        let signal_host = "bastion".to_string(); // SSH config alias → mu:2222
                         let mut descriptions = Vec::new();
                         for (path, content_type) in &attachment_paths {
                             // Read the file from the signal host via SSH
@@ -942,6 +942,7 @@ async fn litellm_describe_image(
 async fn read_remote_file(host: &str, path: &str) -> Result<Vec<u8>, String> {
     let output = tokio::process::Command::new("ssh")
         .args([
+            "-F", "/var/lib/temple/.ssh/config",
             "-o", "ConnectTimeout=10",
             "-o", "BatchMode=yes",
             host,
