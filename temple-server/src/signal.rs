@@ -29,18 +29,17 @@ impl Signal {
         self.config.enabled
     }
 
-    /// Return the host portion of the configured socket address.
-    pub fn host(&self) -> &str {
-        self.config.socket_addr
-            .split(':').next()
-            .unwrap_or("127.0.0.1")
-    }
-
     /// One JSON-RPC call over a fresh TCP connection: write the request
     /// line, read the response line, surface any error field.
     async fn rpc_call(&self, method: &str, params: Value) -> Result<(), String> {
+        self.rpc_call_returning(method, params).await.map(|_| ())
+    }
+
+    /// Same as `rpc_call` but returns the parsed `result` field. Used by
+    /// methods like `getAttachment` that return data to the caller.
+    async fn rpc_call_returning(&self, method: &str, params: Value) -> Result<Value, String> {
         if !self.config.enabled {
-            return Ok(());
+            return Ok(Value::Null);
         }
 
         let mut stream = TcpStream::connect(&self.config.socket_addr)
@@ -64,12 +63,12 @@ impl Signal {
             .await
             .map_err(|e| format!("signal read: {e}"))?;
 
-        if let Ok(resp) = serde_json::from_str::<Value>(&response_line) {
-            if let Some(err) = resp.get("error") {
-                return Err(format!("{method} error: {err}"));
-            }
+        let resp = serde_json::from_str::<Value>(&response_line)
+            .map_err(|e| format!("signal parse: {e}"))?;
+        if let Some(err) = resp.get("error") {
+            return Err(format!("{method} error: {err}"));
         }
-        Ok(())
+        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// Send a read receipt for a message timestamp. This marks the message
@@ -80,6 +79,28 @@ impl Signal {
             "targetTimestamp": [timestamp],
             "type": "read",
         })).await
+    }
+
+    /// Fetch an already-downloaded attachment from signal-cli's storage by
+    /// its id (the same `id` field that appears in the `receive`
+    /// notification's attachment metadata). Returns the raw file bytes.
+    ///
+    /// signal-cli's `getAttachment` JSON-RPC method reads the file from
+    /// its own attachment store (`<data-dir>/attachments/<sanitized-id>`)
+    /// and returns it base64-encoded. We decode to bytes here so callers
+    /// don't have to. This avoids any need to SSH to the signal host or
+    /// guess the on-disk path — signal-cli knows where it put the file.
+    pub async fn get_attachment(&self, id: &str) -> Result<Vec<u8>, String> {
+        use base64::Engine;
+        let result = self.rpc_call_returning("getAttachment", json!({
+            "id": id,
+        })).await?;
+        let b64 = result.get("data")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| format!("getAttachment: missing 'data' field in response: {result}"))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("getAttachment: base64 decode failed: {e}"))
     }
 
     /// Send a typing indicator. Shows the typing bubble for ~15 seconds;
@@ -305,13 +326,11 @@ impl Signal {
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0);
 
-            // Extract image attachments — signal-cli daemon downloads them to
-            // /var/lib/signal-cli/data/attachments/<id> on the signal host.
-            // The JSON notification only includes metadata (id, contentType,
-            // size, width, height), NOT the local path. We construct the path
-            // from the known attachment directory.
-            // NB: attachments live on the signal host (mu), NOT on oracle.
-            // Reading them requires SSH — handled by describe_image in main.rs.
+            // Extract image attachments. The JSON-RPC notification carries
+            // only metadata (id, contentType, size, ...); the bytes are
+            // fetched on demand via the `getAttachment` JSON-RPC method,
+            // which reads from signal-cli's own attachment store. We pass
+            // the id through to the handler unchanged.
             let attachment_ids: Vec<(String, String)> = envelope.get("dataMessage")
                 .and_then(|d| d.get("attachments"))
                 .and_then(|a| a.as_array())
@@ -332,10 +351,7 @@ impl Signal {
                             if id.is_empty() {
                                 return None;
                             }
-                            let path = format!(
-                                "/var/lib/signal-cli/data/attachments/{id}"
-                            );
-                            Some((path, content_type))
+                            Some((id, content_type))
                         })
                         .collect()
                 })
@@ -343,16 +359,10 @@ impl Signal {
 
             if !attachment_ids.is_empty() {
                 tracing::info!(
-                    "signal: got {} attachment(s): {:?}",
+                    "signal: got {} image attachment(s): {:?}",
                     attachment_ids.len(),
                     attachment_ids,
                 );
-                // Dump raw attachment JSON to find correct field names
-                if let Some(atts) = envelope.get("dataMessage")
-                    .and_then(|d| d.get("attachments"))
-                {
-                    tracing::info!("signal: raw attachment JSON: {}", atts);
-                }
             }
 
             if message.is_empty() && attachment_ids.is_empty() {

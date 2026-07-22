@@ -148,7 +148,7 @@ impl CronScheduler {
         match self.agent.litellm.chat(req).await {
             Ok(resp) => {
                 if let Some(choice) = resp.choices.first() {
-                    if let Some(content) = choice.message.content.as_deref() {
+                    if let Some(content) = choice.message.content_text() {
                         let mut extracted = 0;
                         for line in content.lines() {
                             let line = line.trim();

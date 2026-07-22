@@ -459,7 +459,7 @@ impl Agent {
         // Build transcript of user/assistant text turns for client replay
         let transcript: Vec<(String, String)> = history.iter()
             .filter_map(|m| {
-                let content = m.content.clone()?;
+                let content = m.content_text_owned()?;
                 if (m.role == "user" || m.role == "assistant")
                     && !content.is_empty()
                     && m.tool_call_id.is_none()
@@ -570,7 +570,7 @@ impl Agent {
                 }
                 s.history.iter()
                     .find(|m| m.role == "user")
-                    .and_then(|m| m.content.clone())
+                    .and_then(|m| m.content_text_owned())
                     .map(|content| {
                         // Group messages are stored as "sender: text" —
                         // don't let the sender prefix leak into titles.
@@ -629,7 +629,7 @@ impl Agent {
 
         let model_title = match self.litellm.chat(req).await {
             Ok(resp) => resp.choices.first()
-                .and_then(|c| c.message.content.clone())
+                .and_then(|c| c.message.content_text_owned())
                 .map(|t| t.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string())
                 .filter(|t| {
                     let words = t.split_whitespace().count();
@@ -1101,7 +1101,7 @@ impl Agent {
                 match resp {
                     Ok(resp) => {
                         if let Some(choice) = resp.choices.first() {
-                            if let Some(content) = choice.message.content.as_deref() {
+                            if let Some(content) = choice.message.content_text() {
                                 return content.trim().to_string();
                             }
                         }
@@ -1154,7 +1154,7 @@ impl Agent {
                 match resp {
                     Ok(resp) => {
                         if let Some(choice) = resp.choices.first() {
-                            if let Some(content) = choice.message.content.as_deref() {
+                            if let Some(content) = choice.message.content_text() {
                                 let trimmed = content.trim();
                                 if trimmed.to_uppercase().starts_with("APPROVED") {
                                     return (true, String::new());
@@ -1926,7 +1926,7 @@ Git conventions:
         match self.litellm.chat(req).await {
             Ok(resp) => {
                 if let Some(choice) = resp.choices.first() {
-                    if let Some(new_personality) = choice.message.content.as_deref() {
+                    if let Some(new_personality) = choice.message.content_text() {
                         let trimmed = new_personality.trim();
                         if !trimmed.is_empty() && trimmed.len() > 20 {
                             tracing::info!("Updating personality: {trimmed:.80}...");

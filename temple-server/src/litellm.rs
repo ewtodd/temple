@@ -14,7 +14,7 @@ pub struct LiteLLM {
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,11 +23,35 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
+/// Message content — either plain text (the common case) or a multipart
+/// array (used for vision requests with image_url parts).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One part of a multipart message. Matches the OpenAI chat content-part
+/// schema: `{"type":"text","text":"..."}` or
+/// `{"type":"image_url","image_url":{"url":"..."}}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -37,7 +61,7 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -47,7 +71,7 @@ impl ChatMessage {
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
         Self {
             role: "assistant".into(),
-            content,
+            content: content.map(MessageContent::Text),
             tool_calls,
             tool_call_id: None,
             name: None,
@@ -57,11 +81,26 @@ impl ChatMessage {
     pub fn tool_result(tool_call_id: impl Into<String>, name: impl Into<String>, content: String) -> Self {
         Self {
             role: "tool".into(),
-            content: Some(content),
+            content: Some(MessageContent::Text(content)),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
         }
+    }
+
+    /// Return the message's text content if it is plain text. Returns None
+    /// for multipart (vision) messages, which have no single text body.
+    pub fn content_text(&self) -> Option<&str> {
+        match self.content.as_ref()? {
+            MessageContent::Text(s) => Some(s),
+            MessageContent::Parts(_) => None,
+        }
+    }
+
+    /// Owned-text convenience — same semantics as `content_text` but
+    /// returns a cloned `String` for callers that need ownership.
+    pub fn content_text_owned(&self) -> Option<String> {
+        self.content_text().map(|s| s.to_string())
     }
 }
 
@@ -502,7 +541,7 @@ impl LiteLLM {
 
         let resp = self.chat(req).await.ok()?;
         let choice = resp.choices.first()?;
-        let content = choice.message.content.as_deref()?.trim().to_lowercase();
+        let content = choice.message.content_text()?.trim().to_lowercase();
 
         if content.starts_with("simple") {
             Some(ComplexityClass::Simple)

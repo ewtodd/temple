@@ -253,24 +253,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // ── Image attachments: describe with vision model, prepend to text ──
-                    // Attachments live on the signal-cli host (mu, 10.0.0.2), not on
-                    // oracle. Read them via SSH, then send to the vision model via litellm.
+                    // Fetch each attachment's bytes via signal-cli's getAttachment
+                    // JSON-RPC method (same socket we use for sends), then send
+                    // the image to the vision model as a multipart content array.
                     if !attachment_paths.is_empty() {
                         let vision_model = agent.models.router_model.as_deref()
                             .unwrap_or(&agent.models.researcher_model);
-                        let signal_host = "bastion".to_string(); // SSH config alias → mu:2222
                         let mut descriptions = Vec::new();
-                        for (path, content_type) in &attachment_paths {
-                            // Read the file from the signal host via SSH
-                            let data = match read_remote_file(&signal_host, path).await {
-                                Ok(d) => d,
+                        for (id, content_type) in &attachment_paths {
+                            let bytes = match signal.get_attachment(id).await {
+                                Ok(b) => b,
                                 Err(e) => {
-                                    tracing::warn!("ssh read {signal_host}:{path}: {e}");
+                                    tracing::warn!("getAttachment {id}: {e}");
                                     continue;
                                 }
                             };
                             let ext = if content_type.contains("png") { "png" } else { "jpg" };
-                            let b64 = base64_encode(&data);
+                            let b64 = base64_encode(&bytes);
                             let image_url = format!("data:image/{ext};base64,{b64}");
                             match litellm_describe_image(&agent.litellm, vision_model, &image_url).await {
                                 Ok(desc) => descriptions.push(desc),
@@ -908,16 +907,22 @@ async fn litellm_describe_image(
     model: &str,
     image_url: &str,
 ) -> Result<String, String> {
-    let content = serde_json::json!([
-        {"type": "image_url", "image_url": {"url": image_url}},
-        {"type": "text", "text": "Describe this image in detail. Focus on visible text, UI elements, code, diagrams, people, objects. Be concise but thorough."},
+    use crate::litellm::{ContentPart, ImageUrl, MessageContent};
+
+    let content = MessageContent::Parts(vec![
+        ContentPart::ImageUrl {
+            image_url: ImageUrl { url: image_url.to_string() },
+        },
+        ContentPart::Text {
+            text: "Describe this image in detail. Focus on visible text, UI elements, code, diagrams, people, objects. Be concise but thorough.".into(),
+        },
     ]);
 
     let req = crate::litellm::ChatRequest {
         model: model.to_string(),
         messages: vec![crate::litellm::ChatMessage {
             role: "user".into(),
-            content: Some(content.to_string()),
+            content: Some(content),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -932,36 +937,8 @@ async fn litellm_describe_image(
     let resp = litellm.chat(req).await
         .map_err(|e| format!("vision model: {e}"))?;
     resp.choices.first()
-        .and_then(|c| c.message.content.clone())
+        .and_then(|c| c.message.content_text_owned())
         .ok_or_else(|| "no response from vision model".into())
-}
-
-/// Read a file from a remote host via SSH. Uses the system SSH config
-/// (keys, known_hosts). Files are read as raw bytes — no shell escaping
-/// needed since we cat a known path.
-async fn read_remote_file(host: &str, path: &str) -> Result<Vec<u8>, String> {
-    let output = tokio::process::Command::new("ssh")
-        .args([
-            "-F", "/var/lib/temple/.ssh/config",
-            "-o", "ConnectTimeout=10",
-            "-o", "BatchMode=yes",
-            host,
-            &format!("cat -- {}", shell_escape_single(path)),
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("ssh spawn: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let code = output.status.code().unwrap_or(-1);
-        return Err(format!("ssh {host} exit {code}: {stderr}"));
-    }
-    Ok(output.stdout)
-}
-
-fn shell_escape_single(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 fn base64_encode(data: &[u8]) -> String {
