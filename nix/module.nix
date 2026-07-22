@@ -280,6 +280,19 @@ in
       default = [ ];
       description = "Extra CLI arguments for temple-server.";
     };
+
+    gitSafeDirectories = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "/etc/nixos" ];
+      description = ''
+        Git repositories the temple user may open despite not owning them.
+        The cron smart-flake-update runs `nix flake update`, which fetches
+        the flake via libgit2 — and libgit2 refuses repos not owned by the
+        invoking user (the "dubious ownership" check). Each path here lands
+        in the temple user's gitconfig as a safe.directory entry.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -413,7 +426,19 @@ in
     systemd.tmpfiles.rules = [
       "d ${cfg.dataDir}/.ssh 0700 temple temple - -"
       "L+ ${cfg.dataDir}/.ssh/config - - - - /etc/temple/ssh_config"
-    ];
+    ]
+    ++ lib.optional (cfg.gitSafeDirectories != [ ])
+      "L+ ${cfg.dataDir}/.gitconfig - - - - /etc/temple/gitconfig";
+
+    # gitconfig marking configured repos as safe for the temple user
+    # (libgit2's dubious-ownership check — cron flake updates would
+    # otherwise fail with "repository path is not owned by current user").
+    environment.etc."temple/gitconfig" = mkIf (cfg.gitSafeDirectories != [ ]) {
+      text = ''
+        [safe]
+        ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
+      '';
+    };
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
       (lib.toIntBase10 port)
