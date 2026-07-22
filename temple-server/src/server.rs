@@ -256,10 +256,18 @@ async fn handle_connection(
                 }
             }
 
-            ClientMessage::NewSession { ssh_target } => {
+            ClientMessage::NewSession {
+                ssh_target,
+                start_dir,
+            } => {
                 let owner = auth_owner.clone().unwrap_or_default();
                 match agent
-                    .new_persisted_session(&owner, ssh_target.as_deref(), None, None)
+                    .new_persisted_session(
+                        &owner,
+                        ssh_target.as_deref(),
+                        start_dir.as_deref(),
+                        None,
+                    )
                     .await
                 {
                     Ok(sid) => {

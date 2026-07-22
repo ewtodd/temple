@@ -538,16 +538,22 @@ impl Memory {
     /// account column silently deletes nothing for them.
     pub async fn clear_sessions(&self, account: &str) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().await;
-        // Delete the conversations too — otherwise they're orphaned forever.
+        // Match by username (owner), machine account, exact ssh target, or
+        // target account prefix — so `/clear ethan`, `/clear e-play`, and
+        // `/clear e-work@e-desktop` all do what the user means.
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM conversations WHERE session_id IN (\
-                SELECT id FROM sessions WHERE account = ?1 OR username = ?1\
+                SELECT id FROM sessions \
+                WHERE account = ?1 OR username = ?1 OR ssh_target = ?1 \
+                   OR ssh_target LIKE ?1 || '@%'\
              )",
             params![account],
         )?;
         let n = tx.execute(
-            "DELETE FROM sessions WHERE account = ?1 OR username = ?1",
+            "DELETE FROM sessions \
+             WHERE account = ?1 OR username = ?1 OR ssh_target = ?1 \
+                OR ssh_target LIKE ?1 || '@%'",
             params![account],
         )?;
         tx.commit()?;

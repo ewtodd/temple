@@ -450,6 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "commands:\n\
                              /sessions — list your recent sessions\n\
                              /session <id-prefix> — resume a session\n\
+                             /delete <id-prefix> — delete a session\n\
                              /new <target> [dir] — new coding session\n\
                              /new — new session\n\
                              /quick — back to the default session\n\
@@ -566,6 +567,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 names.join("\n")
                             };
                             send_conv(&signal, &sender, &group_id, &body).await;
+                            return;
+                        }
+
+                        if trimmed == "/delete" || trimmed.starts_with("/delete ") {
+                            let prefix = trimmed.strip_prefix("/delete").unwrap().trim().to_lowercase();
+                            if prefix.is_empty() {
+                                send_conv(&signal, &sender, &group_id, "usage: /delete <id-prefix>").await;
+                                return;
+                            }
+                            let list_owner = if group_id.is_some() { "group" } else { &username };
+                            match memory.list_sessions(list_owner, 50).await {
+                                Ok(rows) => {
+                                    let found = rows.iter().find(|r| {
+                                        r.id.simple().to_string().starts_with(&prefix)
+                                    });
+                                    match found {
+                                        Some(r) => {
+                                            agent.close_session(r.id).await;
+                                            match memory.delete_session(r.id).await {
+                                                Ok(_) => {
+                                                    // Drop any active-map pointers to it
+                                                    let mut active_lock = active.lock().await;
+                                                    active_lock.retain(|_, v| *v != r.id);
+                                                    drop(active_lock);
+                                                    let target = r.ssh_target.as_deref().unwrap_or("quick");
+                                                    let title = r.title.as_deref().unwrap_or("(untitled)");
+                                                    send_conv(&signal, &sender, &group_id, &format!(
+                                                        "🗑 deleted {target} · {title}"
+                                                    )).await;
+                                                }
+                                                Err(e) => {
+                                                    send_conv(&signal, &sender, &group_id, &format!("delete failed: {e}")).await;
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            send_conv(&signal, &sender, &group_id, "no session matching that prefix").await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
+                                }
+                            }
                             return;
                         }
 

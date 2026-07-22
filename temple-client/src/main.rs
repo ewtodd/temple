@@ -565,7 +565,10 @@ fn spawn_ws(
                                 s.entries.push(ChatEntry::System(
                                     "(that was the active session — starting fresh)".into(),
                                 ));
-                                let _ = tx_session.send(ClientMessage::NewSession { ssh_target: None });
+                                let _ = tx_session.send(ClientMessage::NewSession {
+                                    ssh_target: None,
+                                    start_dir: None,
+                                });
                             }
                         }
                         ServerMessage::Pong | ServerMessage::SessionClosed { .. } | ServerMessage::ToolResult { .. } | ServerMessage::ToolRequest { .. } => {}
@@ -1371,7 +1374,10 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             return;
                         }
                         "/new" => {
-                            cmd_h.send(ClientMessage::NewSession { ssh_target: None }).ok();
+                            cmd_h.send(ClientMessage::NewSession {
+                                ssh_target: None,
+                                start_dir: None,
+                            }).ok();
                             return;
                         }
                         "/help" => {
@@ -1420,6 +1426,12 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 }
                                 return;
                             }
+                            if content == "/clear" {
+                                s.entries.push(ChatEntry::System(
+                                    "usage: /clear <user|account|target> — e.g. /clear e-play, /clear e-work@e-desktop, /clear ethan".into(),
+                                ));
+                                return;
+                            }
                             if let Some(account) = content.strip_prefix("/clear ") {
                                 cmd_h.send(ClientMessage::ClearSessions {
                                     account: account.trim().to_string(),
@@ -1452,9 +1464,16 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 }
                                 return;
                             }
-                            if let Some(target) = content.strip_prefix("/new ") {
+                            if let Some(rest) = content.strip_prefix("/new ") {
+                                // "/new target dir" — target is the first
+                                // word, dir is the remainder (may contain
+                                // spaces if quoted, but we keep it simple).
+                                let mut parts = rest.trim().splitn(2, ' ');
+                                let target = parts.next().unwrap_or("").to_string();
+                                let dir = parts.next().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
                                 cmd_h.send(ClientMessage::NewSession {
-                                    ssh_target: Some(target.trim().to_string()),
+                                    ssh_target: Some(target),
+                                    start_dir: dir,
                                 }).ok();
                                 return;
                             }
@@ -1714,8 +1733,22 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     const MAX_PROMPT_ROWS: usize = 4;
     let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
     let prompt_h = shown_rows + 2; // + border rows
-    let prompt_window: Vec<String> = prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
+    let mut prompt_window: Vec<String> =
+        prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
 
+    // Blinking cursor at the end of the input — iocraft draws no terminal
+    // cursor, so we render one ourselves. Hidden while a permission
+    // prompt owns the box (the y/N answer is single-key, not typed).
+    if s.permission.is_none() {
+        let cursor = if (tick_val as usize / 4) % 2 == 0 {
+            "▌"
+        } else {
+            " "
+        };
+        if let Some(last) = prompt_window.last_mut() {
+            last.push_str(cursor);
+        }
+    }
     // Scroll window
     let status_h = 1usize;
     let view_h = h.saturating_sub(prompt_h + status_h + art_lines);

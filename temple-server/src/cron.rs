@@ -371,6 +371,18 @@ impl CronScheduler {
         Ok(())
     }
 
+    /// Daily transient-session sweep: summarize anything important from
+    /// quick Signal sessions into memory, then drop them. Quick sessions
+    /// are ephemeral by design — only persisted coding sessions survive.
+    pub async fn sweep_transient(&self) -> Result<(), String> {
+        tracing::info!("Running transient-session sweep...");
+        let swept = self.agent.sweep_transient_sessions().await;
+        if swept > 0 {
+            tracing::info!("swept {swept} transient session(s)");
+        }
+        Ok(())
+    }
+
     pub async fn run_forever(&self) -> Result<(), String> {
         // Track last-run dates so a job that misses its window (long model
         // call, server restart) still runs once that day instead of being
@@ -379,6 +391,7 @@ impl CronScheduler {
         let mut last_skills: Option<chrono::NaiveDate> = None;
         let mut last_flake: Option<chrono::NaiveDate> = None;
         let mut last_maintenance: Option<chrono::NaiveDate> = None;
+        let mut last_sweep: Option<chrono::NaiveDate> = None;
 
         loop {
             let now = chrono::Local::now();
@@ -396,6 +409,13 @@ impl CronScheduler {
                 last_flake = Some(today);
                 if let Err(e) = self.smart_flake_update().await {
                     tracing::error!("flake update: {e}");
+                }
+            }
+
+            if hm.as_str() >= "04:30" && last_sweep != Some(today) {
+                last_sweep = Some(today);
+                if let Err(e) = self.sweep_transient().await {
+                    tracing::error!("transient sweep: {e}");
                 }
             }
 

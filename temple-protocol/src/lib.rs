@@ -111,9 +111,11 @@ pub enum ClientMessage {
         session_id: Uuid,
     },
     /// Create a new session, optionally bound to an SSH target
-    /// (e.g. "e-work@e-desktop"). No target = local/quick session.
+    /// (e.g. "e-work@e-desktop") and an optional start directory (relative
+    /// to the target's $HOME). No target = local/quick session.
     NewSession {
         ssh_target: Option<String>,
+        start_dir: Option<String>,
     },
     /// Delete a persisted session by id or index from the last listing
     DeleteSession {
