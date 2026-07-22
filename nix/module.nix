@@ -317,7 +317,8 @@ in
 
       # ssh must be in PATH — SshExecutor spawns `ssh` (and the generated
       # config's ProxyCommand spawns another `ssh`) for remote tool execution.
-      path = [ pkgs.openssh ];
+      # nix must be in PATH too — the cron smart-flake-update spawns it.
+      path = [ pkgs.openssh pkgs.nix ];
 
       serviceConfig = {
         Type = "simple";

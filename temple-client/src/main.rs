@@ -86,8 +86,10 @@ enum ChatEntry {
         content: String,
         stats: Option<String>,
     },
-    /// System/info line
+    /// System/info line (command output, session notices — cyan)
     System(String),
+    /// Error line (red)
+    Error(String),
     /// Tool activity
     Tool {
         name: String,
@@ -305,7 +307,7 @@ fn spawn_ws(
                             if session_id != s.session_id { continue; }
                             s.working = false;
                             s.work_started = None;
-                            s.entries.push(ChatEntry::System(format!("error: {error}")));
+                            s.entries.push(ChatEntry::Error(format!("error: {error}")));
                         }
                         ServerMessage::ChatStats {
                             session_id,
@@ -549,6 +551,22 @@ fn spawn_ws(
                             let id8: String = sid.simple().to_string()
                                 .chars().take(8).collect();
                             s.entries.push(ChatEntry::System(format!("deleted session {id8}")));
+                            // Deleting the ACTIVE session leaves the client
+                            // pointing at a dead id — every subsequent message
+                            // would 400 with "session not found". Drop back to
+                            // a fresh server-side session instead.
+                            if sid == s.session_id {
+                                s.entries.clear();
+                                s.last_total = 0;
+                                s.last_lines.clear();
+                                s.selection = None;
+                                s.sel_anchor = None;
+                                s.mode = PermissionMode::Default;
+                                s.entries.push(ChatEntry::System(
+                                    "(that was the active session — starting fresh)".into(),
+                                ));
+                                let _ = tx_session.send(ClientMessage::NewSession { ssh_target: None });
+                            }
                         }
                         ServerMessage::Pong | ServerMessage::SessionClosed { .. } | ServerMessage::ToolResult { .. } | ServerMessage::ToolRequest { .. } => {}
                     }
@@ -957,6 +975,8 @@ enum LineKind {
     Normal,
     Code,
     Dim,
+    System,
+    Error,
     ToolStart,
     ToolDone,
     ToolFail,
@@ -1596,7 +1616,15 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 for l in wrap_text(text, content_width.saturating_sub(2)) {
                     lines.push(StyledLine {
                         text: format!(" {l}"),
-                        kind: LineKind::Dim,
+                        kind: LineKind::System,
+                    });
+                }
+            }
+            ChatEntry::Error(text) => {
+                for l in wrap_text(text, content_width.saturating_sub(2)) {
+                    lines.push(StyledLine {
+                        text: format!(" {l}"),
+                        kind: LineKind::Error,
                     });
                 }
             }
@@ -1789,17 +1817,22 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             .map(|((sl, _), (el, _))| i >= sl && i <= el)
             .unwrap_or(false);
         let color = match l.kind {
+            // Everything here is a standard ANSI theme color — these follow
+            // the terminal's base16 scheme, so the palette always matches
+            // the rest of the desktop.
             LineKind::Normal => None,
             LineKind::Code => Some(Color::Grey),
             LineKind::Dim => Some(Color::DarkGrey),
+            LineKind::System => Some(Color::Cyan),
+            LineKind::Error => Some(Color::Red),
             LineKind::ToolStart => Some(Color::Yellow),
             LineKind::ToolDone => Some(Color::Green),
             LineKind::ToolFail => Some(Color::Red),
             LineKind::ToolDetail => Some(Color::DarkGrey),
             LineKind::Separator => Some(Color::DarkGrey),
-            LineKind::UserHeader => Some(Color::Cyan),
+            LineKind::UserHeader => Some(Color::Blue),
             LineKind::AgentHeader => Some(Color::Green),
-            LineKind::Stats => Some(Color::DarkGrey),
+            LineKind::Stats => Some(Color::Magenta),
         };
         let elem = match (color, in_sel) {
             (Some(_), true) => element! {
@@ -1826,15 +1859,24 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         children.push(elem.into());
     }
 
-    // Prompt box — bordered, expands up to MAX_PROMPT_ROWS then scrolls
+    // Prompt box — bordered, expands up to MAX_PROMPT_ROWS then scrolls.
+    // Border color carries state: red while a permission prompt is up,
+    // yellow while the agent works, dim otherwise. No forced background —
+    // the box follows the terminal theme.
+    let border_color = if s_permission.is_some() {
+        Color::Red
+    } else if s_working {
+        Color::Yellow
+    } else {
+        Color::DarkGrey
+    };
     children.push(
         element! {
             View(
                 height: prompt_h as u16,
                 overflow: Overflow::Hidden,
                 border_style: BorderStyle::Round,
-                border_color: Color::DarkGrey,
-                background_color: Color::Black,
+                border_color: border_color,
             ) {
                 #(prompt_window.iter().enumerate().map(|(i, l)| element! {
                     View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {

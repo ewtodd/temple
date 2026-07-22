@@ -305,6 +305,18 @@ async fn handle_connection(
             }
 
             ClientMessage::DeleteSession { session_id: sid } => {
+                // Ownership check: a client may only delete its own
+                // sessions (or any session if admin).
+                let owner = auth_owner.clone().unwrap_or_default();
+                let is_admin = memory.is_admin_username(&owner).await.unwrap_or(false);
+                let session_owner = agent.session_owner(sid).await;
+                if !is_admin && session_owner.as_deref() != Some(owner.as_str()) {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id: sid,
+                        error: "session belongs to another user".into(),
+                    });
+                    continue;
+                }
                 // Close in-memory session if loaded, then remove from DB.
                 agent.close_session(sid).await;
                 match memory.delete_session(sid).await {
@@ -331,11 +343,15 @@ async fn handle_connection(
                     });
                     continue;
                 }
+                // Unload in-memory sessions FIRST (without persisting) —
+                // otherwise the next turn re-persists them and the deleted
+                // rows resurrect.
+                let dropped = agent.drop_sessions_for(&account).await;
                 match memory.clear_sessions(&account).await {
                     Ok(n) => {
                         let _ = tx.send(ServerMessage::ChatDelta {
                             session_id,
-                            delta: format!("deleted {n} sessions for {account}\n"),
+                            delta: format!("deleted {n} sessions for {account} ({dropped} unloaded from memory)\n"),
                             done: true,
                         });
                     }

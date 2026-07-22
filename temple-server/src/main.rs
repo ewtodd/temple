@@ -518,13 +518,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 )
                                 .await;
                             } else {
+                                // Unload in-memory sessions first — otherwise
+                                // the next turn re-persists them and the
+                                // deleted rows resurrect.
+                                let dropped = agent.drop_sessions_for(account).await;
+                                // Drop stale pointers from the active-session
+                                // map — sessions that no longer exist must not
+                                // be driven by future group/DM messages.
+                                {
+                                    let mut active_lock = active.lock().await;
+                                    let ids: Vec<uuid::Uuid> = active_lock.values().copied().collect();
+                                    for id in ids {
+                                        if !agent.has_session(id).await {
+                                            active_lock.retain(|_, v| *v != id);
+                                        }
+                                    }
+                                }
                                 match memory.clear_sessions(account).await {
                                     Ok(n) => {
                                         send_conv(
                                             &signal,
                                             &sender,
                                             &group_id,
-                                            &format!("deleted {n} sessions for {account}"),
+                                            &format!("deleted {n} sessions for {account} ({dropped} unloaded from memory)"),
                                         )
                                         .await;
                                     }
@@ -823,7 +839,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let target_session = {
                             let mut active_lock = active.lock().await;
                             match active_lock.get(&conv_key) {
-                                Some(id) => *id,
+                                // Self-heal stale entries: a session that was
+                                // /clear'd or /delete'd elsewhere must not be
+                                // driven — drop it and fall through to create.
+                                Some(id) if agent.has_session(*id).await => *id,
+                                Some(id) => {
+                                    tracing::info!(
+                                        "signal: dropping stale active session {id} for {conv_key}"
+                                    );
+                                    active_lock.remove(&conv_key);
+                                    let new_id = uuid::Uuid::new_v4();
+                                    let session_user: &str = if group_id.is_some() {
+                                        "group"
+                                    } else {
+                                        &username
+                                    };
+                                    agent
+                                        .open_session(
+                                            new_id,
+                                            session_user,
+                                            &workspace,
+                                            router::SessionKind::Interactive,
+                                            None,
+                                        )
+                                        .await;
+                                    active_lock.insert(conv_key.clone(), new_id);
+                                    new_id
+                                }
                                 None => {
                                     let new_id = uuid::Uuid::new_v4();
                                     let session_user: &str = if group_id.is_some() {

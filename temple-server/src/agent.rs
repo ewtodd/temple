@@ -785,6 +785,26 @@ impl Agent {
             .map(|s| s.cwd.clone())
     }
 
+    /// The session's owner (token username), if loaded. Falls back to the
+    /// DB for sessions not currently in memory.
+    pub async fn session_owner(&self, session_id: Uuid) -> Option<String> {
+        if let Some(o) = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|s| s.owner.clone())
+        {
+            return Some(o);
+        }
+        self.memory
+            .load_session(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.username)
+    }
+
     pub async fn close_session(&self, session_id: Uuid) {
         // Cancel any in-progress loop, persist state, then unload
         self.cancel_chat(session_id).await;
@@ -1178,6 +1198,32 @@ impl Agent {
         let n = tokens.len();
         for (_, (_, t)) in tokens.iter() {
             t.cancel();
+        }
+        n
+    }
+
+    /// Unload all in-memory sessions belonging to an account or username
+    /// WITHOUT persisting them first. /clear uses this: a session that was
+    /// deleted from the DB but left in memory would be re-persisted on its
+    /// next turn — resurrecting the very rows /clear just removed.
+    pub async fn drop_sessions_for(&self, account: &str) -> usize {
+        let ids: Vec<Uuid> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter(|(_, s)| {
+                    s.account.as_deref() == Some(account)
+                        || s.owner == account
+                        || s.username == account
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let n = ids.len();
+        for id in ids {
+            self.cancel_chat(id).await;
+            self.sessions.lock().await.remove(&id);
+            self.loop_locks.lock().await.remove(&id);
         }
         n
     }
