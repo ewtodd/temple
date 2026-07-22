@@ -197,7 +197,7 @@ impl Signal {
     /// Returns when the connection is permanently lost (after retry backoff).
     pub async fn receive_loop(
         &self,
-        handler: Arc<dyn Fn(String, String, u64, Option<String>) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64, Option<String>, Vec<String>) + Send + Sync>,
     ) {
         if !self.config.enabled {
             return;
@@ -220,7 +220,7 @@ impl Signal {
     /// One receive cycle: connect, read notifications until disconnect.
     async fn receive_once(
         &self,
-        handler: Arc<dyn Fn(String, String, u64, Option<String>) + Send + Sync>,
+        handler: Arc<dyn Fn(String, String, u64, Option<String>, Vec<String>) + Send + Sync>,
     ) -> Result<(), String> {
         let stream = TcpStream::connect(&self.config.socket_addr)
             .await
@@ -298,7 +298,30 @@ impl Signal {
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0);
 
-            if message.is_empty() {
+            // Extract image attachments — signal-cli downloads them to a temp
+            // directory and stores the path in storedFilename.
+            let attachment_paths: Vec<String> = envelope.get("dataMessage")
+                .and_then(|d| d.get("attachments"))
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|att| {
+                            let content_type = att.get("contentType")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+                            // Only handle image attachments
+                            if !content_type.starts_with("image/") {
+                                return None;
+                            }
+                            att.get("storedFilename")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if message.is_empty() && attachment_paths.is_empty() {
                 continue;
             }
 
@@ -322,7 +345,7 @@ impl Signal {
             } else {
                 source_name
             };
-            handler(source.to_string(), message, timestamp, group_id);
+            handler(source.to_string(), message, timestamp, group_id, attachment_paths);
         }
     }
 }

@@ -190,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pending_perms: Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let perms_for_handler = pending_perms.clone();
-            let handler = Arc::new(move |sender: String, message: String, timestamp: u64, group_id: Option<String>| {
+            let handler = Arc::new(move |sender: String, mut message: String, timestamp: u64, group_id: Option<String>, attachment_paths: Vec<String>| {
                 let agent = agent_for_handler.clone();
                 let scope = scope_for_handler.clone();
                 let signal = signal_for_handler.clone();
@@ -250,6 +250,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // If user's UUID wasn't set yet, set it now
                     if let Some((_, _, None)) = &user {
                         let _ = memory.set_signal_user_uuid(&username, &sender).await;
+                    }
+
+                    // ── Image attachments: describe with vision model, prepend to text ──
+                    if !attachment_paths.is_empty() {
+                        let vision_model = agent.models.router_model.as_deref()
+                            .unwrap_or(&agent.models.researcher_model);
+                        let mut descriptions = Vec::new();
+                        for path in &attachment_paths {
+                            match describe_image(&agent.litellm, vision_model, path).await {
+                                Ok(desc) => descriptions.push(desc),
+                                Err(e) => tracing::warn!("image description failed for {path}: {e}"),
+                            }
+                        }
+                        if !descriptions.is_empty() {
+                            let prefix = descriptions.join("\n");
+                            if message.is_empty() {
+                                message = format!("[The user sent an image. Here is a description:\n{prefix}]\n\n(respond to what's in the image)");
+                            } else {
+                                message = format!("[The user sent an image. Here is a description:\n{prefix}]\n\nThe user also said: {message}");
+                            }
+                        }
                     }
 
                     let trimmed = message.trim();
@@ -864,4 +885,55 @@ async fn notify_admins(signal: &crate::signal::Signal, memory: &crate::memory::M
             tracing::warn!("notify_admins: {e}");
         }
     }
+}
+
+/// Describe an image using a vision-capable model via litellm.
+/// Reads the file, base64-encodes it, sends a brief description prompt,
+/// and returns the model's text response.
+async fn describe_image(
+    litellm: &crate::litellm::LiteLLM,
+    model: &str,
+    path: &str,
+) -> Result<String, String> {
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("read {path}: {e}"))?;
+    let mime = if path.ends_with(".png") { "image/png" } else { "image/jpeg" };
+    let b64 = base64_encode(&data);
+    let image_url = format!("data:{mime};base64,{b64}");
+
+    // Build a vision request using OpenAI's content-parts format.
+    // litellm passes this through to llama-server which handles it
+    // when --mmproj is loaded.
+    let content = serde_json::json!([
+        {"type": "image_url", "image_url": {"url": image_url}},
+        {"type": "text", "text": "Describe this image in detail. Focus on what's visible: text, UI elements, code, diagrams, people, objects, etc. Be concise but thorough."},
+    ]);
+
+    let req = crate::litellm::ChatRequest {
+        model: model.to_string(),
+        messages: vec![crate::litellm::ChatMessage {
+            role: "user".into(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }],
+        tools: None,
+        stream: Some(false),
+        stream_options: None,
+        max_tokens: Some(512),
+        temperature: Some(0.3),
+    };
+
+    let resp = litellm.chat(req).await
+        .map_err(|e| format!("vision model: {e}"))?;
+    resp.choices.first()
+        .and_then(|c| c.message.content.clone())
+        .ok_or_else(|| "no response from vision model".into())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }

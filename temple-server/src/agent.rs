@@ -797,10 +797,11 @@ impl Agent {
                 Some(heuristic)
             }
         };
-        let route = match complexity {
-            Some(c) => Router::route(c, &self.models, session_kind),
-            None if is_command => Route::Direct { model: session_model },
-            None => Route::Direct { model: self.models.default_model.clone() },
+        let route = match (complexity, model_override) {
+            (Some(c), _) => Router::route(c, &self.models, session_kind),
+            (None, true) => Route::Direct { model: session_model },
+            (None, _) if is_command => Route::Direct { model: session_model },
+            (None, _) => Route::Direct { model: self.models.default_model.clone() },
         };
         let lane = match &route {
             Route::Direct { model } => model.clone(),
