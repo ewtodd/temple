@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 temple-protocol = { path = "../temple-protocol" }
-iocraft = "0.8"
+ratatui = "0.30"
 crossterm = "0.29"
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -21,9 +21,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { version = "0.3", features = ["sink"] }
 chrono = { version = "0.4" }
-smol = "2"
 whoami = "1"
-tracing = "0.1"
 base64 = "0.22"
 native-tls = "0.2"
 unicode-width = "0.2"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[pre-commit] temple quality check"
+
+# By default, run inside nix dev shell.
+# If nix isn't available, fall back to direct cargo.
+CARGO="nix develop --command cargo"
+if ! command -v nix &>/dev/null; then
+    echo "  nix not found, using system cargo (may miss toolchains)"
+    CARGO="cargo"
+fi
+
+echo "  → cargo fmt --check"
+$CARGO fmt --check
+
+echo "  → cargo clippy --workspace --all-targets -- -D warnings"
+$CARGO clippy --workspace --all-targets -- -D warnings
+
+echo "  → cargo test --workspace"
+$CARGO test --workspace
+
+echo "[pre-commit] ok"

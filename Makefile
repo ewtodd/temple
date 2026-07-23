@@ -1,10 +1,11 @@
 # Makefile — local quality pipeline.
 # `make check` runs the full suite via the flake dev shell.
+# `make hooks` configures git to use the project's pre-commit hook.
 
 ARTIFACTS := ci-artifacts
 CARGO     := nix develop --command cargo
 
-.PHONY: check check-fmt check-clippy check-build check-test clean
+.PHONY: check check-fmt check-clippy check-build check-test clean hooks
 
 check: check-fmt check-clippy check-build check-test
 	@echo "==> pipeline passed"
@@ -28,6 +29,10 @@ check-test:
 	@mkdir -p $(ARTIFACTS)
 	@echo "==> tests"
 	set -o pipefail; $(CARGO) test --workspace 2>&1 | tee $(ARTIFACTS)/test.log
+
+hooks:
+	git config core.hooksPath .githooks
+	@echo "==> git hooks configured"
 
 clean:
 	rm -rf $(ARTIFACTS)
