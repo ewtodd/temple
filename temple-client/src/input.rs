@@ -398,20 +398,22 @@ fn handle_key_event(
             }
             if let Some(prefix) = s.prompt.strip_prefix("/model ") {
                 let lower = prefix.to_lowercase();
-                let matches: Vec<&String> = models
-                    .iter()
-                    .filter(|m| m.to_lowercase().starts_with(&lower))
-                    .collect();
-                if matches.is_empty() {
+                // Filter to models starting with the typed prefix
+                let subset: Vec<&String> = if lower.is_empty() {
+                    models.iter().collect()
+                } else {
+                    models
+                        .iter()
+                        .filter(|m| m.to_lowercase().starts_with(&lower))
+                        .collect()
+                };
+                if subset.is_empty() {
                     return true;
                 }
-                // Cycle: if current prompt equals a match, advance. Else take first.
-                let next = matches
-                    .iter()
-                    .position(|m| m.to_lowercase() == lower)
-                    .map(|i| (i + 1) % matches.len())
-                    .unwrap_or(0);
-                s.prompt = format!("/model {}", matches[next]);
+                // Find current model in the subset, advance, wrap
+                let current = subset.iter().position(|m| m.as_str() == prefix);
+                let next = current.map(|i| (i + 1) % subset.len()).unwrap_or(0);
+                s.prompt = format!("/model {}", subset[next]);
                 s.prompt_cursor = s.prompt.chars().count();
             }
         }
