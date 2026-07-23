@@ -158,6 +158,11 @@ struct SessionCtx {
     /// True when the user explicitly picked a model via /model — routing
     /// is bypassed and this model is used directly.  /model auto clears it.
     model_override: bool,
+    /// Model locked by the router for the session. The first substantive
+    /// (non-Simple, non-command) message stamps this, and all subsequent
+    /// messages reuse it without re-classifying.  Cleared by /model and
+    /// on reset.  In-memory only — not persisted to DB.
+    last_routed_model: Option<String>,
     /// Coding-session task list, persisted with the session.
     todos: Vec<temple_protocol::TodoItem>,
 }
@@ -392,6 +397,7 @@ impl Agent {
                 permission_mode: PermissionMode::Default,
                 project_context: None,
                 model_override: false,
+                last_routed_model: None,
                 todos: Vec::new(),
             },
         );
@@ -495,6 +501,7 @@ impl Agent {
                 permission_mode: PermissionMode::Default,
                 project_context: None,
                 model_override: false,
+                last_routed_model: None,
                 todos: Vec::new(),
             },
         );
@@ -589,6 +596,7 @@ impl Agent {
                 permission_mode,
                 project_context: None,
                 model_override: false,
+                last_routed_model: None,
                 todos,
             },
         );
@@ -840,6 +848,7 @@ impl Agent {
         if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
             s.model = model.to_string();
             s.model_override = true;
+            s.last_routed_model = None;
         }
     }
 
@@ -848,6 +857,7 @@ impl Agent {
         if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
             s.model = self.models.default_model.clone();
             s.model_override = false;
+            s.last_routed_model = None;
         }
     }
 
@@ -935,6 +945,7 @@ impl Agent {
             session_kind,
             ssh_executor,
             model_override,
+            last_routed_model,
         ) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
@@ -951,6 +962,7 @@ impl Agent {
                 s.kind,
                 s.ssh.clone(),
                 s.model_override,
+                s.last_routed_model.clone(),
             )
         };
 
@@ -963,6 +975,8 @@ impl Agent {
         let is_command = content.starts_with('/') || content.starts_with(':');
         let complexity = if is_command || session_kind == SessionKind::Headless || model_override {
             None // commands + headless skip routing; /model override uses session model directly
+        } else if last_routed_model.is_some() {
+            None // session model already locked — reuse without re-classifying
         } else {
             let heuristic = Router::classify(content);
             if heuristic == ComplexityClass::Medium {
@@ -988,15 +1002,16 @@ impl Agent {
                 Some(heuristic)
             }
         };
-        let route = match (complexity, model_override) {
-            (Some(c), _) => Router::route(c, &self.models, session_kind),
-            (None, true) => Route::Direct {
+        let route = match (complexity, model_override, &last_routed_model) {
+            (Some(c), _, _) => Router::route(c, &self.models, session_kind),
+            (_, true, _) => Route::Direct {
                 model: session_model,
             },
-            (None, _) if is_command => Route::Direct {
+            (_, _, Some(m)) => Route::Direct { model: m.clone() },
+            (None, false, None) if is_command => Route::Direct {
                 model: session_model,
             },
-            (None, _) => Route::Direct {
+            (None, false, None) => Route::Direct {
                 model: self.models.default_model.clone(),
             },
         };
@@ -1004,6 +1019,16 @@ impl Agent {
             Route::Direct { model } => model.clone(),
             Route::Pipeline { executor, .. } => executor.clone(),
         };
+
+        // Lock the model for the session if this was a substantive routed
+        // message — avoids shuffling models mid-conversation.  Simple
+        // greetings and commands don't lock.
+        if complexity.is_some_and(|c| c != ComplexityClass::Simple) && !is_command {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                s.last_routed_model = Some(lane.clone());
+            }
+        }
 
         // Immediate ack — before any queue wait — so the user knows their
         // message is being worked on, what model(s), and how deep the line is.
