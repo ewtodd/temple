@@ -819,7 +819,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &username
                             };
                             match agent
-                                .new_persisted_session(session_owner, target, subdir, None)
+                                .new_persisted_session(session_owner, target, subdir, None, None)
                                 .await
                             {
                                 Ok(sid) => {

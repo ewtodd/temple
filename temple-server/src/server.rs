@@ -106,6 +106,7 @@ async fn handle_connection(
 
     let mut session_id = Uuid::nil();
     let mut permissions: Option<Arc<Mutex<PermissionScope>>> = None;
+    let mut client_cwd: Option<String> = None;
 
     // Writer task: forwards channel messages to the socket
     let send_task = tokio::spawn(async move {
@@ -162,6 +163,7 @@ async fn handle_connection(
                         None,
                         None,
                         Some(&open.username),
+                        Some(&open.cwd),
                     )
                     .await
                 {
@@ -181,6 +183,7 @@ async fn handle_connection(
                             .await;
                     }
                 }
+                client_cwd = Some(open.cwd.clone());
                 let scope = PermissionScope::new(
                     std::path::Path::new(&open.cwd),
                     PermissionMode::Default,
@@ -231,11 +234,19 @@ async fn handle_connection(
                 match agent.resume_session(sid, &owner).await {
                     Ok((meta, transcript)) => {
                         session_id = sid;
-                        // Scope the permission check to the session's actual
-                        // working directory — NOT the server's data dir,
-                        // which would auto-grant /var/lib/temple.
+                        // Scope the permission check to the client's actual
+                        // working directory (or the session's persisted cwd
+                        // for SSH targets / backward compat).
+                        let effective_cwd = client_cwd
+                            .as_deref()
+                            .filter(|c| !c.is_empty())
+                            .or_else(|| {
+                                (!meta.cwd.is_empty() && meta.cwd != "/var/lib/temple")
+                                    .then(|| meta.cwd.as_str())
+                            })
+                            .unwrap_or(".");
                         let scope = PermissionScope::new(
-                            std::path::Path::new(&meta.cwd),
+                            std::path::Path::new(effective_cwd),
                             PermissionMode::Default,
                             &config.allowed_dirs,
                         )
@@ -267,6 +278,7 @@ async fn handle_connection(
                         ssh_target.as_deref(),
                         start_dir.as_deref(),
                         None,
+                        client_cwd.as_deref(),
                     )
                     .await
                 {
@@ -274,13 +286,24 @@ async fn handle_connection(
                         session_id = sid;
                         // For SSH targets the scope is irrelevant (SSH
                         // permission checks run against $HOME on the remote
-                        // host). For local sessions, fall back to the
-                        // connection's existing scope if one exists.
-                        if permissions.is_none() {
+                        // host). For local sessions, recreate the scope from
+                        // the client's actual cwd (not /var/lib/temple).
+                        if client_cwd.is_some() {
+                            // Client-side session: use the stored client cwd
+                            let scope = PermissionScope::new(
+                                std::path::Path::new(
+                                    client_cwd.as_deref().unwrap_or("."),
+                                ),
+                                PermissionMode::Default,
+                                &config.allowed_dirs,
+                            )
+                            .await;
+                            permissions = Some(Arc::new(Mutex::new(scope)));
+                        } else if permissions.is_none() {
                             let cwd = agent
                                 .session_cwd(sid)
                                 .await
-                                .unwrap_or_else(|| "/var/lib/temple".into());
+                                .unwrap_or_else(|| ".".into());
                             let scope = PermissionScope::new(
                                 std::path::Path::new(&cwd),
                                 PermissionMode::Default,

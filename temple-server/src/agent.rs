@@ -411,6 +411,7 @@ impl Agent {
         ssh_target: Option<&str>,
         start_dir: Option<&str>,
         account: Option<&str>,
+        client_cwd: Option<&str>,
     ) -> Result<Uuid, String> {
         let session_id = Uuid::new_v4();
         let (ssh, kind, cwd, full_name, account_name) = match ssh_target {
@@ -445,7 +446,7 @@ impl Agent {
             None => (
                 None,
                 SessionKind::Interactive,
-                "/var/lib/temple".to_string(),
+                client_cwd.unwrap_or("/var/lib/temple").to_string(),
                 "temple".to_string(),
                 account.map(|a| a.to_string()),
             ),
@@ -2018,6 +2019,14 @@ impl Agent {
         kind: SessionKind,
         project_context: &str,
     ) -> String {
+        // Mask the server's internal base path — the model should never see
+        // /var/lib/temple in the system prompt (it's a server implementation
+        // detail, not the user's filesystem).
+        let display_cwd = if cwd == "/var/lib/temple" {
+            ".".to_string()
+        } else {
+            cwd.to_string()
+        };
         let personality = self.memory.get_personality().await.unwrap_or_default();
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
 
@@ -2074,11 +2083,10 @@ impl Agent {
 You are renco, an agentic coding assistant running on temple harness.
 You are talking to {username} right now.
 Current date: {now}
-Working directory: {cwd}
+Working directory: {display_cwd}
 
 When working with files, use paths relative to the working directory.
-Do not prepend /var/lib/temple or any other base path — that is an
-implementation detail of the server, not the user's filesystem.{user_section}
+Do not prepend the server's base path — use relative paths only.{user_section}
 {skills_section}
 
 ## Available tools
@@ -2111,7 +2119,7 @@ session resume.
                 format!(
                     "{personality}
 You are renco, running a scheduled maintenance task on temple harness.
-Current date: {now}. Working directory: {cwd}
+Current date: {now}. Working directory: {display_cwd}
 Filesystem access and shell commands are available.
 
 Git conventions:
@@ -2151,14 +2159,13 @@ Git conventions:
         };
 
         // Reject paths and commands that leak the server's base directory.
-        // The model sometimes confuses /var/lib/temple (its ssh key path
-        // from the system prompt) with a workspace root. Catch it here
-        // and remind it of the relevant instruction.
+        // The model sometimes confuses it with a workspace root. Catch it
+        // here and remind it of the relevant instruction.
         if let Some(path) = args["path"].as_str() {
             if path.contains("/var/lib/temple") {
                 return Err(
                     "REJECTED: path must be relative to the working directory. \
-                     Do not prepend /var/lib/temple or any base path."
+                     Do not prepend the server's base path."
                         .to_string(),
                 );
             }
@@ -2166,7 +2173,7 @@ Git conventions:
         if let Some(cmd) = args["command"].as_str() {
             if cmd.contains("/var/lib/temple") {
                 return Err(
-                    "REJECTED: command must not reference /var/lib/temple. \
+                    "REJECTED: command must not reference the server's base path. \
                      Use relative paths from the working directory."
                         .to_string(),
                 );
