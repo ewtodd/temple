@@ -15,6 +15,25 @@ use crate::state::{AppState, ChatEntry, InternalCmd, PromptKind, PromptState, Sh
 use crate::tools::{execute_local_tool, mode_tag};
 use crate::ui;
 
+/// Try to read the user's default SSH public key for daemon-auth.
+/// Returns None if no key is found (TUI/legacy clients fall back to token auth).
+fn discover_pubkey() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/.ssh/id_ed25519.pub"),
+        format!("{home}/.ssh/id_rsa.pub"),
+    ];
+    for path in &candidates {
+        if let Ok(key) = std::fs::read_to_string(path) {
+            let trimmed = key.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
 pub struct App {
     pub state: SharedState,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
@@ -40,8 +59,9 @@ impl App {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
+                let pubkey = discover_pubkey();
                 let sess = SessionOpen {
-                    client_id,
+                    client_id: client_id.clone(),
                     cwd: std::fs::canonicalize(&cwd)
                         .unwrap_or_else(|_| std::path::PathBuf::from(&cwd))
                         .to_string_lossy()
@@ -49,6 +69,7 @@ impl App {
                     hostname: whoami::fallible::hostname()
                         .unwrap_or_else(|_| "unknown".into()),
                     username: whoami::username(),
+                    daemon_pubkey: pubkey,
                 };
                 let (mut conn, _) =
                     match client::connect(&server, &token, sess, force_tls).await {

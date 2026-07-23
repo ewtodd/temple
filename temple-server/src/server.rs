@@ -154,13 +154,26 @@ async fn handle_connection(
                 if auth_owner.is_none() {
                     auth_owner = Some(open.username.clone());
                 }
+                // If daemon_pubkey is set, verify it's authorized for this user.
+                // TUI clients leave this unset and rely on token auth alone.
+                if let Some(ref pubkey) = open.daemon_pubkey {
+                    if !verify_daemon_pubkey(&open.username, pubkey) {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!(
+                                "daemon public key not authorized for user {}",
+                                open.username
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 // Auto-create a persisted Coding session (no SSH — tools run
                 // client-side via ToolRequest, so every `temple` invocation
                 // gets working tools and sessions show up in /sessions).
                 match agent
                     .new_persisted_session(
                         auth_owner.as_deref().unwrap_or(&open.username),
-                        None,
                         None,
                         Some(&open.username),
                         Some(&open.cwd),
@@ -178,7 +191,6 @@ async fn handle_connection(
                                 auth_owner.as_deref().unwrap_or(&open.username),
                                 &open.cwd,
                                 crate::router::SessionKind::Interactive,
-                                None,
                             )
                             .await;
                     }
@@ -268,14 +280,13 @@ async fn handle_connection(
             }
 
             ClientMessage::NewSession {
-                ssh_target,
+                ssh_target: _ssh_target,
                 start_dir,
             } => {
                 let owner = auth_owner.clone().unwrap_or_default();
                 match agent
                     .new_persisted_session(
                         &owner,
-                        ssh_target.as_deref(),
                         start_dir.as_deref(),
                         None,
                         client_cwd.as_deref(),
@@ -284,10 +295,6 @@ async fn handle_connection(
                 {
                     Ok(sid) => {
                         session_id = sid;
-                        // For SSH targets the scope is irrelevant (SSH
-                        // permission checks run against $HOME on the remote
-                        // host). For local sessions, recreate the scope from
-                        // the client's actual cwd (not /var/lib/temple).
                         if client_cwd.is_some() {
                             // Client-side session: use the stored client cwd
                             let scope = PermissionScope::new(
@@ -310,7 +317,7 @@ async fn handle_connection(
                         let meta = SessionMeta {
                             id: sid,
                             title: None,
-                            ssh_target: ssh_target.clone(),
+                            ssh_target: None,
                             cwd: String::new(),
                             mode: "default".into(),
                             updated_at: String::new(),
@@ -595,4 +602,19 @@ async fn handle_connection(
 /// Build a 401 Unauthorized HTTP status response.
 fn http_status_unauthorized() -> tokio_tungstenite::tungstenite::http::StatusCode {
     tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+}
+
+/// Verify that a daemon's public key is authorized for the given user.
+/// Keys are stored one-per-line in `/var/lib/temple/authorized_keys/<username>`.
+/// The key line must match exactly (whitespace-insensitive comparison after trim).
+fn verify_daemon_pubkey(username: &str, pubkey: &str) -> bool {
+    let key = pubkey.trim();
+    if key.is_empty() {
+        return false;
+    }
+    let path = std::path::PathBuf::from("/var/lib/temple/authorized_keys").join(username);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => contents.lines().any(|line| line.trim() == key),
+        Err(_) => false,
+    }
 }

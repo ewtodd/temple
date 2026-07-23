@@ -13,8 +13,6 @@ let
   cfg = config.services.temple-server;
   toml = pkgs.formats.toml { };
 
-  # pkgs.formats.toml cannot serialize null — build the model/ssh sections
-  # with only the keys that are actually set.
   configFile = toml.generate "temple-config.toml" ({
     listen = cfg.listen;
     litellm_url = cfg.litellmUrl;
@@ -25,9 +23,6 @@ let
     signal = {
       enabled = cfg.signal.enable;
       socket_addr = cfg.signal.socketAddr;
-      # default_recipient and allowed_senders come from env vars
-      # (SIGNAL_RECIPIENT) via environmentFile, not config.toml — phone
-      # numbers are secrets and shouldn't be in the nix store.
       default_recipient = "";
       allowed_senders = [ ];
     };
@@ -37,7 +32,6 @@ let
       username = cfg.nextcloud.username;
     };
     models = {
-      use_local_router = false;
       default_model = cfg.defaultModel;
       simple_model = cfg.simpleModel;
       planner_model = cfg.plannerModel;
@@ -45,39 +39,11 @@ let
       reviewer_model = cfg.reviewerModel;
       critical_model = cfg.criticalModel;
       researcher_model = cfg.researcherModel;
-      # Documented fallback: routerModel unset → researcherModel.
       router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
     };
-    ssh_targets = map (t: {
-      name = t.name;
-      account = t.account;
-      host = t.host;
-      port = t.port;
-      owner = t.owner;
-      allowed_dirs = t.allowedDirs;
-    }) cfg.sshTargets;
-    local_llama_url = cfg.localLlamaUrl;
-    local_llama_model = cfg.localLlamaModel;
-  }
-  // optionalAttrs (cfg.sshBastion != null) { ssh_bastion = cfg.sshBastion; }
-  // optionalAttrs (cfg.sshKeyPath != null) { ssh_key_path = cfg.sshKeyPath; });
+  });
 
   port = toString (lib.last (lib.splitString ":" cfg.listen));
-
-  # Parse "user@host:port" (any part optional) for the bastion Host block.
-  bastionParts = if cfg.sshBastion == null then null else
-    let
-      b = cfg.sshBastion;
-      hasAt = builtins.match ".*@.*" b != null;
-      userHost = if hasAt then lib.splitString "@" b else [ "deploy" b ];
-      user = builtins.head userHost;
-      hostPort = lib.last userHost;
-      hp = lib.splitString ":" hostPort;
-    in {
-      inherit user;
-      host = builtins.head hp;
-      port = if builtins.length hp > 1 then lib.last hp else "2222";
-    };
 in
 {
   options.services.temple-server = {
@@ -104,100 +70,53 @@ in
     defaultModel = mkOption {
       type = types.str;
       default = "deepseek-v4-flash-high";
-      description = "Default model for new sessions and Medium complexity (must exist on the litellm proxy).";
+      description = "Default model for new sessions and Medium complexity.";
     };
 
     simpleModel = mkOption {
       type = types.str;
       default = "qwen3-4b-instruct";
-      description = "Model for Simple queries (local classifier on oracle).";
+      description = "Model for Simple queries.";
     };
 
     plannerModel = mkOption {
       type = types.str;
       default = "deepseek-v4-flash-high";
-      description = "Planner model for Complex pipeline (deepseek on son-of-anton).";
+      description = "Planner model for Complex pipeline.";
     };
 
     executorModel = mkOption {
       type = types.str;
       default = "qwen3.6-27b-coding";
-      description = "Executor model for Complex pipeline (qwen coding on anton).";
+      description = "Executor model for Complex pipeline.";
     };
 
     reviewerModel = mkOption {
       type = types.str;
       default = "deepseek-v4-flash-high";
-      description = "Reviewer model for Complex pipeline (deepseek on son-of-anton).";
+      description = "Reviewer model for Complex pipeline.";
     };
 
     criticalModel = mkOption {
       type = types.str;
       default = "deepseek-v4-flash-high";
-      description = "Model for Critical complexity queries (deepseek direct).";
+      description = "Model for Critical complexity queries.";
     };
 
     researcherModel = mkOption {
       type = types.str;
       default = "gemma-4-31b";
-      description = "Model for research/lookup queries (Signal quick questions).";
+      description = "Model for research/lookup queries.";
     };
 
     routerModel = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = "gemma-4-e4b-it";
+      example = "gemma-4-12b-router";
       description = ''
-        Model used for complexity classification during query routing.
-        Should be a small fast model (4B-class) co-resident with the
-        default/executor model on the same GPU host. Falls back to
-        researcherModel when unset.
-      '';
-    };
-
-    sshTargets = mkOption {
-      type = types.listOf (types.submodule {
-        options = {
-          name = mkOption { type = types.str; description = "Human-readable name (e.g. e-work@e-desktop)."; };
-          account = mkOption { type = types.str; description = "SSH username on the workstation."; };
-          host = mkOption { type = types.str; description = "Workstation IP or hostname."; };
-          port = mkOption { type = types.port; default = 2222; description = "SSH port."; };
-          owner = mkOption { type = types.str; description = "Temple username who owns this account."; };
-          allowedDirs = mkOption { type = types.listOf types.str; default = [ ]; description = "Extra allowed dirs (beyond $HOME and /tmp)."; };
-          proxyCommand = mkOption {
-            type = types.nullOr types.str;
-            default = null;
-            example = "ssh -F /var/lib/temple/.ssh/config bastion wake-and-relay-e-desktop";
-            description = "ProxyCommand for reaching this target (e.g. a wake-on-LAN relay on the bastion). Overrides ProxyJump.";
-          };
-        };
-      });
-      default = [ ];
-      description = "SSH targets for remote tool execution.";
-    };
-
-    sshBastion = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "deploy@10.0.0.2:2222";
-      description = ''
-        Bastion host for SSH connections, as user@host:port (user and port
-        optional — default "deploy" and 2222). A `bastion` Host alias is
-        generated from this spec; targets reference it via ProxyJump or in
-        their proxyCommand. A bare alias name is NOT valid here — it would
-        become the HostName and fail to resolve.
-      '';
-    };
-
-    sshKeyPath = mkOption {
-      # types.str, NOT types.path — a path literal would copy the private
-      # key into the world-readable nix store.
-      type = types.nullOr types.str;
-      default = null;
-      example = "/run/agenix/temple-ssh-key";
-      description = ''
-        SSH private key for connecting to workstations. Must be a runtime
-        path (agenix secret, /var/lib/...), never a nix store path.
+        Model for complexity classification. Falls back to researcherModel
+        when unset. Point this at a small fast model co-resident with the
+        executor model on the same GPU host.
       '';
     };
 
@@ -210,7 +129,7 @@ in
     dataDir = mkOption {
       type = types.path;
       default = "/var/lib/temple";
-      description = "State directory: memory DB, skills.md, ssh config.";
+      description = "State directory: memory DB, tokens, authorized keys.";
     };
 
     environmentFile = mkOption {
@@ -222,9 +141,7 @@ in
         or a list of paths — all are loaded. Any of these env vars are
         picked up:
         - LITELLM_API_KEY or LITELLM_MASTER_KEY (litellm auth)
-        - SIGNAL_RECIPIENT (your phone number, E.164 with + prefix;
-          used as outbound recipient AND sole allowed sender for inbound)
-        Compatible with agenix secrets (one KEY=VALUE per line).
+        - SIGNAL_RECIPIENT (E.164 phone number, + prefix)
       '';
     };
 
@@ -232,7 +149,7 @@ in
       type = types.listOf types.str;
       default = [ ];
       example = [ "/etc/nixos" "/home" ];
-      description = "Extra directories the agent may access without prompting (beyond each session's CWD).";
+      description = "Extra directories the agent may access without prompting.";
     };
 
     signal = {
@@ -260,19 +177,7 @@ in
     openFirewall = mkOption {
       type = types.bool;
       default = false;
-      description = "Open the WebSocket port in the firewall (needed for LAN clients).";
-    };
-
-    localLlamaUrl = mkOption {
-      type = types.str;
-      default = "http://127.0.0.1:8080/v1";
-      description = "Local llama.cpp endpoint for routing/title generation (on oracle, zero-latency).";
-    };
-
-    localLlamaModel = mkOption {
-      type = types.str;
-      default = "qwen3-4b-instruct";
-      description = "Small model name for local routing and title generation.";
+      description = "Open the WebSocket port in the firewall.";
     };
 
     extraArgs = mkOption {
@@ -287,30 +192,27 @@ in
       example = [ "/etc/nixos" ];
       description = ''
         Git repositories the temple user may open despite not owning them.
-        The cron smart-flake-update runs `nix flake update`, which fetches
-        the flake via libgit2 — and libgit2 refuses repos not owned by the
-        invoking user (the "dubious ownership" check). Each path here lands
-        in the temple user's gitconfig as a safe.directory entry.
+      '';
+    };
+
+    # ── Daemon authentication ──
+    daemonAuthorizedKeys = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      example = {
+        ethan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... e-work@e-desktop";
+        val = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... v-work@v-desktop";
+      };
+      description = ''
+        Public keys authorized for daemon authentication, keyed by username.
+        Each entry becomes a file at /var/lib/temple/authorized_keys/<name>.
+        Reuses the user's existing SSH public key — no separate key needed.
       '';
     };
   };
 
   config = mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.sshTargets == [ ] || cfg.sshKeyPath != null;
-        message = "services.temple-server: sshTargets is non-empty but sshKeyPath is unset — SSH tool execution will fail in BatchMode.";
-      }
-      {
-        assertion = cfg.sshKeyPath == null || !(lib.hasPrefix "/nix/store" cfg.sshKeyPath);
-        message = "services.temple-server: sshKeyPath must not point into the nix store — private keys in the store are world-readable.";
-      }
-    ];
-
     environment.systemPackages = [ cfg.package ];
-    # Expose the generated config for inspection/debugging and to give CI
-    # a buildable artifact that exercises TOML generation (a null value
-    # fails at build time, not eval time).
     environment.etc."temple/config.toml".source = configFile;
 
     users.users.temple = {
@@ -318,12 +220,30 @@ in
       group = "temple";
       description = "temple renco agent";
       home = cfg.dataDir;
-      # A real shell is required: ssh executes ProxyCommand via the user's
-      # login shell, and nologin breaks the wake-and-relay proxy with
-      # "This account is currently not available." as the SSH banner.
       shell = pkgs.bash;
     };
     users.groups.temple = { };
+
+    # Authorized daemon keys
+    systemd.tmpfiles.rules =
+      [
+        "d ${cfg.dataDir} 0750 temple temple - -"
+        "d ${cfg.dataDir}/authorized_keys 0700 temple temple - -"
+      ]
+      ++ mapAttrsToList (
+        username: key:
+        "f ${cfg.dataDir}/authorized_keys/${username} 0400 temple temple - ${key}\n"
+      ) cfg.daemonAuthorizedKeys
+      ++ lib.optional (cfg.gitSafeDirectories != [ ])
+        "L+ ${cfg.dataDir}/.gitconfig - - - - /etc/temple/gitconfig";
+
+    # gitconfig marking configured repos as safe for the temple user
+    environment.etc."temple/gitconfig" = mkIf (cfg.gitSafeDirectories != [ ]) {
+      text = ''
+        [safe]
+        ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
+      '';
+    };
 
     systemd.services.temple-server = {
       description = "temple agent harness server — renco";
@@ -334,17 +254,20 @@ in
       environment.RUST_LOG = "temple_server=info";
       environment.HOME = cfg.dataDir;
 
-      # ssh must be in PATH — SshExecutor spawns `ssh` (and the generated
-      # config's ProxyCommand spawns another `ssh`) for remote tool execution.
-      # nix must be in PATH too — the cron smart-flake-update spawns it.
-      path = [ pkgs.openssh pkgs.nix ];
+      path = [ pkgs.nix ];
 
       serviceConfig = {
         Type = "simple";
         User = "temple";
         Group = "temple";
         ExecStart = concatStringsSep " " (
-          [ (escapeShellArgs [ "${cfg.package}/bin/temple-server" "--config" (toString configFile) ]) ]
+          [
+            (escapeShellArgs [
+              "${cfg.package}/bin/temple-server"
+              "--config"
+              (toString configFile)
+            ])
+          ]
           ++ map escapeShellArg cfg.extraArgs
         );
         Restart = "always";
@@ -354,8 +277,6 @@ in
         StateDirectoryMode = "0750";
         UMask = "0077";
 
-        # Hardening — the service needs: network (WS + outbound HTTPS/SSH),
-        # spawning ssh, and its state dir. Nothing else.
         NoNewPrivileges = true;
         ProtectSystem = "full";
         ProtectHome = "read-only";
@@ -376,68 +297,9 @@ in
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       }
       // (optionalAttrs (cfg.environmentFile != null) {
-        EnvironmentFile = if builtins.isList cfg.environmentFile then cfg.environmentFile else [ cfg.environmentFile ];
+        EnvironmentFile =
+          if builtins.isList cfg.environmentFile then cfg.environmentFile else [ cfg.environmentFile ];
       });
-    };
-
-    # SSH config for the temple user. One Host alias per target
-    # (name with @ replaced by -, e.g. e-work@e-desktop → e-work-e-desktop).
-    # Targets with a proxyCommand (wake-on-LAN relay) use it; others
-    # ProxyJump through the bastion. The bastion block is generated from
-    # cfg.sshBastion (user@host:port) and only emitted when configured.
-    environment.etc."temple/ssh_config".text =
-      let
-        sanitize = name: builtins.replaceStrings [ "@" ] [ "-" ] name;
-        identityFile = if cfg.sshKeyPath != null then cfg.sshKeyPath else "${cfg.dataDir}/ssh_key";
-        targetBlock = t: ''
-          Host ${sanitize t.name}
-            HostName ${t.host}
-            Port ${toString t.port}
-            User ${t.account}
-            IdentityFile ${identityFile}
-            UserKnownHostsFile ${cfg.dataDir}/.ssh/known_hosts
-            StrictHostKeyChecking accept-new
-            BatchMode yes
-            ConnectTimeout 15
-          ${if t.proxyCommand != null then
-            "  ProxyCommand ${t.proxyCommand}"
-          else if cfg.sshBastion != null then
-            "  ProxyJump bastion"
-          else ""}
-        '';
-        bastionBlock = optionalString (bastionParts != null) ''
-          Host bastion
-            HostName ${bastionParts.host}
-            Port ${bastionParts.port}
-            User ${bastionParts.user}
-            IdentityFile ${identityFile}
-            UserKnownHostsFile ${cfg.dataDir}/.ssh/known_hosts
-            StrictHostKeyChecking accept-new
-            BatchMode yes
-            ControlMaster auto
-            ControlPath ${cfg.dataDir}/.ssh/control-%r@%h-%p
-            ControlPersist 5m
-        '';
-      in
-      ''
-        ${bastionBlock}
-        ${concatStringsSep "\n" (map targetBlock cfg.sshTargets)}
-      '';
-    systemd.tmpfiles.rules = [
-      "d ${cfg.dataDir}/.ssh 0700 temple temple - -"
-      "L+ ${cfg.dataDir}/.ssh/config - - - - /etc/temple/ssh_config"
-    ]
-    ++ lib.optional (cfg.gitSafeDirectories != [ ])
-      "L+ ${cfg.dataDir}/.gitconfig - - - - /etc/temple/gitconfig";
-
-    # gitconfig marking configured repos as safe for the temple user
-    # (libgit2's dubious-ownership check — cron flake updates would
-    # otherwise fail with "repository path is not owned by current user").
-    environment.etc."temple/gitconfig" = mkIf (cfg.gitSafeDirectories != [ ]) {
-      text = ''
-        [safe]
-        ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
-      '';
     };
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [

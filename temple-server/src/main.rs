@@ -11,7 +11,6 @@ mod queue;
 mod router;
 mod server;
 mod signal;
-mod ssh;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
@@ -141,13 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp = mcp::McpClient::new(&cfg.litellm_url, &api_key);
 
     // Initialize agent
-    let mut agent = agent::Agent::new(litellm, mcp, memory.clone(), cfg.models.clone());
-    agent.set_local_endpoint(&cfg.local_llama_url, &cfg.local_llama_model);
-    agent.set_ssh_config(
-        cfg.ssh_targets.clone(),
-        cfg.ssh_bastion.clone(),
-        cfg.ssh_key_path.clone(),
-    );
+    let agent = agent::Agent::new(litellm, mcp, memory.clone(), cfg.models.clone());
     let agent = Arc::new(agent);
 
     // Load tools (local + MCP)
@@ -563,13 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if trimmed == "/targets" {
-                            let names = agent.ssh_target_names();
-                            let body = if names.is_empty() {
-                                "no ssh targets configured".to_string()
-                            } else {
-                                names.join("\n")
-                            };
-                            send_conv(&signal, &sender, &group_id, &body).await;
+                            send_conv(&signal, &sender, &group_id, "no targets configured").await;
                             return;
                         }
 
@@ -608,8 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let mut active_lock = active.lock().await;
                                                     active_lock.retain(|_, v| *v != r.id);
                                                     drop(active_lock);
-                                                    let target =
-                                                        r.ssh_target.as_deref().unwrap_or("quick");
+                                                    let target = "session";
                                                     let title =
                                                         r.title.as_deref().unwrap_or("(untitled)");
                                                     send_conv(
@@ -665,7 +651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for r in &rows {
                                         let id8: String =
                                             r.id.simple().to_string().chars().take(8).collect();
-                                        let target = r.ssh_target.as_deref().unwrap_or("quick");
+                                        let target = "session";
                                         let title = r.title.as_deref().unwrap_or("(untitled)");
                                         body.push_str(&format!("• {id8} · {target} · {title}\n"));
                                     }
@@ -729,27 +715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             }
                                             active.lock().await.insert(conv_key.clone(), sid);
-                                            // Auto-attach SSH if needed — Signal sessions
-                                            // need SSH to execute tools (no TUI client).
-                                            if !agent.has_ssh(sid).await {
-                                                if let Some(t) = agent
-                                                    .ssh_targets
-                                                    .iter()
-                                                    .find(|t| t.owner == username)
-                                                {
-                                                    if let Err(e) =
-                                                        agent.attach_ssh(sid, &t.name).await
-                                                    {
-                                                        tracing::warn!("attach_ssh for {sid}: {e}");
-                                                    } else {
-                                                        tracing::info!(
-                                                            "auto-attached SSH {} to session {sid}",
-                                                            t.name
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            let target = r.ssh_target.as_deref().unwrap_or("quick");
+                                            let target = "session";
                                             let title = r.title.as_deref().unwrap_or("(untitled)");
                                             send_conv(
                                                 &signal,
@@ -794,11 +760,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             };
                             if arg.is_empty() {
-                                let (_, _, mode) = agent.session_display(sid).await.unwrap_or((
-                                    None,
-                                    None,
-                                    temple_protocol::PermissionMode::Default,
-                                ));
+                                let (_, mode) = agent
+                                    .session_display(sid)
+                                    .await
+                                    .unwrap_or((None, temple_protocol::PermissionMode::Default));
                                 send_conv(
                                     &signal,
                                     &sender,
@@ -855,7 +820,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &username
                             };
                             match agent
-                                .new_persisted_session(session_owner, target, subdir, None, None)
+                                .new_persisted_session(session_owner, subdir, None, None)
                                 .await
                             {
                                 Ok(sid) => {
@@ -941,7 +906,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             session_user,
                                             &workspace,
                                             router::SessionKind::Interactive,
-                                            None,
                                         )
                                         .await;
                                     active_lock.insert(conv_key.clone(), new_id);
@@ -960,7 +924,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             session_user,
                                             &workspace,
                                             router::SessionKind::Interactive,
-                                            None,
                                         )
                                         .await;
                                     active_lock.insert(conv_key.clone(), new_id);
@@ -1056,13 +1019,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     request_id, name, ..
                                 } => {
                                     // Signal sessions have no local tool executor
-                                    // (tools run via SSH or a TUI client) — fail
-                                    // fast instead of stalling the request queue
-                                    // for the 300s timeout.
+                                    // — fail fast instead of stalling the
+                                    // request queue for the 300s timeout.
                                     let agent = agent_for_emit.clone();
                                     tokio::spawn(async move {
                                         agent.resolve_tool(request_id, format!(
-                                        "Error: tool {name} needs an SSH target or TUI client — none attached to this session"
+                                        "Error: tool {name} needs a TUI client — none attached to this session"
                                     )).await;
                                     });
                                 }
@@ -1132,12 +1094,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !text.trim().is_empty() {
                             // Preamble for non-quick sessions
                             let full = {
-                                let (target, title, mode) =
-                                    agent.session_display(target_session).await.unwrap_or((
-                                        None,
-                                        None,
-                                        temple_protocol::PermissionMode::Default,
-                                    ));
+                                let target: Option<String> = None;
+                                let (title, mode) = agent
+                                    .session_display(target_session)
+                                    .await
+                                    .unwrap_or((None, temple_protocol::PermissionMode::Default));
                                 let id8: String = target_session
                                     .simple()
                                     .to_string()

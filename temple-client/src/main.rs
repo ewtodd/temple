@@ -1,13 +1,15 @@
 mod app;
 mod client;
+mod daemon;
 mod input;
 mod render;
 mod state;
 mod tools;
 mod ui;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
+use temple_protocol::PermissionMode;
 
 #[derive(Parser)]
 #[command(name = "temple", about = "renco TUI client")]
@@ -29,6 +31,34 @@ struct Cli {
     tls: bool,
     #[arg(long, value_enum)]
     generate_completions: Option<Shell>,
+    /// Run as a headless daemon — executes tool requests locally, no UI
+    #[arg(long)]
+    daemon: bool,
+    /// Permission mode for daemon mode (yolo/ask/lockdown). Default: yolo
+    #[arg(long, default_value = "yolo")]
+    mode: DaemonMode,
+    /// Path to SSH private key for daemon authentication (e.g. ~/.ssh/id_ed25519)
+    #[arg(long)]
+    identity: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DaemonMode {
+    Default,
+    Ask,
+    Lockdown,
+    Yolo,
+}
+
+impl From<DaemonMode> for PermissionMode {
+    fn from(m: DaemonMode) -> Self {
+        match m {
+            DaemonMode::Default => PermissionMode::Default,
+            DaemonMode::Ask => PermissionMode::Ask,
+            DaemonMode::Lockdown => PermissionMode::Lockdown,
+            DaemonMode::Yolo => PermissionMode::Yolo,
+        }
+    }
 }
 
 impl Cli {
@@ -48,11 +78,42 @@ fn main() {
 
     let cwd =
         std::fs::canonicalize(&cli.cwd).unwrap_or_else(|_| std::path::PathBuf::from(&cli.cwd));
-    let cwd_str = cwd.to_string_lossy().to_string();
     let client_id = cli
         .client_id
         .unwrap_or_else(|| whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()));
 
+    if cli.daemon {
+        let pubkey = cli.identity.as_ref().and_then(|path| {
+            let pub_path = if path.ends_with(".pub") {
+                path.clone()
+            } else {
+                format!("{path}.pub")
+            };
+            std::fs::read_to_string(&pub_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = daemon::run(
+                cli.server,
+                cwd,
+                client_id,
+                cli.token,
+                cli.tls,
+                cli.mode.into(),
+                pubkey,
+            )
+            .await
+            {
+                eprintln!("temple-daemon: fatal: {e}");
+                std::process::exit(1);
+            }
+        });
+        return;
+    }
+
+    let cwd_str = cwd.to_string_lossy().to_string();
     let mut app = app::App::new(
         cwd_str,
         client_id,

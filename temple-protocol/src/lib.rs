@@ -12,6 +12,12 @@ pub struct SessionOpen {
     pub cwd: String,
     pub hostname: String,
     pub username: String,
+    /// Public key for daemon authentication (SSH ed25519 format).
+    /// If set, the server verifies this key is authorized for the username
+    /// before accepting the session. TUI clients leave this unset and rely
+    /// on token auth alone.
+    #[serde(default)]
+    pub daemon_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

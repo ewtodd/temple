@@ -136,12 +136,7 @@ struct SessionCtx {
     history: Vec<ChatMessage>,
     username: String,
     cwd: String,
-    initialized: bool,
     kind: SessionKind,
-    /// SSH executor for remote tool execution (None = local tools only)
-    ssh: Option<Arc<crate::ssh::SshExecutor>>,
-    /// SSH target name (e.g. "e-work@e-desktop") for persistence/display
-    ssh_target_name: Option<String>,
     /// Client account name (e.g. "e-play") for per-account session clearing
     account: Option<String>,
     /// Person who owns this session (token username, e.g. "ethan").
@@ -151,7 +146,6 @@ struct SessionCtx {
     /// Whether this session should be persisted to the DB
     persist: bool,
     /// Permission mode, persisted and restored on resume.
-    /// SSH sessions can never be Yolo.
     permission_mode: PermissionMode,
     /// Cached project context string (detected from CWD on first message)
     project_context: Option<String>,
@@ -169,8 +163,6 @@ struct SessionCtx {
 
 pub struct Agent {
     pub litellm: LiteLLM,
-    /// Local llama.cpp for routing/titles (zero latency, on oracle)
-    pub local: LiteLLM,
     pub mcp: McpClient,
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
@@ -192,22 +184,13 @@ pub struct Agent {
     pub queue: crate::queue::RequestQueue,
     /// Last time a real request started (keep-warm skips while this is fresh)
     last_request: std::sync::Mutex<Instant>,
-    router_model: String,
-    title_model: String,
     tools: Mutex<Vec<ToolDefinition>>,
-    /// SSH targets for remote tool execution (from config) — read by server
-    /// to auto-match client hostnames during OpenSession.
-    pub ssh_targets: Vec<crate::config::SshTarget>,
-    ssh_key_path: Option<std::path::PathBuf>,
-    ssh_bastion: Option<String>,
 }
 
 impl Agent {
     pub fn new(litellm: LiteLLM, mcp: McpClient, memory: Arc<Memory>, models: ModelConfig) -> Self {
         Self {
             litellm,
-            // Local model client — no API key needed, localhost
-            local: LiteLLM::new("http://127.0.0.1:8080/v1", "none"),
             mcp,
             memory,
             permissions: Arc::new(PermissionResolver::new()),
@@ -216,17 +199,12 @@ impl Agent {
             token_generation: std::sync::atomic::AtomicU64::new(0),
             loop_locks: Mutex::new(HashMap::new()),
             pending_tools: Mutex::new(HashMap::new()),
-            router_model: "qwen3-4b-instruct".to_string(),
-            title_model: "qwen3-4b-instruct".to_string(),
             models,
             queue: crate::queue::RequestQueue::new(),
             last_request: std::sync::Mutex::new(
                 Instant::now() - std::time::Duration::from_secs(3600),
             ),
             tools: Mutex::new(Vec::new()),
-            ssh_targets: Vec::new(),
-            ssh_key_path: None,
-            ssh_bastion: None,
         }
     }
 
@@ -277,45 +255,6 @@ impl Agent {
         out
     }
 
-    /// Set the local llama.cpp endpoint (called from main.rs with config)
-    pub fn set_local_endpoint(&mut self, url: &str, model: &str) {
-        self.local = LiteLLM::new(url, "none");
-        self.router_model = model.to_string();
-        self.title_model = model.to_string();
-    }
-
-    /// Set the SSH execution config (called from main.rs with config)
-    pub fn set_ssh_config(
-        &mut self,
-        targets: Vec<crate::config::SshTarget>,
-        bastion: Option<String>,
-        key_path: Option<std::path::PathBuf>,
-    ) {
-        self.ssh_targets = targets;
-        self.ssh_bastion = bastion;
-        self.ssh_key_path = key_path;
-    }
-
-    /// List configured SSH target names.
-    pub fn ssh_target_names(&self) -> Vec<String> {
-        self.ssh_targets.iter().map(|t| t.name.clone()).collect()
-    }
-
-    /// Build an SSH executor for a named target. Returns None if the target
-    /// isn't configured or no key path is set.
-    pub fn make_ssh(&self, target_name: &str) -> Option<Arc<crate::ssh::SshExecutor>> {
-        let target = self.ssh_targets.iter().find(|t| t.name == target_name)?;
-        let key = self
-            .ssh_key_path
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/temple/ssh_key"));
-        Some(Arc::new(crate::ssh::SshExecutor::new(
-            target.clone(),
-            self.ssh_bastion.clone(),
-            key,
-        )))
-    }
-
     /// Load tool definitions: local tools + MCP tools from litellm.
     pub async fn refresh_tools(&self) {
         let mut tools = local_tools();
@@ -364,15 +303,8 @@ impl Agent {
         username: &str,
         cwd: &str,
         kind: SessionKind,
-        ssh: Option<Arc<crate::ssh::SshExecutor>>,
     ) {
         let mut sessions = self.sessions.lock().await;
-        let initialized = self
-            .memory
-            .get_memory("onboarded", username)
-            .await
-            .unwrap_or(None)
-            .is_some();
         sessions.insert(
             session_id,
             SessionCtx {
@@ -380,10 +312,7 @@ impl Agent {
                 history: Vec::new(),
                 username: username.to_string(),
                 cwd: cwd.to_string(),
-                initialized,
                 kind,
-                ssh,
-                ssh_target_name: None,
                 account: None,
                 owner: username.to_string(),
                 title: None,
@@ -403,85 +332,18 @@ impl Agent {
         );
     }
 
-    /// Create a new persisted session for `owner`, optionally bound to an
-    /// SSH target and with an optional start directory (relative to $HOME).
+    /// Create a new persisted session for `owner`, with an optional
+    /// start directory. The client handles tool execution via ToolRequest.
     pub async fn new_persisted_session(
         &self,
         owner: &str,
-        ssh_target: Option<&str>,
-        start_dir: Option<&str>,
+        _start_dir: Option<&str>,
         account: Option<&str>,
         client_cwd: Option<&str>,
     ) -> Result<Uuid, String> {
         let session_id = Uuid::new_v4();
-        let (ssh, kind, cwd, full_name, account_name) = match ssh_target {
-            Some(name) => {
-                let t = self
-                    .ssh_targets
-                    .iter()
-                    .find(|t| {
-                        t.name == name
-                            || t.name.starts_with(&format!("{name}@"))
-                            || t.account == name
-                    })
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "unknown ssh target: {name} (available: {})",
-                            self.ssh_target_names().join(", ")
-                        )
-                    })?;
-                let ssh = self
-                    .make_ssh(&t.name)
-                    .ok_or_else(|| "ssh key not configured".to_string())?;
-                let cwd = ssh.home_dir().await.unwrap_or_else(|_| "~".into());
-                (
-                    Some(ssh),
-                    SessionKind::Interactive,
-                    cwd,
-                    t.name,
-                    Some(t.account),
-                )
-            }
-            None => (
-                None,
-                SessionKind::Interactive,
-                client_cwd.unwrap_or("/var/lib/temple").to_string(),
-                "temple".to_string(),
-                account.map(|a| a.to_string()),
-            ),
-        };
-
-        // If a start_dir was given and we have an SSH executor, cd into it
-        let cwd = if let (Some(ref ssh), Some(dir)) = (&ssh, start_dir) {
-            if dir.is_empty() {
-                cwd
-            } else {
-                // mkdir -p so /new target DIR works for dirs that don't
-                // exist yet. ssh.execute never errs on non-zero exit (it
-                // embeds "[exit N]" in the output), so validate that pwd
-                // actually returned a path.
-                let cmd = format!(
-                    "mkdir -p -- ~/{} && cd ~/{} && pwd",
-                    shell_escape(dir),
-                    shell_escape(dir)
-                );
-                match ssh.execute(&cmd).await {
-                    Ok(pwd) => {
-                        // ssh.execute never errs on non-zero exit (it
-                        // embeds "[exit N]"), and MOTD/banner noise can
-                        // surround the path — pick the path-looking line.
-                        match pwd.lines().map(str::trim).find(|l| l.starts_with('/')) {
-                            Some(p) => p.to_string(),
-                            None => cwd, // unexpected output — keep home dir
-                        }
-                    }
-                    Err(_) => cwd, // ssh failed — keep home dir
-                }
-            }
-        } else {
-            cwd
-        };
+        let cwd = client_cwd.unwrap_or("/var/lib/temple").to_string();
+        let account_name = account.map(|a| a.to_string());
 
         let mut sessions = self.sessions.lock().await;
         sessions.insert(
@@ -490,11 +352,8 @@ impl Agent {
                 model: self.models.default_model.clone(),
                 history: Vec::new(),
                 username: owner.to_string(),
-                cwd,
-                initialized: true,
-                kind,
-                ssh,
-                ssh_target_name: Some(full_name),
+                cwd: cwd.clone(),
+                kind: SessionKind::Interactive,
                 account: account_name,
                 owner: owner.to_string(),
                 title: None,
@@ -541,7 +400,6 @@ impl Agent {
         let todos: Vec<temple_protocol::TodoItem> =
             serde_json::from_str(&row.todos_json).unwrap_or_default();
 
-        let ssh = row.ssh_target.as_deref().and_then(|n| self.make_ssh(n));
         let kind = match row.kind.as_str() {
             "headless" => SessionKind::Headless,
             _ => SessionKind::Interactive,
@@ -586,10 +444,7 @@ impl Agent {
                 history,
                 username: row.username.clone(),
                 cwd: row.cwd,
-                initialized: true,
                 kind,
-                ssh,
-                ssh_target_name: row.ssh_target,
                 account: row.account,
                 owner: row.username,
                 title: row.title,
@@ -619,7 +474,7 @@ impl Agent {
             crate::memory::PersistedSession {
                 id: session_id,
                 username: s.owner.clone(),
-                ssh_target: s.ssh_target_name.clone(),
+                ssh_target: None,
                 account: s.account.clone(),
                 cwd: s.cwd.clone(),
                 mode: format!("{:?}", s.permission_mode).to_lowercase(),
@@ -635,32 +490,6 @@ impl Agent {
         if let Err(e) = self.memory.save_session(&row).await {
             tracing::warn!("persist session {session_id}: {e}");
         }
-    }
-
-    /// Attach an SSH executor to an existing session.
-    pub async fn attach_ssh(&self, session_id: Uuid, target_name: &str) -> Result<(), String> {
-        let ssh = self
-            .make_ssh(target_name)
-            .ok_or_else(|| format!("unknown ssh target: {target_name}"))?;
-        let mut sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.get_mut(&session_id) {
-            s.ssh = Some(ssh);
-            s.ssh_target_name = Some(target_name.to_string());
-            s.kind = SessionKind::Interactive;
-            Ok(())
-        } else {
-            Err("session not found".into())
-        }
-    }
-
-    /// Check whether a session has an SSH executor attached.
-    pub async fn has_ssh(&self, session_id: Uuid) -> bool {
-        self.sessions
-            .lock()
-            .await
-            .get(&session_id)
-            .map(|s| s.ssh.is_some())
-            .unwrap_or(false)
     }
 
     /// Generate and store a title for a session if it doesn't have one yet.
@@ -777,15 +606,11 @@ impl Agent {
     pub async fn session_display(
         &self,
         session_id: Uuid,
-    ) -> Option<(Option<String>, Option<String>, PermissionMode)> {
+    ) -> Option<(Option<String>, PermissionMode)> {
         let sessions = self.sessions.lock().await;
-        sessions.get(&session_id).map(|s| {
-            (
-                s.ssh_target_name.clone(),
-                s.title.clone(),
-                s.permission_mode,
-            )
-        })
+        sessions
+            .get(&session_id)
+            .map(|s| (s.title.clone(), s.permission_mode))
     }
 
     /// Check whether a session is currently loaded in memory.
@@ -865,24 +690,15 @@ impl Agent {
     /// Set the permission mode for a session. SSH sessions cannot use
     /// Yolo — silently downgraded. Persisted immediately if durable.
     pub async fn set_session_mode(&self, session_id: Uuid, mode: PermissionMode) {
-        let effective = {
+        {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.get_mut(&session_id) {
-                let effective = if s.ssh.is_some() && mode == PermissionMode::Yolo {
-                    tracing::warn!("Yolo rejected for SSH session {session_id} — using default");
-                    PermissionMode::Default
-                } else {
-                    mode
-                };
-                s.permission_mode = effective;
-                effective
+                s.permission_mode = mode;
             } else {
                 return;
             }
-        };
-        // No need to re-read — we know it might be persistable
+        }
         self.persist_session(session_id).await;
-        let _ = effective;
     }
 
     pub async fn session_model(&self, session_id: Uuid) -> String {
@@ -938,16 +754,7 @@ impl Agent {
         let _loop_guard = loop_lock.lock().await;
 
         // Get session info
-        let (
-            username,
-            cwd,
-            _is_initialized,
-            session_model,
-            session_kind,
-            ssh_executor,
-            model_override,
-            last_routed_model,
-        ) = {
+        let (username, cwd, session_model, session_kind, model_override, last_routed_model) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
@@ -958,10 +765,8 @@ impl Agent {
             (
                 s.username.clone(),
                 s.cwd.clone(),
-                s.initialized,
                 s.model.clone(),
                 s.kind,
-                s.ssh.clone(),
                 s.model_override,
                 s.last_routed_model.clone(),
             )
@@ -1135,7 +940,6 @@ impl Agent {
                         &base_system_prompt,
                         &cancel_token,
                         &scope,
-                        ssh_executor.as_ref(),
                         emit,
                         &mut stats,
                         &mut tool_history,
@@ -1157,7 +961,6 @@ impl Agent {
                     reviewer,
                     &cancel_token,
                     &scope,
-                    ssh_executor.as_ref(),
                     emit,
                     &mut stats,
                 )
@@ -1251,10 +1054,6 @@ impl Agent {
                     s.account.as_deref() == Some(account)
                         || s.owner == account
                         || s.username == account
-                        || s.ssh_target_name.as_deref() == Some(account)
-                        || s.ssh_target_name
-                            .as_deref()
-                            .is_some_and(|t| t.starts_with(&format!("{account}@")))
                 })
                 .map(|(id, _)| *id)
                 .collect()
@@ -1374,7 +1173,6 @@ impl Agent {
         reviewer: &str,
         cancel_token: &CancellationToken,
         scope: &Arc<Mutex<PermissionScope>>,
-        ssh: Option<&Arc<crate::ssh::SshExecutor>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         stats: &mut StatsAccum,
     ) -> (String, String) {
@@ -1415,7 +1213,6 @@ impl Agent {
                 &executor_prompt,
                 cancel_token,
                 scope,
-                ssh,
                 emit,
                 stats,
                 &mut tool_history,
@@ -1480,7 +1277,6 @@ impl Agent {
                     &executor_prompt,
                     cancel_token,
                     scope,
-                    ssh,
                     emit,
                     stats,
                     &mut tool_history,
@@ -1613,7 +1409,6 @@ impl Agent {
         system_prompt: &str,
         cancel_token: &CancellationToken,
         scope: &Arc<Mutex<PermissionScope>>,
-        ssh: Option<&Arc<crate::ssh::SshExecutor>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         stats: &mut StatsAccum,
         tool_call_history: &mut Vec<String>,
@@ -1879,7 +1674,6 @@ impl Agent {
                         name,
                         args_str,
                         scope.clone(),
-                        ssh,
                         cancel_token,
                         emit,
                     )
@@ -2145,24 +1939,13 @@ Git conventions:
         name: &str,
         args_json: &str,
         scope: Arc<Mutex<PermissionScope>>,
-        ssh: Option<&Arc<crate::ssh::SshExecutor>>,
         cancel_token: &CancellationToken,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String, String> {
         let args = LiteLLM::recover_tool_call(args_json)
             .ok_or_else(|| format!("cannot parse arguments for {name}"))?;
 
-        // SSH sessions: resolve relative paths against the session's working
-        // directory (each ssh call starts in $HOME otherwise — /new target
-        // DIR would silently operate on ~).
-        let session_cwd = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id).map(|s| s.cwd.clone())
-        };
-
         // Reject paths and commands that leak the server's base directory.
-        // The model sometimes confuses it with a workspace root. Catch it
-        // here and remind it of the relevant instruction.
         if let Some(path) = args["path"].as_str() {
             if path.contains("/var/lib/temple") {
                 return Err("REJECTED: path must be relative to the working directory. \
@@ -2179,221 +1962,140 @@ Git conventions:
                 );
             }
         }
-        let in_cwd = |path: &str| -> String {
-            match &session_cwd {
-                Some(cwd)
-                    if ssh.is_some()
-                        && cwd.starts_with('/')
-                        && !path.starts_with('/')
-                        && !path.starts_with('~') =>
-                {
-                    format!("{}/{}", cwd.trim_end_matches('/'), path)
-                }
-                _ => path.to_string(),
-            }
-        };
 
         match name {
             "read_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::Read,
-                        ssh,
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    ssh.read_file(&resolved).await
+                let resolved = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
                 } else {
-                    let resolved = if std::path::Path::new(path).is_absolute() {
-                        std::path::PathBuf::from(path)
-                    } else {
-                        let sessions = self.sessions.lock().await;
-                        let cwd = sessions
-                            .get(&session_id)
-                            .map(|s| s.cwd.clone())
-                            .unwrap_or_else(|| ".".into());
-                        drop(sessions);
-                        std::path::Path::new(&cwd).join(path)
-                    };
-                    self.check_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::Read,
-                        scope.clone(),
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    let request_id = Uuid::new_v4();
-                    let rx = self.ask_tool(request_id).await;
-                    emit(AgentEvent::ToolRequestNeeded {
-                        request_id,
-                        name: "read_file".to_string(),
-                        args_json: args_json.to_string(),
-                    });
-                    self.wait_tool_result(request_id, rx, cancel_token).await
-                }
+                    let sessions = self.sessions.lock().await;
+                    let cwd = sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into());
+                    drop(sessions);
+                    std::path::Path::new(&cwd).join(path)
+                };
+                self.check_perm(
+                    session_id,
+                    &resolved,
+                    AccessKind::Read,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "read_file".to_string(),
+                    args_json: args_json.to_string(),
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
 
             "write_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let content = args["content"].as_str().ok_or("missing content")?;
-                if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::Write,
-                        ssh,
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    ssh.write_file(&resolved, content).await
+                let _content = args["content"].as_str().ok_or("missing content")?;
+                let resolved = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
                 } else {
-                    let resolved = if std::path::Path::new(path).is_absolute() {
-                        std::path::PathBuf::from(path)
-                    } else {
-                        let sessions = self.sessions.lock().await;
-                        let cwd = sessions
-                            .get(&session_id)
-                            .map(|s| s.cwd.clone())
-                            .unwrap_or_else(|| ".".into());
-                        drop(sessions);
-                        std::path::Path::new(&cwd).join(path)
-                    };
-                    self.check_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::Write,
-                        scope.clone(),
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    let request_id = Uuid::new_v4();
-                    let rx = self.ask_tool(request_id).await;
-                    emit(AgentEvent::ToolRequestNeeded {
-                        request_id,
-                        name: "write_file".to_string(),
-                        args_json: args_json.to_string(),
-                    });
-                    self.wait_tool_result(request_id, rx, cancel_token).await
-                }
+                    let sessions = self.sessions.lock().await;
+                    let cwd = sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into());
+                    drop(sessions);
+                    std::path::Path::new(&cwd).join(path)
+                };
+                self.check_perm(
+                    session_id,
+                    &resolved,
+                    AccessKind::Write,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "write_file".to_string(),
+                    args_json: args_json.to_string(),
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
 
             "list_dir" => {
                 let path = args["path"].as_str().unwrap_or(".");
-                if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::ReadDir,
-                        ssh,
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    ssh.list_dir(&resolved).await
+                let resolved = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
                 } else {
-                    let resolved = if std::path::Path::new(path).is_absolute() {
-                        std::path::PathBuf::from(path)
+                    let sessions = self.sessions.lock().await;
+                    let cwd = sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into());
+                    drop(sessions);
+                    std::path::Path::new(&cwd).join(path)
+                };
+                self.check_perm(
+                    session_id,
+                    &resolved,
+                    AccessKind::ReadDir,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "list_dir".to_string(),
+                    args_json: args_json.to_string(),
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
+            }
+
+            "execute_command" => {
+                let command = args["command"].as_str().ok_or("missing command")?;
+                // Local session: check permission mode. Lockdown always
+                // prompts for commands. Unsafe commands always prompt.
+                // Safe read-only commands are allowed automatically.
+                let must_check = {
+                    if !temple_protocol::command::is_safe_command(command) {
+                        true
                     } else {
                         let sessions = self.sessions.lock().await;
-                        let cwd = sessions
-                            .get(&session_id)
-                            .map(|s| s.cwd.clone())
-                            .unwrap_or_else(|| ".".into());
+                        let mode = sessions.get(&session_id).map(|s| s.permission_mode);
                         drop(sessions);
-                        std::path::Path::new(&cwd).join(path)
-                    };
+                        matches!(mode, Some(PermissionMode::Lockdown))
+                    }
+                };
+                if must_check {
+                    let cmd_path = std::path::Path::new(command);
                     self.check_perm(
                         session_id,
-                        &resolved,
-                        AccessKind::ReadDir,
+                        cmd_path,
+                        AccessKind::Execute,
                         scope.clone(),
                         cancel_token,
                         emit,
                     )
                     .await?;
-                    let request_id = Uuid::new_v4();
-                    let rx = self.ask_tool(request_id).await;
-                    emit(AgentEvent::ToolRequestNeeded {
-                        request_id,
-                        name: "list_dir".to_string(),
-                        args_json: args_json.to_string(),
-                    });
-                    self.wait_tool_result(request_id, rx, cancel_token).await
                 }
-            }
-
-            "execute_command" => {
-                let command = args["command"].as_str().ok_or("missing command")?;
-                if let Some(ssh) = ssh {
-                    // SSH sessions: Yolo is never allowed — dangerous and
-                    // non-safe commands always prompt.
-                    if !temple_protocol::command::is_safe_command(command) {
-                        self.check_ssh_perm(
-                            session_id,
-                            command,
-                            AccessKind::Execute,
-                            ssh,
-                            cancel_token,
-                            emit,
-                        )
-                        .await?;
-                    }
-                    // Run inside the session's working directory — each
-                    // ssh call starts fresh in $HOME otherwise.
-                    let command = match &session_cwd {
-                        Some(cwd) if cwd.starts_with('/') => {
-                            format!("cd -- {} && {}", shell_escape(cwd), command)
-                        }
-                        _ => command.to_string(),
-                    };
-                    ssh.execute(&command).await
-                } else {
-                    // Local session: check permission mode. Lockdown always
-                    // prompts for commands. Unsafe commands always prompt.
-                    // Safe read-only commands are allowed automatically.
-                    let must_check = {
-                        if !temple_protocol::command::is_safe_command(command) {
-                            true
-                        } else {
-                            let sessions = self.sessions.lock().await;
-                            let mode = sessions.get(&session_id).map(|s| s.permission_mode);
-                            drop(sessions);
-                            matches!(mode, Some(PermissionMode::Lockdown))
-                        }
-                    };
-                    if must_check {
-                        // Use the command as the "path" for the prompt
-                        let cmd_path = std::path::Path::new(command);
-                        self.check_perm(
-                            session_id,
-                            cmd_path,
-                            AccessKind::Execute,
-                            scope.clone(),
-                            cancel_token,
-                            emit,
-                        )
-                        .await?;
-                    }
-                    let request_id = Uuid::new_v4();
-                    let rx = self.ask_tool(request_id).await;
-                    emit(AgentEvent::ToolRequestNeeded {
-                        request_id,
-                        name: "execute_command".to_string(),
-                        args_json: args_json.to_string(),
-                    });
-                    self.wait_tool_result(request_id, rx, cancel_token).await
-                }
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "execute_command".to_string(),
+                    args_json: args_json.to_string(),
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
 
             "save_memory" => {
@@ -2414,63 +2116,36 @@ Git conventions:
             }
             "edit_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let old_str = args["old_str"].as_str().ok_or("missing old_str")?;
-                let new_str = args["new_str"].as_str().unwrap_or("");
-                if let Some(ssh) = ssh {
-                    let resolved = ssh.resolve_path(&in_cwd(path)).await?;
-                    self.check_ssh_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::Write,
-                        ssh,
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    let content = ssh.read_file(&resolved).await?;
-                    if !content.contains(old_str) {
-                        return Err(format!("old_str not found in {resolved}"));
-                    }
-                    let count = content.matches(old_str).count();
-                    if count > 1 {
-                        return Err(format!("old_str found {count} times — must be unique"));
-                    }
-                    let mut new_content = content.replacen(old_str, new_str, 1);
-                    if content.ends_with('\n') && !new_content.ends_with('\n') {
-                        new_content.push('\n');
-                    }
-                    ssh.write_file(&resolved, &new_content).await?;
-                    Ok(format!("edited {resolved} (replaced 1 occurrence)"))
+                let _old_str = args["old_str"].as_str().ok_or("missing old_str")?;
+                let _new_str = args["new_str"].as_str().unwrap_or("");
+                let resolved = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
                 } else {
-                    let resolved = if std::path::Path::new(path).is_absolute() {
-                        std::path::PathBuf::from(path)
-                    } else {
-                        let sessions = self.sessions.lock().await;
-                        let cwd = sessions
-                            .get(&session_id)
-                            .map(|s| s.cwd.clone())
-                            .unwrap_or_else(|| ".".into());
-                        drop(sessions);
-                        std::path::Path::new(&cwd).join(path)
-                    };
-                    self.check_perm(
-                        session_id,
-                        &resolved,
-                        AccessKind::Write,
-                        scope.clone(),
-                        cancel_token,
-                        emit,
-                    )
-                    .await?;
-                    let request_id = Uuid::new_v4();
-                    let rx = self.ask_tool(request_id).await;
-                    emit(AgentEvent::ToolRequestNeeded {
-                        request_id,
-                        name: "edit_file".to_string(),
-                        args_json: args_json.to_string(),
-                    });
-                    self.wait_tool_result(request_id, rx, cancel_token).await
-                }
+                    let sessions = self.sessions.lock().await;
+                    let cwd = sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into());
+                    drop(sessions);
+                    std::path::Path::new(&cwd).join(path)
+                };
+                self.check_perm(
+                    session_id,
+                    &resolved,
+                    AccessKind::Write,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "edit_file".to_string(),
+                    args_json: args_json.to_string(),
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
             "recall_memory" => {
                 let username = {
@@ -2573,52 +2248,6 @@ Git conventions:
                 out
             }
         }
-    }
-
-    /// Check permissions for SSH-executed tools. Always prompts for
-    /// paths outside $HOME and /tmp. Yolo is never allowed.
-    async fn check_ssh_perm(
-        &self,
-        session_id: Uuid,
-        target: &str,
-        access: AccessKind,
-        ssh: &crate::ssh::SshExecutor,
-        cancel_token: &CancellationToken,
-        emit: &(dyn Fn(AgentEvent) + Send + Sync),
-    ) -> Result<(), String> {
-        // Get the remote home dir to check against
-        let home = ssh.home_dir().await.unwrap_or_default();
-        let allowed = ssh.is_path_allowed(target, &home);
-
-        if allowed {
-            return Ok(());
-        }
-
-        // Not in allowed dirs — prompt the user
-        let request_id = Uuid::new_v4();
-        let rx = self.permissions.ask(request_id).await;
-        emit(AgentEvent::PermissionNeeded(PermissionRequest {
-            request_id,
-            session_id,
-            path: format!("{} @ {}", target, ssh.target_name()),
-            access,
-        }));
-
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-        let out = tokio::select! {
-            res = tokio::time::timeout(TIMEOUT, rx) => {
-                match res {
-                    Ok(Ok(true)) => Ok(()),
-                    Ok(Ok(false)) => Err(format!("permission denied: {target}")),
-                    _ => Err("permission request timed out".to_string()),
-                }
-            }
-            _ = cancel_token.cancelled() => Err("cancelled by user".to_string()),
-        };
-        if out.is_err() {
-            self.permissions.forget(request_id).await;
-        }
-        out
     }
 
     /// Weekly personality update: analyze recent conversations, ask the brain
@@ -3021,11 +2650,6 @@ fn truncate(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…[truncated {} bytes]", s.len() - cut.len())
     }
-}
-
-/// Minimal shell escaping for directory paths in ssh commands.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 /// Generate code rules that only cover the languages detected in the project

@@ -14,34 +14,8 @@ pub struct Config {
     pub cron: CronConfig,
     pub default_permission: String,
     pub allowed_dirs: Vec<String>,
-    /// Local llama.cpp instance for routing/titles (on oracle).
-    pub local_llama_url: String,
-    pub local_llama_model: String,
     /// Path to the auth tokens file. Each line: `token:username:phone`.
     pub auth_token_file: Option<PathBuf>,
-    /// SSH targets for remote tool execution.
-    pub ssh_targets: Vec<SshTarget>,
-    /// Bastion host for SSH (e.g., "deploy-mu" or "10.0.0.2:2222").
-    pub ssh_bastion: Option<String>,
-    /// SSH key for connecting to workstations (path on oracle).
-    pub ssh_key_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SshTarget {
-    /// Human-readable name, e.g., "e-work@e-desktop"
-    pub name: String,
-    /// Username on the workstation, e.g., "e-work"
-    pub account: String,
-    /// Workstation IP, e.g., "10.0.0.4"
-    pub host: String,
-    /// SSH port (usually 2222)
-    pub port: u16,
-    /// User who owns this account (matches token file username)
-    pub owner: String,
-    /// Allowed directories for this target (in addition to $HOME and /tmp)
-    #[serde(default)]
-    pub allowed_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,13 +66,9 @@ impl Default for NextcloudConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// Whether to use small local model as router (deprecated — use router_model)
-    pub use_local_router: bool,
-    /// Path to small GGUF for router (deprecated — use router_model)
-    pub local_router_model: Option<String>,
     /// Default model for fallback / Medium complexity
     pub default_model: String,
-    /// Fast model for Simple queries (oracle local classifier)
+    /// Fast model for Simple queries
     pub simple_model: String,
     /// Planner model for Complex pipeline (deepseek on son-of-anton)
     pub planner_model: String,
@@ -108,13 +78,11 @@ pub struct ModelConfig {
     pub reviewer_model: String,
     /// Model for Critical complexity (deepseek direct)
     pub critical_model: String,
-    /// Model for research/lookups (gemma on anton — good at general knowledge)
+    /// Model for research/lookups (gemma on anton)
     pub researcher_model: String,
     /// Model for complexity classification — a small fast model co-resident
-    /// with the default/executor model on the same GPU host. Defaults to
-    /// researcher_model if unset. Point this at a 4B-class model (e.g.
-    /// gemma-4-E4B) loaded alongside deepseek on son-of-anton for ~50ms
-    /// classification latency.
+    /// with the default/executor model on the same GPU host. Falls back to
+    /// researcher_model when unset.
     #[serde(default)]
     pub router_model: Option<String>,
     /// Model definitions
@@ -124,8 +92,6 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            use_local_router: false,
-            local_router_model: None,
             default_model: "deepseek-v4-flash-high".into(),
             simple_model: "qwen3-4b-instruct".into(),
             planner_model: "deepseek-v4-flash-high".into(),
@@ -179,12 +145,7 @@ impl Default for Config {
             cron: CronConfig::default(),
             default_permission: "default".into(),
             allowed_dirs: vec!["/etc/nixos".into(), "/home".into()],
-            local_llama_url: "http://127.0.0.1:8080/v1".into(),
-            local_llama_model: "qwen3-4b-instruct".into(),
             auth_token_file: None,
-            ssh_targets: Vec::new(),
-            ssh_bastion: None,
-            ssh_key_path: None,
         }
     }
 }
@@ -208,7 +169,6 @@ impl Config {
                 Self::default()
             }
         } else {
-            // Try standard paths
             for p in &[
                 "/etc/temple/config.toml",
                 "/var/lib/temple/config.toml",
