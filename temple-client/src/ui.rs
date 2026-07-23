@@ -351,11 +351,10 @@ fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .padding(ratatui::widgets::Padding::new(1, 0, 0, 0));
+    let inner_area = block.inner(area);
     f.render_widget(block, area);
-
-    let inner = Block::default().padding(ratatui::widgets::Padding::new(1, 0, 0, 0));
-    let inner_area = inner.inner(area);
 
     let prompt_inner_w = width.saturating_sub(3).max(1);
 
