@@ -390,8 +390,12 @@ impl App {
                             ServerMessage::SessionList { sessions } => {
                                 if do_continue {
                                     do_continue = false;
+                                    // Resume the most recent session in the
+                                    // same working directory — not globally.
+                                    let cwd = s.cwd.clone();
                                     match sessions
                                         .iter()
+                                        .filter(|m| m.cwd == cwd)
                                         .find(|m| m.id != s.session_id)
                                     {
                                         Some(prev) => {
@@ -553,6 +557,12 @@ impl App {
                         }
                     }
                 });
+
+                // Request session list on connect for --continue: resume the
+                // most recent session in the same directory, not across cwds.
+                if do_continue {
+                    let _ = tx_session.send(ClientMessage::ListSessions);
+                }
 
                 // Writer: UI channel → socket, + pings
                 loop {
