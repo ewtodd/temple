@@ -211,15 +211,22 @@ fn spawn_ws(
                         // Session binding: ignore tool requests for sessions
                         // other than the active one — a misbehaving server
                         // must not drive tools through a stale channel.
-                        let (cwd, active_sid) = {
+                        let (cwd, active_sid, mode) = {
                             let g = s.lock().unwrap();
-                            (g.cwd.clone(), g.session_id)
+                            (g.cwd.clone(), g.session_id, g.mode)
                         };
                         if session_id != active_sid {
                             let _ = tx_session.send(ClientMessage::ToolResult {
                                 request_id, session_id,
                                 result: "Error: tool request for inactive session".into(),
                             });
+                            continue;
+                        }
+
+                        // ── YOLO bypass: skip consent entirely ──
+                        if mode == PermissionMode::Yolo {
+                            let result = execute_local_tool(name, args_json, &cwd).await;
+                            let _ = tx_session.send(ClientMessage::ToolResult { request_id, session_id, result });
                             continue;
                         }
 
@@ -1827,9 +1834,9 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     } else {
         wrap_text(&sanitize(&s.prompt), prompt_inner_w)
     };
-    // Grow up to 4 content rows, then scroll — the tail (cursor end)
+    // Grow up to 8 content rows, then scroll — the tail (cursor end)
     // stays visible.
-    const MAX_PROMPT_ROWS: usize = 4;
+    const MAX_PROMPT_ROWS: usize = 8;
     let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
     let prompt_h = shown_rows + 2; // + border rows
     let mut prompt_window: Vec<String> =
@@ -1959,15 +1966,6 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             format!(" {s_status}{model_info}{mode_info}{scroll_info}{char_info}")
         }
     };
-    children.push(
-        element! {
-            View(height: 1u16, overflow: Overflow::Hidden) {
-                Text(content: status_text)
-            }
-        }
-        .into(),
-    );
-
     // Chat lines (highlight selection with a subtle background)
     for (i, l) in visible.iter().enumerate() {
         let in_sel = selection
@@ -2043,7 +2041,8 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         let chars: Vec<char> = l.chars().collect();
                         let col = cc.min(chars.len());
                         let before: String = chars[..col].iter().collect();
-                        let after: String = chars[col..].iter().collect();
+                        let after_start = (col + 1).min(chars.len());
+                        let after: String = chars[after_start..].iter().collect();
                         let cursor_ch = if col < chars.len() {
                             chars[col].to_string()
                         } else {
@@ -2066,6 +2065,16 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                     }
                 }.into()).collect::<Vec<AnyElement<'static>>>().into_iter())
+            }
+        }
+        .into(),
+    );
+
+    // Status line at bottom (under prompt)
+    children.push(
+        element! {
+            View(height: 1u16, overflow: Overflow::Hidden) {
+                Text(content: status_text)
             }
         }
         .into(),
