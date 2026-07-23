@@ -1,13 +1,14 @@
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Clone)]
-pub struct LiteLLM {
+pub struct LlamaSwapClient {
     client: HttpClient,
-    base_url: String,
-    api_key: String,
+    model_endpoints: HashMap<String, String>,
+    api_keys: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -231,37 +232,50 @@ pub enum StreamEvent {
     Error(String),
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ModelListResponse {
-    pub data: Vec<ModelListItem>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ModelListItem {
-    pub id: String,
-}
-
-impl LiteLLM {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+impl LlamaSwapClient {
+    pub fn new(
+        model_endpoints: HashMap<String, String>,
+        api_keys: HashMap<String, Option<String>>,
+    ) -> Self {
         let client = HttpClient::builder()
             .timeout(Duration::from_secs(1800))
             .build()
             .expect("http client");
         Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            model_endpoints,
+            api_keys,
         }
     }
 
-    fn headers(&self) -> reqwest::header::HeaderMap {
+    fn endpoint(&self, model: &str) -> Result<&str, String> {
+        self.model_endpoints
+            .get(model)
+            .map(|s| s.as_str())
+            .or_else(|| {
+                self.model_endpoints.iter().find_map(|(k, v)| {
+                    if model.starts_with(k.as_str()) {
+                        Some(v.as_str())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| format!("no endpoint configured for model: {model}"))
+    }
+
+    fn headers(&self, model: &str) -> reqwest::header::HeaderMap {
         use reqwest::header;
         let mut h = header::HeaderMap::new();
         h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        h.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {}", self.api_key).parse().unwrap(),
-        );
+        if let Ok(url) = self.endpoint(model) {
+            if let Some(Some(key)) = self.api_keys.get(url) {
+                h.insert(
+                    header::AUTHORIZATION,
+                    format!("Bearer {key}").parse().unwrap(),
+                );
+            }
+        }
         h
     }
 
@@ -269,8 +283,8 @@ impl LiteLLM {
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, String> {
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .headers(self.headers())
+            .post(format!("{}/chat/completions", self.endpoint(&req.model)?))
+            .headers(self.headers(&req.model))
             .json(&req)
             .send()
             .await
@@ -316,8 +330,8 @@ impl LiteLLM {
 
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .headers(self.headers())
+            .post(format!("{}/chat/completions", self.endpoint(&req.model)?))
+            .headers(self.headers(&req.model))
             .json(&req)
             .send()
             .await
@@ -495,64 +509,7 @@ impl LiteLLM {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>, String> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/models", self.base_url))
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("models request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("models error: {}", resp.status()));
-        }
-        let data: ModelListResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("models parse: {e}"))?;
-        Ok(data.data.into_iter().map(|m| m.id).collect())
-    }
-
-    /// List MCP tools exposed by the proxy (OpenAI tool schema format).
-    pub async fn list_mcp_tools(&self) -> Result<Vec<ToolDefinition>, String> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/mcp/tools", self.base_url))
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("mcp tools request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("mcp tools error: {}", resp.status()));
-        }
-
-        let body: Value = resp.json().await.map_err(|e| format!("mcp parse: {e}"))?;
-        let mut out = Vec::new();
-        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-            for t in tools {
-                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-                let desc = t
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or_default();
-                let params = t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
-                if !name.is_empty() {
-                    out.push(ToolDefinition {
-                        type_field: "function".into(),
-                        function: ToolFunctionDef {
-                            name: name.to_string(),
-                            description: desc.chars().take(1024).collect(),
-                            parameters: params,
-                        },
-                    });
-                }
-            }
-        }
-        Ok(out)
+        Ok(self.model_endpoints.keys().cloned().collect())
     }
 
     /// Quick complexity classification. Sends a tiny prompt (~200 tokens in,

@@ -15,7 +15,8 @@ let
 
   configFile = toml.generate "temple-config.toml" ({
     listen = cfg.listen;
-    litellm_url = cfg.litellmUrl;
+    model_endpoints = cfg.modelEndpoints;
+    model_api_keys = cfg.modelApiKeys;
     db_path = "${cfg.dataDir}/memory.db";
     allowed_dirs = cfg.allowedDirs;
     signal = {
@@ -59,10 +60,21 @@ in
       description = "WebSocket listen address (host:port).";
     };
 
-    litellmUrl = mkOption {
-      type = types.str;
-      default = "https://llm.ethanwtodd.com";
-      description = "LiteLLM proxy URL used for model access and MCP tools.";
+    modelEndpoints = mkOption {
+      type = types.attrsOf types.str;
+      default = {
+        "deepseek-v4-flash-high" = "http://son-of-anton:8000/v1";
+        "qwen3.6-27b-coding" = "http://anton:8000/v1";
+        "gemma-4-31b" = "http://anton:8000/v1";
+        "gemma-4-12b-router" = "http://son-of-anton:8000/v1";
+      };
+      description = "Per-model llama-swap endpoint URLs (model name → base URL).";
+    };
+
+    modelApiKeys = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      description = "Optional per-endpoint API keys.";
     };
 
     defaultModel = mkOption {

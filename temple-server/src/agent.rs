@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::ModelConfig;
-use crate::litellm::{ChatMessage, ChatRequest, LiteLLM, StreamEvent, ToolDefinition};
+use crate::litellm::{ChatMessage, ChatRequest, LlamaSwapClient, StreamEvent, ToolDefinition};
 use crate::mcp::McpClient;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
@@ -162,7 +162,7 @@ struct SessionCtx {
 }
 
 pub struct Agent {
-    pub litellm: LiteLLM,
+    pub litellm: LlamaSwapClient,
     pub mcp: McpClient,
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
@@ -191,7 +191,12 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(litellm: LiteLLM, mcp: McpClient, memory: Arc<Memory>, models: ModelConfig) -> Self {
+    pub fn new(
+        litellm: LlamaSwapClient,
+        mcp: McpClient,
+        memory: Arc<Memory>,
+        models: ModelConfig,
+    ) -> Self {
         Self {
             litellm,
             mcp,
@@ -344,18 +349,11 @@ impl Agent {
         out
     }
 
-    /// Load tool definitions: local tools + MCP tools from litellm.
+    /// Load tool definitions: local tools only (MCP tools replaced by
+    /// direct service calls in a future PR).
     pub async fn refresh_tools(&self) {
-        let mut tools = local_tools();
-        match self.litellm.list_mcp_tools().await {
-            Ok(mcp_tools) => {
-                tracing::info!("Loaded {} MCP tools from litellm", mcp_tools.len());
-                tools.extend(mcp_tools);
-            }
-            Err(e) => {
-                tracing::warn!("MCP tools unavailable: {e} (local tools only)");
-            }
-        }
+        let tools = local_tools();
+        tracing::info!("Loaded {} local tools", tools.len());
         *self.tools.lock().await = tools;
     }
 
@@ -2051,7 +2049,7 @@ Git conventions:
         cancel_token: &CancellationToken,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String, String> {
-        let args = LiteLLM::recover_tool_call(args_json)
+        let args = LlamaSwapClient::recover_tool_call(args_json)
             .ok_or_else(|| format!("cannot parse arguments for {name}"))?;
 
         // Reject paths and commands that leak the server's base directory.
@@ -2740,7 +2738,7 @@ async fn detect_project_context(cwd: &str) -> String {
 }
 
 fn summarize_args(args_json: &str) -> String {
-    let v = LiteLLM::recover_tool_call(args_json);
+    let v = LlamaSwapClient::recover_tool_call(args_json);
     match v {
         Some(val) => {
             let s = serde_json::to_string(&val).unwrap_or_default();
