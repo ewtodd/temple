@@ -292,10 +292,9 @@ impl App {
                             ServerMessage::ModelList { models } => {
                                 s.available_models =
                                     models.iter().map(|m| m.id.clone()).collect();
-                                s.entries.push(ChatEntry::System(format!(
-                                    "models ({}): use / + Tab to cycle commands and models",
-                                    models.len()
-                                )));
+                                s.entries.push(ChatEntry::System(
+                                    "use / + Tab to cycle commands and models".into(),
+                                ));
                             }
                             ServerMessage::ModelChanged { model, .. } => {
                                 s.model = model.clone();

@@ -394,37 +394,30 @@ fn handle_key_event(
             s.prompt_cursor = 0;
         }
         KeyCode::Tab => {
-            // Tab on /model or /model <prefix> cycles through models
-            if s.prompt == "/model" || s.prompt.starts_with("/model ") {
+            // Tab on /model<space><prefix> cycles through models
+            // Tab on /model (no space) cycles through commands like any other /
+            if s.prompt.starts_with("/model ") {
                 let models = s.available_models.clone();
                 if models.is_empty() {
                     return true;
                 }
-                if s.prompt == "/model" {
-                    s.prompt = format!("/model {}", models[0]);
-                    s.prompt_cursor = s.prompt.chars().count();
-                    return true;
-                }
                 if let Some(prefix) = s.prompt.strip_prefix("/model ") {
                     let lower = prefix.to_lowercase();
-                    // If the current text matches a known model exactly, cycle
-                    // through the FULL list from that position.
+                    // Exact match: cycle full list from that position
                     if let Some(pos) = models.iter().position(|m| m.as_str() == prefix) {
                         let next = (pos + 1) % models.len();
                         s.prompt = format!("/model {}", models[next]);
                         s.prompt_cursor = s.prompt.chars().count();
+                    } else if lower.is_empty() {
+                        // /model<space> (empty): pick first model
+                        s.prompt = format!("/model {}", models[0]);
+                        s.prompt_cursor = s.prompt.chars().count();
                     } else {
-                        // Partial prefix (e.g. "de") — filter and pick first
-                        let subset: Vec<&String> = if lower.is_empty() {
-                            models.iter().collect()
-                        } else {
-                            models
-                                .iter()
-                                .filter(|m| m.to_lowercase().starts_with(&lower))
-                                .collect()
-                        };
-                        if !subset.is_empty() {
-                            s.prompt = format!("/model {}", subset[0]);
+                        // Partial prefix: filter and show first match
+                        if let Some(m) =
+                            models.iter().find(|m| m.to_lowercase().starts_with(&lower))
+                        {
+                            s.prompt = format!("/model {}", m);
                             s.prompt_cursor = s.prompt.chars().count();
                         }
                     }
@@ -438,7 +431,6 @@ fn handle_key_event(
                     "/delete ",
                     "/help",
                     "/mode ",
-                    "/model ",
                     "/new ",
                     "/q",
                     "/quit",
@@ -475,15 +467,15 @@ fn handle_slash_command(
     if content == "/help" || content == "/?" {
         let help_text = "\
 Commands:                     Keys:
-  /help            this help     Ctrl+G   edit in $EDITOR
-  /clear           clear chat    Ctrl+L   clear (same)
-  /sessions        list          Ctrl+C   cancel agent
-  /session <n>     resume        Ctrl+U   clear prompt
-  /delete <n>      permanently   Ctrl+J/K scroll by 10
+  /clear           clear chat    Ctrl+G   edit in $EDITOR
+  /delete <n>      permanently   Ctrl+L   clear (same)
+  /help            this help     Ctrl+C   cancel agent
+  /mode <m>        permission    Ctrl+U   clear prompt
+  /model <id>      switch model  Ctrl+J/K scroll by 10
   /new [target]    start new     PgUp/Dn  scroll by 10
-  /mode <m>        permission    Shift+Tab cycle mode
-  /model <id>      switch model  Esc      clear prompt
-  /model auto      use router    Tab      complete model";
+  /q, /quit        exit          Shift+Tab cycle mode
+  /session <n>     resume        Esc      clear prompt
+  /sessions        list          Tab      cycle commands";
         s.entries
             .push(crate::state::ChatEntry::System(help_text.into()));
         return true;
