@@ -233,8 +233,10 @@ pub fn cursor_position(s: &AppState, prompt_area: Rect, width: usize) -> Option<
     Some((inner_x + col_offset, inner_y + adj_line as u16))
 }
 
-/// Draw the entire UI.
-pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> Rect {
+/// Draw the entire UI. Returns (prompt_area, visible_chat_text) where
+/// visible_chat_text is plain-text lines matching the rendered output
+/// 1:1, used for mouse hit-testing and selection.
+pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>) {
     let area = f.area();
     let w = area.width as usize;
     let h = area.height as usize;
@@ -267,6 +269,18 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> Rect {
         .into_iter()
         .skip(start)
         .take(chat_avail.max(1))
+        .collect();
+
+    // Extract plain text for mouse selection BEFORE consuming with styles
+    let visible_text: Vec<String> = visible_chat
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<&str>>()
+                .concat()
+        })
         .collect();
 
     // Apply selection highlighting
@@ -338,7 +352,7 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> Rect {
     // Status
     draw_status(f, s, status_area, tick_count);
 
-    prompt_area
+    (prompt_area, visible_text)
 }
 
 fn prompt_box_height(s: &AppState, width: usize) -> usize {

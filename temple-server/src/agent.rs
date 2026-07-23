@@ -920,6 +920,7 @@ impl Agent {
         // Lock the model for the session if this was a substantive routed
         // message — avoids shuffling models mid-conversation.  Simple
         // greetings and commands don't lock.
+        let was_locked = last_routed_model.is_some();
         if complexity.is_some_and(|c| c != ComplexityClass::Simple) && !is_command {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.get_mut(&session_id) {
@@ -942,13 +943,18 @@ impl Agent {
             };
             let (busy, waiting) = self.queue.lane_status(&lane);
             let ahead = waiting + busy as usize;
-            let detail = if ahead == 0 {
-                format!("working on your message — using {model_desc}, you're next up")
-            } else {
+            let is_locked_now = !was_locked
+                && complexity.is_some_and(|c| c != ComplexityClass::Simple)
+                && !is_command;
+            let detail = if is_locked_now {
                 format!(
-                    "working on your message — using {model_desc} · you're #{} in line (~{ahead} ahead)",
-                    ahead + 1
+                    "routing: selected {model_desc} for this session\n\
+                     use /model <name> to override or /model auto to re-route"
                 )
+            } else if ahead == 0 {
+                "message received — you're next up".to_string()
+            } else {
+                format!("message received — {} user(s) ahead in queue", ahead)
             };
             emit(AgentEvent::ToolEvent {
                 name: "routing".into(),

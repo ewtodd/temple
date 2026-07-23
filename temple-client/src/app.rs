@@ -664,9 +664,11 @@ impl App {
             self.tick_count = self.tick_count.wrapping_add(1);
 
             // Render
+            let mut visible_text = Vec::new();
             let _ = terminal.draw(|f| {
                 let s = self.state.lock().unwrap();
-                let prompt_area = ui::draw(f, &s, self.tick_count);
+                let (prompt_area, text) = ui::draw(f, &s, self.tick_count);
+                visible_text = text;
 
                 // Position cursor at prompt input position
                 if let Some((cx, cy)) =
@@ -678,49 +680,8 @@ impl App {
 
             // Store visible lines for mouse hit-testing
             {
-                let s = self.state.lock().unwrap();
-                let w = terminal.size()?.width as usize;
-                let mut last_lines = Vec::new();
-                for entry in &s.entries {
-                    match entry {
-                        crate::state::ChatEntry::User(text) => {
-                            for l in crate::render::render_markdown_lite(text, w.saturating_sub(4))
-                            {
-                                last_lines.push(l.text);
-                            }
-                        }
-                        crate::state::ChatEntry::Assistant { content, .. } => {
-                            for l in
-                                crate::render::render_markdown_lite(content, w.saturating_sub(4))
-                            {
-                                last_lines.push(l.text);
-                            }
-                        }
-                        crate::state::ChatEntry::System(text)
-                        | crate::state::ChatEntry::Error(text) => {
-                            for l in crate::render::wrap_text(text, w.saturating_sub(6)) {
-                                last_lines.push(l);
-                            }
-                        }
-                        crate::state::ChatEntry::Tool { detail, .. } => {
-                            for l in crate::render::wrap_text(detail, w.saturating_sub(8)) {
-                                last_lines.push(l);
-                            }
-                        }
-                        crate::state::ChatEntry::Todo { items } => {
-                            for item in items {
-                                for l in
-                                    crate::render::wrap_text(&item.content, w.saturating_sub(8))
-                                {
-                                    last_lines.push(l);
-                                }
-                            }
-                        }
-                    }
-                }
-                drop(s);
                 let mut s = self.state.lock().unwrap();
-                s.last_lines = last_lines;
+                s.last_lines = visible_text;
             }
         }
 
