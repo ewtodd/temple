@@ -673,7 +673,9 @@ impl Agent {
                         // Group messages are stored as "sender: text" —
                         // don't let the sender prefix leak into titles.
                         if s.username == "group" {
-                            content.split_once(": ").map(|x| x.1)
+                            content
+                                .split_once(": ")
+                                .map(|x| x.1)
                                 .unwrap_or(&content)
                                 .to_string()
                         } else {
@@ -1260,7 +1262,11 @@ impl Agent {
             for m in history.iter().rev().take(20).rev() {
                 if let Some(text) = m.content_text() {
                     if !text.trim().is_empty() {
-                        transcript.push_str(&format!("{}: {}\n", m.role, text.chars().take(300).collect::<String>()));
+                        transcript.push_str(&format!(
+                            "{}: {}\n",
+                            m.role,
+                            text.chars().take(300).collect::<String>()
+                        ));
                     }
                 }
             }
@@ -1290,7 +1296,11 @@ impl Agent {
                                 let line = line.trim();
                                 if let Some((k, v)) = line.split_once(':') {
                                     let (k, v) = (k.trim(), v.trim());
-                                    if !k.is_empty() && k.len() <= 48 && !v.is_empty() && v.len() <= 500 {
+                                    if !k.is_empty()
+                                        && k.len() <= 48
+                                        && !v.is_empty()
+                                        && v.len() <= 500
+                                    {
                                         let _ = self.memory.set_memory(k, v, &username).await;
                                     }
                                 }
@@ -2043,7 +2053,8 @@ Working directory: {cwd}
 
 When working with files, use paths relative to the working directory.
 Do not prepend /var/lib/temple or any other base path — that is an
-implementation detail of the server, not the user's filesystem.{user_section}{skills_section}
+implementation detail of the server, not the user's filesystem.{user_section}
+{skills_section}
 
 ## Available tools
 You have filesystem access, shell commands, persistent memory, web
@@ -2113,6 +2124,19 @@ Git conventions:
             let sessions = self.sessions.lock().await;
             sessions.get(&session_id).map(|s| s.cwd.clone())
         };
+
+        // Reject absolute paths that leak the server's base directory.
+        // The model sometimes confuses /var/lib/temple (its ssh key path
+        // from the system prompt) with a workspace root. Catch it here
+        // and remind it of the relevant instruction.
+        if let Some(path) = args["path"].as_str() {
+            if path.starts_with("/var/lib/temple") {
+                return Err(format!(
+                    "REJECTED: path must be relative to the working directory: {}",
+                    session_cwd.as_deref().unwrap_or(".")
+                ));
+            }
+        }
         let in_cwd = |path: &str| -> String {
             match &session_cwd {
                 Some(cwd)

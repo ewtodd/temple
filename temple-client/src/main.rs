@@ -289,7 +289,7 @@ fn spawn_ws(
                             // compromised server authorize writes anywhere.
                             s.mode = info.permissions;
                             s.entries.push(ChatEntry::System(format!(
-                                "session on {}", info.hostname
+                                "session on {} · cwd: {}", info.hostname, info.cwd
                             )));
                             s.status = format!("renco · {}", info.hostname);
                             // Auto-resume the most recent session if --continue
