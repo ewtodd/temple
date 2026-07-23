@@ -258,10 +258,15 @@ fn handle_key_event(
             s.sel_anchor = None;
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            s.scroll = s.scroll.saturating_add(10);
+            // Bash convention: Ctrl+U clears the prompt
+            s.prompt.clear();
+            s.prompt_cursor = 0;
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             s.scroll = s.scroll.saturating_sub(10);
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            s.scroll = s.scroll.saturating_add(10);
         }
         KeyCode::BackTab => {
             let next = next_mode(s.mode);
@@ -443,12 +448,12 @@ Commands:                     Keys:
   /help            this help     Ctrl+G   edit in $EDITOR
   /clear           clear chat    Ctrl+L   clear (same)
   /sessions        list          Ctrl+C   cancel agent
-  /session <n>     resume        PgUp/Dn  scroll by 10
-  /delete <n>      permanently   Up/Down  input history
-  /new [target]    start new     Shift+Tab cycle mode
-  /mode <m>        permission    Esc      clear prompt
-  /model <id>      switch model
-  /model auto      use router";
+  /session <n>     resume        Ctrl+U   clear prompt
+  /delete <n>      permanently   Ctrl+J/K scroll by 10
+  /new [target]    start new     PgUp/Dn  scroll by 10
+  /mode <m>        permission    Shift+Tab cycle mode
+  /model <id>      switch model  Esc      clear prompt
+  /model auto      use router    Tab      complete model";
         s.entries
             .push(crate::state::ChatEntry::System(help_text.into()));
         return true;
