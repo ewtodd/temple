@@ -391,28 +391,27 @@ fn handle_key_event(
             if models.is_empty() {
                 return true;
             }
-            // Tab-complete: /model (no space yet) → /model <first>
             if s.prompt == "/model" {
                 s.prompt = format!("/model {}", models[0]);
                 s.prompt_cursor = s.prompt.chars().count();
                 return true;
             }
-            // Tab-complete: /model <partial> → cycle through matches
             if let Some(prefix) = s.prompt.strip_prefix("/model ") {
+                let lower = prefix.to_lowercase();
                 let matches: Vec<&String> = models
                     .iter()
-                    .filter(|m| m.to_lowercase().starts_with(&prefix.to_lowercase()))
+                    .filter(|m| m.to_lowercase().starts_with(&lower))
                     .collect();
                 if matches.is_empty() {
-                    s.prompt = format!("/model {}", models[0]);
-                } else {
-                    let cur = matches
-                        .iter()
-                        .position(|m| m.as_str() == prefix)
-                        .map(|i| (i + 1) % matches.len())
-                        .unwrap_or(0);
-                    s.prompt = format!("/model {}", matches[cur]);
+                    return true;
                 }
+                // Cycle: if current prompt equals a match, advance. Else take first.
+                let next = matches
+                    .iter()
+                    .position(|m| m.to_lowercase() == lower)
+                    .map(|i| (i + 1) % matches.len())
+                    .unwrap_or(0);
+                s.prompt = format!("/model {}", matches[next]);
                 s.prompt_cursor = s.prompt.chars().count();
             }
         }
