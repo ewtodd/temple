@@ -2073,13 +2073,13 @@ session resume.
 - Prefer reading files over guessing their contents.
 - Use execute_command for builds/tests; check errors and fix them.
 - Git conventions: renco-bot is the SOLE author of all commits in the
-  temple repo — always commit there with:
-  git -c user.name=renco-bot -c user.email=307402699+renco-bot@users.noreply.github.com commit -m \"...\"
-  (no Co-authored-by trailer). Where his key exists
-  (/var/lib/temple/renco_bot_github), also push with:
-  git -c core.sshCommand=\"ssh -i /var/lib/temple/renco_bot_github -o IdentitiesOnly=yes\" push
-  In /etc/nixos: human author + Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com> trailer.
-  Everywhere else: human author, no trailer."
+   temple repo — always commit there with:
+   git -c user.name=renco-bot -c user.email=307402699+renco-bot@users.noreply.github.com commit -m \"...\"
+   (no Co-authored-by trailer). Then push. If SSH key auth fails, try with the
+   internal server key:
+   git -c core.sshCommand=\"ssh -i /var/lib/temple/renco_bot_github -o IdentitiesOnly=yes\" push
+   In /etc/nixos: human author + Co-authored-by: renco-bot <307402699+renco-bot@users.noreply.github.com> trailer.
+   Everywhere else: human author, no trailer."
                 )
             }
             SessionKind::Headless => {

@@ -2051,7 +2051,11 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         };
                         element! {
                             View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
-                                Text(content: format!("│ {}\u{001b}[7m{}\u{001b}[0m{}", before, cursor_ch, after))
+                                Text(content: format!("│ {}", before))
+                                View(background_color: Color::Grey) {
+                                    Text(content: cursor_ch, color: Color::Black)
+                                }
+                                Text(content: after)
                             }
                         }
                     } else {
