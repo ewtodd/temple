@@ -407,21 +407,27 @@ fn handle_key_event(
                 }
                 if let Some(prefix) = s.prompt.strip_prefix("/model ") {
                     let lower = prefix.to_lowercase();
-                    let subset: Vec<&String> = if lower.is_empty() {
-                        models.iter().collect()
+                    // If the current text matches a known model exactly, cycle
+                    // through the FULL list from that position.
+                    if let Some(pos) = models.iter().position(|m| m.as_str() == prefix) {
+                        let next = (pos + 1) % models.len();
+                        s.prompt = format!("/model {}", models[next]);
+                        s.prompt_cursor = s.prompt.chars().count();
                     } else {
-                        models
-                            .iter()
-                            .filter(|m| m.to_lowercase().starts_with(&lower))
-                            .collect()
-                    };
-                    if subset.is_empty() {
-                        return true;
+                        // Partial prefix (e.g. "de") — filter and pick first
+                        let subset: Vec<&String> = if lower.is_empty() {
+                            models.iter().collect()
+                        } else {
+                            models
+                                .iter()
+                                .filter(|m| m.to_lowercase().starts_with(&lower))
+                                .collect()
+                        };
+                        if !subset.is_empty() {
+                            s.prompt = format!("/model {}", subset[0]);
+                            s.prompt_cursor = s.prompt.chars().count();
+                        }
                     }
-                    let current = subset.iter().position(|m| m.as_str() == prefix);
-                    let next = current.map(|i| (i + 1) % subset.len()).unwrap_or(0);
-                    s.prompt = format!("/model {}", subset[next]);
-                    s.prompt_cursor = s.prompt.chars().count();
                 }
                 return true;
             }

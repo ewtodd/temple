@@ -293,7 +293,7 @@ impl App {
                                 s.available_models =
                                     models.iter().map(|m| m.id.clone()).collect();
                                 s.entries.push(ChatEntry::System(format!(
-                                    "models ({}): type /model <name> or use Tab to complete",
+                                    "models ({}): use / + Tab to cycle commands and models",
                                     models.len()
                                 )));
                             }
