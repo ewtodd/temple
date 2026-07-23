@@ -2131,18 +2131,20 @@ Git conventions:
         // and remind it of the relevant instruction.
         if let Some(path) = args["path"].as_str() {
             if path.contains("/var/lib/temple") {
-                return Err(format!(
-                    "REJECTED: path must be relative to the working directory: {}",
-                    session_cwd.as_deref().unwrap_or(".")
-                ));
+                return Err(
+                    "REJECTED: path must be relative to the working directory. \
+                     Do not prepend /var/lib/temple or any base path."
+                        .to_string(),
+                );
             }
         }
         if let Some(cmd) = args["command"].as_str() {
             if cmd.contains("/var/lib/temple") {
-                return Err(format!(
-                    "REJECTED: command must not reference /var/lib/temple. Work in: {}",
-                    session_cwd.as_deref().unwrap_or(".")
-                ));
+                return Err(
+                    "REJECTED: command must not reference /var/lib/temple. \
+                     Use relative paths from the working directory."
+                        .to_string(),
+                );
             }
         }
         let in_cwd = |path: &str| -> String {

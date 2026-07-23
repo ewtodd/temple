@@ -1835,13 +1835,11 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let mut prompt_window: Vec<String> =
         prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
 
-    // Solid cursor at the caret position — iocraft draws no terminal
-    // cursor, so we render one ourselves. Hidden while a permission
-    // prompt owns the box (the y/N answer is single-key, not typed).
-    if s.permission.is_none() {
+    // Cursor at caret position — iocraft draws no terminal cursor.
+    // When on a character, invert it (dark on light); when at end,
+    // show a block cursor. Hidden while a permission prompt owns the box.
+    let cursor_pos: Option<(usize, usize)> = if s.permission.is_none() {
         // Map cursor char index to position in sanitized, wrapped text.
-        // Sanitize strips control chars, so count visible chars up to
-        // prompt_cursor to find the effective index.
         let cursor_vis: usize = s.prompt
             .chars()
             .take(s.prompt_cursor.min(s.prompt.chars().count()))
@@ -1858,7 +1856,6 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 None
             }
         }).unwrap_or_else(|| {
-            // Cursor at the very end
             (prompt_window.len().max(1) - 1,
              prompt_window.last().map(|l| l.chars().count()).unwrap_or(0))
         });
@@ -1871,14 +1868,11 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             cursor_from_end - shown_rows + 1
         };
         prompt_window = prompt_lines[start..start + shown_rows].to_vec();
-        // Place cursor in the correct line.
         let adj_line = cursor_line - start;
-        if let Some(line) = prompt_window.get_mut(adj_line) {
-            let col = cursor_col.min(line.chars().count());
-            let byte_idx = line.char_indices().nth(col).map(|(i, _)| i).unwrap_or(line.len());
-            line.insert_str(byte_idx, "▌");
-        }
-    }
+        Some((adj_line, cursor_col))
+    } else {
+        None
+    };
     // Scroll window
     let status_h = 1usize;
     let view_h = h.saturating_sub(prompt_h + status_h + art_lines);
@@ -2033,6 +2027,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     } else {
         Color::DarkGrey
     };
+    let cursor_pos = cursor_pos;
     children.push(
         element! {
             View(
@@ -2041,9 +2036,30 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 border_style: BorderStyle::Round,
                 border_color: border_color,
             ) {
-                #(prompt_window.iter().enumerate().map(|(i, l)| element! {
-                    View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
-                        Text(content: format!("│ {}", l))
+                #(prompt_window.iter().enumerate().map(|(i, l)| {
+                    if cursor_pos.map(|(cl, _)| cl) == Some(i) {
+                        // Cursor line — render with inverted block cursor
+                        let cc = cursor_pos.unwrap().1;
+                        let chars: Vec<char> = l.chars().collect();
+                        let col = cc.min(chars.len());
+                        let before: String = chars[..col].iter().collect();
+                        let after: String = chars[col..].iter().collect();
+                        let cursor_ch = if col < chars.len() {
+                            chars[col].to_string()
+                        } else {
+                            "█".to_string()
+                        };
+                        element! {
+                            View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
+                                Text(content: format!("│ {}\u{001b}[7m{}\u{001b}[0m{}", before, cursor_ch, after))
+                            }
+                        }
+                    } else {
+                        element! {
+                            View(key: i as u64, height: 1u16, overflow: Overflow::Hidden) {
+                                Text(content: format!("│ {}", l))
+                            }
+                        }
                     }
                 }.into()).collect::<Vec<AnyElement<'static>>>().into_iter())
             }
