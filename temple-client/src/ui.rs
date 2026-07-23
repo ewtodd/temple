@@ -169,13 +169,13 @@ pub fn cursor_position(s: &AppState, prompt_area: Rect, width: usize) -> Option<
     }
     if s.prompt.is_empty() {
         // Cursor at the start of the empty prompt box
-        let inner_x = prompt_area.x + 2; // border + space
+        let inner_x = prompt_area.x + 2; // border + left padding
         let inner_y = prompt_area.y + 1; // top border
         return Some((inner_x, inner_y));
     }
 
     // Build the prompt lines exactly as they would be rendered
-    let prompt_inner_w = width.saturating_sub(4).max(1);
+    let prompt_inner_w = width.saturating_sub(3).max(1);
     let sanitized = crate::render::sanitize(&s.prompt);
     let prompt_lines = crate::render::wrap_text(&sanitized, prompt_inner_w);
 
@@ -215,12 +215,11 @@ pub fn cursor_position(s: &AppState, prompt_area: Rect, width: usize) -> Option<
         .min(prompt_lines.len().saturating_sub(shown_rows));
     let adj_line = cursor_line - window_start;
 
-    // Terminal coords: inner_x = border(1) + "│ " prefix(2) = +3
-    let inner_x = prompt_area.x + 3;
+    // Terminal coords: border(1) + left padding(1) = 2
+    let inner_x = prompt_area.x + 2;
     let inner_y = prompt_area.y + 1;
 
-    // Column: each char after the "│ " prefix. Use Unicode width for
-    // the characters before the cursor.
+    // Column: count Unicode display width of chars before cursor
     let win_line = prompt_lines
         .get(window_start + adj_line)
         .cloned()
@@ -329,10 +328,10 @@ fn prompt_box_height(s: &AppState, width: usize) -> usize {
     }
     if let Some(ref pstate) = s.permission {
         let text = format!("Allow {}? (y/N)", crate::render::sanitize(&pstate.text));
-        let lines = crate::render::wrap_text(&text, width.saturating_sub(4).max(1));
+        let lines = crate::render::wrap_text(&text, width.saturating_sub(3).max(1));
         return lines.len() + 2; // +2 for borders
     }
-    let prompt_inner_w = width.saturating_sub(4).max(1);
+    let prompt_inner_w = width.saturating_sub(3).max(1);
     let prompt_lines =
         crate::render::wrap_text(&crate::render::sanitize(&s.prompt), prompt_inner_w);
     const MAX_PROMPT_ROWS: usize = 8;
@@ -358,19 +357,14 @@ fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
     let inner = Block::default().padding(ratatui::widgets::Padding::new(1, 0, 0, 0));
     let inner_area = inner.inner(area);
 
-    let prompt_inner_w = width.saturating_sub(4).max(1);
+    let prompt_inner_w = width.saturating_sub(3).max(1);
 
     if let Some(ref pstate) = s.permission {
         let text = format!("Allow {}? (y/N)", crate::render::sanitize(&pstate.text));
         let lines = crate::render::wrap_text(&text, prompt_inner_w);
         let display: Vec<Line> = lines
             .into_iter()
-            .map(|l| {
-                Line::from(Span::styled(
-                    format!("\u{2502} {l}"),
-                    Style::default().fg(Color::White),
-                ))
-            })
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::White))))
             .collect();
         f.render_widget(Paragraph::new(display), inner_area);
         return;
@@ -418,10 +412,7 @@ fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
 
     let display: Vec<Line> = window
         .iter()
-        .map(|line| {
-            let prefix = format!("\u{2502} {line}");
-            Line::from(Span::styled(prefix, Style::default().fg(Color::White)))
-        })
+        .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
         .collect();
     f.render_widget(Paragraph::new(display), inner_area);
 }

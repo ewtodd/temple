@@ -243,6 +243,9 @@ fn handle_key_event(
             s.working = false;
             s.work_started = None;
         }
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            s.running = false;
+        }
         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             s.editor_pending = true;
         }
@@ -493,6 +496,10 @@ Commands:                     Keys:
                 })
                 .ok();
         }
+        return true;
+    }
+    if content == "/q" || content == "/quit" || content == ":q" {
+        s.running = false;
         return true;
     }
     if content.starts_with('/') {
