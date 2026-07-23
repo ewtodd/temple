@@ -290,6 +290,7 @@ impl App {
                                 });
                             }
                             ServerMessage::ModelList { models } => {
+                                s.available_models = models.iter().map(|m| m.id.clone()).collect();
                                 s.entries.push(ChatEntry::System(format!(
                                     "models ({}):",
                                     models.len()
@@ -553,6 +554,9 @@ impl App {
                         }
                     }
                 });
+
+                // Request model list for tab-completion on connect.
+                let _ = tx_session.send(ClientMessage::ListModels);
 
                 // Request session list on connect for --continue: resume the
                 // most recent session in the same directory, not across cwds.

@@ -386,6 +386,32 @@ fn handle_key_event(
             s.prompt.clear();
             s.prompt_cursor = 0;
         }
+        KeyCode::Tab => {
+            if let Some(_rest) = s.prompt.strip_prefix("/model ") {
+                let models = s.available_models.clone();
+                if models.is_empty() {
+                    return true;
+                }
+                let prefix = &s.prompt["/model ".len()..];
+                let matches: Vec<&String> = models
+                    .iter()
+                    .filter(|m| m.to_lowercase().starts_with(&prefix.to_lowercase()))
+                    .collect();
+                if matches.is_empty() {
+                    let new_prompt = format!("/model {}", models[0]);
+                    s.prompt = new_prompt;
+                    s.prompt_cursor = s.prompt.chars().count();
+                } else {
+                    let cur = matches
+                        .iter()
+                        .position(|m| m.as_str() == prefix)
+                        .map(|i| (i + 1) % matches.len())
+                        .unwrap_or(0);
+                    s.prompt = format!("/model {}", matches[cur]);
+                    s.prompt_cursor = s.prompt.chars().count();
+                }
+            }
+        }
         _ => {}
     }
     true
@@ -413,9 +439,10 @@ Commands:                     Keys:
   /clear           clear chat    Ctrl+L   clear (same)
   /sessions        list          Ctrl+C   cancel agent
   /session <n>     resume        PgUp/Dn  scroll by 10
-  /new [target]    start new     Up/Down  input history
-  /mode <m>        permission    Shift+Tab cycle mode
-  /model <id>      switch model  Esc      clear prompt
+  /delete <n>      permanently   Up/Down  input history
+  /new [target]    start new     Shift+Tab cycle mode
+  /mode <m>        permission    Esc      clear prompt
+  /model <id>      switch model
   /model auto      use router";
         s.entries
             .push(crate::state::ChatEntry::System(help_text.into()));
@@ -434,6 +461,25 @@ Commands:                     Keys:
                     .ok();
                 s.entries.push(crate::state::ChatEntry::System(format!(
                     "resuming session {}",
+                    sid.simple().to_string().chars().take(8).collect::<String>()
+                )));
+            } else {
+                s.entries.push(crate::state::ChatEntry::System(format!(
+                    "no session at index {idx}"
+                )));
+            }
+        }
+        return true;
+    }
+    if let Some(n_str) = content.strip_prefix("/delete ") {
+        if let Ok(idx) = n_str.trim().parse::<usize>() {
+            if let Some(meta) = s.last_sessions.get(idx) {
+                let sid = meta.id;
+                cmd_tx
+                    .send(ClientMessage::DeleteSession { session_id: sid })
+                    .ok();
+                s.entries.push(crate::state::ChatEntry::System(format!(
+                    "deleted session {}",
                     sid.simple().to_string().chars().take(8).collect::<String>()
                 )));
             } else {

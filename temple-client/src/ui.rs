@@ -442,9 +442,11 @@ fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
         .map(|s| s.as_str())
         .collect();
 
+    let cmd_mode = s.prompt.starts_with('/');
+    let prompt_color = if cmd_mode { Color::Cyan } else { Color::White };
     let display: Vec<Line> = window
         .iter()
-        .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
+        .map(|line| Line::from(Span::styled(*line, Style::default().fg(prompt_color))))
         .collect();
     f.render_widget(Paragraph::new(display), inner_area);
 }

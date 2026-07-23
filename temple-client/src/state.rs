@@ -108,6 +108,8 @@ pub struct AppState {
     /// Current permission mode (from server), shown in the status bar and
     /// cycled with Shift+Tab.
     pub mode: PermissionMode,
+    /// Available models for tab-completion (populated on connect + /model)
+    pub available_models: Vec<String>,
 }
 
 impl AppState {
@@ -136,6 +138,7 @@ impl AppState {
             work_started: None,
             last_total: 0,
             mode: PermissionMode::Default,
+            available_models: Vec::new(),
         }
     }
 }
