@@ -327,12 +327,7 @@ fn handle_key_event(
             }
 
             // Slash commands
-            let handled = handle_slash_command(&mut s, &content, cmd_tx);
-            if handled {
-                return true;
-            }
-
-            // Normal chat — push to history, clear prompt
+            // Push to input history regardless of type (chat or command)
             if s.input_history.is_empty()
                 || s.input_history
                     .last()
@@ -341,6 +336,13 @@ fn handle_key_event(
             {
                 s.input_history.push(content.clone());
             }
+
+            let handled = handle_slash_command(&mut s, &content, cmd_tx);
+            if handled {
+                return true;
+            }
+
+            // Normal chat
             s.entries
                 .push(crate::state::ChatEntry::User(content.clone()));
             s.working = true;
@@ -392,33 +394,55 @@ fn handle_key_event(
             s.prompt_cursor = 0;
         }
         KeyCode::Tab => {
-            let models = s.available_models.clone();
-            if models.is_empty() {
-                return true;
-            }
-            if s.prompt == "/model" {
-                s.prompt = format!("/model {}", models[0]);
-                s.prompt_cursor = s.prompt.chars().count();
-                return true;
-            }
-            if let Some(prefix) = s.prompt.strip_prefix("/model ") {
-                let lower = prefix.to_lowercase();
-                // Filter to models starting with the typed prefix
-                let subset: Vec<&String> = if lower.is_empty() {
-                    models.iter().collect()
-                } else {
-                    models
-                        .iter()
-                        .filter(|m| m.to_lowercase().starts_with(&lower))
-                        .collect()
-                };
-                if subset.is_empty() {
+            // Tab on /model or /model <prefix> cycles through models
+            if s.prompt == "/model" || s.prompt.starts_with("/model ") {
+                let models = s.available_models.clone();
+                if models.is_empty() {
                     return true;
                 }
-                // Find current model in the subset, advance, wrap
-                let current = subset.iter().position(|m| m.as_str() == prefix);
-                let next = current.map(|i| (i + 1) % subset.len()).unwrap_or(0);
-                s.prompt = format!("/model {}", subset[next]);
+                if s.prompt == "/model" {
+                    s.prompt = format!("/model {}", models[0]);
+                    s.prompt_cursor = s.prompt.chars().count();
+                    return true;
+                }
+                if let Some(prefix) = s.prompt.strip_prefix("/model ") {
+                    let lower = prefix.to_lowercase();
+                    let subset: Vec<&String> = if lower.is_empty() {
+                        models.iter().collect()
+                    } else {
+                        models
+                            .iter()
+                            .filter(|m| m.to_lowercase().starts_with(&lower))
+                            .collect()
+                    };
+                    if subset.is_empty() {
+                        return true;
+                    }
+                    let current = subset.iter().position(|m| m.as_str() == prefix);
+                    let next = current.map(|i| (i + 1) % subset.len()).unwrap_or(0);
+                    s.prompt = format!("/model {}", subset[next]);
+                    s.prompt_cursor = s.prompt.chars().count();
+                }
+                return true;
+            }
+            // Tab on / cycles through available commands alphabetically
+            if s.prompt.starts_with('/') {
+                let commands = [
+                    "/clear",
+                    "/delete ",
+                    "/help",
+                    "/mode ",
+                    "/model ",
+                    "/new ",
+                    "/q",
+                    "/quit",
+                    "/session ",
+                    "/sessions",
+                ];
+                let prefix = s.prompt.as_str();
+                let current = commands.iter().position(|c| c == &prefix);
+                let next = current.map(|i| (i + 1) % commands.len()).unwrap_or(0);
+                s.prompt = commands[next].to_string();
                 s.prompt_cursor = s.prompt.chars().count();
             }
         }
