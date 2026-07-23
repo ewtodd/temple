@@ -269,6 +269,25 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> Rect {
         .take(chat_avail.max(1))
         .collect();
 
+    // Apply selection highlighting
+    let visible_chat: Vec<Line> = if let Some(((sl, _), (el, _))) = s.selection {
+        visible_chat
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let abs_idx = start + i;
+                let (top, bot) = if sl <= el { (sl, el) } else { (el, sl) };
+                if abs_idx >= top && abs_idx <= bot {
+                    line.patch_style(Style::default().bg(Color::DarkGray).fg(Color::Black))
+                } else {
+                    line
+                }
+            })
+            .collect()
+    } else {
+        visible_chat
+    };
+
     // Store visible line plain-text for mouse selection
     // (done externally after draw — we store in a way the caller can access)
     // We return the prompt_area so caller can compute cursor position
@@ -429,13 +448,13 @@ fn draw_status(f: &mut Frame, s: &AppState, area: Rect, tick_count: u64) {
         let model_info = if s.model.is_empty() {
             String::new()
         } else {
-            format!(" \u{b7} {}", s.model)
+            format!(" | {}", s.model)
         };
         let mode = mode_tag(s.mode);
         let mode_str = if s.mode == temple_protocol::PermissionMode::Default {
             String::new()
         } else {
-            format!(" (\u{26BF} {mode})")
+            format!(" ({mode})")
         };
         let spinner = if s.working {
             let idx = tick_count as usize % SPINNER.len();
@@ -450,7 +469,7 @@ fn draw_status(f: &mut Frame, s: &AppState, area: Rect, tick_count: u64) {
             String::new()
         };
         let scroll_indicator = if s.scroll > 0 {
-            format!(" \u{2191}{}", s.scroll)
+            format!(" up:{}", s.scroll)
         } else {
             String::new()
         };

@@ -211,37 +211,33 @@ impl App {
                                 )));
                                 s.status = "ready".into();
                             }
-                            ServerMessage::ChatDelta { delta, done, .. } => {
-                                if let Some(ChatEntry::Assistant {
+                            ServerMessage::ChatDelta {
+                                session_id,
+                                delta,
+                                done,
+                                ..
+                            } => {
+                                // Stale message for a session we switched away
+                                // from — ignore rather than corrupt the view.
+                                if session_id != s.session_id {
+                                    continue;
+                                }
+                                if done {
+                                    // stream finished; stats come separately
+                                } else if let Some(ChatEntry::Assistant {
                                     content: ref mut c,
                                     ..
-                                }) = s
-                                    .entries
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|e| matches!(e, ChatEntry::Assistant { .. }))
+                                }) = s.entries.last_mut()
                                 {
                                     c.push_str(&delta);
-                                } else {
+                                } else if !delta.trim().is_empty() {
+                                    // Don't open an assistant bubble for
+                                    // whitespace-only deltas — tool-call-only
+                                    // rounds emit stray newlines.
                                     s.entries.push(ChatEntry::Assistant {
                                         content: delta,
                                         stats: None,
                                     });
-                                }
-                                if done {
-                                    if let Some(ChatEntry::Assistant {
-                                        stats: ref mut st,
-                                        ..
-                                    }) = s
-                                        .entries
-                                        .iter_mut()
-                                        .rev()
-                                        .find(|e| {
-                                            matches!(e, ChatEntry::Assistant { .. })
-                                        })
-                                    {
-                                        *st = Some("...".into());
-                                    }
                                 }
                             }
                             ServerMessage::ChatError { error, .. } => {

@@ -255,10 +255,10 @@ pub fn next_mode(current: PermissionMode) -> PermissionMode {
 pub fn mode_tag(mode: PermissionMode) -> &'static str {
     use temple_protocol::PermissionMode;
     match mode {
-        PermissionMode::Default => "default",
-        PermissionMode::Ask => "ask",
-        PermissionMode::Lockdown => "locked",
-        PermissionMode::Yolo => "yolo",
+        PermissionMode::Default => "DEFAULT",
+        PermissionMode::Ask => "ASK",
+        PermissionMode::Lockdown => "LOCKED",
+        PermissionMode::Yolo => "YOLO",
     }
 }
 
@@ -396,9 +396,9 @@ mod tests {
     #[test]
     fn test_mode_tag_values() {
         use temple_protocol::PermissionMode;
-        assert_eq!(mode_tag(PermissionMode::Default), "default");
-        assert_eq!(mode_tag(PermissionMode::Ask), "ask");
-        assert_eq!(mode_tag(PermissionMode::Lockdown), "locked");
-        assert_eq!(mode_tag(PermissionMode::Yolo), "yolo");
+        assert_eq!(mode_tag(PermissionMode::Default), "DEFAULT");
+        assert_eq!(mode_tag(PermissionMode::Ask), "ASK");
+        assert_eq!(mode_tag(PermissionMode::Lockdown), "LOCKED");
+        assert_eq!(mode_tag(PermissionMode::Yolo), "YOLO");
     }
 }
