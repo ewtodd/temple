@@ -290,15 +290,12 @@ impl App {
                                 });
                             }
                             ServerMessage::ModelList { models } => {
-                                s.available_models = models.iter().map(|m| m.id.clone()).collect();
+                                s.available_models =
+                                    models.iter().map(|m| m.id.clone()).collect();
                                 s.entries.push(ChatEntry::System(format!(
-                                    "models ({}):",
+                                    "models ({}): type /model <name> or use Tab to complete",
                                     models.len()
                                 )));
-                                for m in &models {
-                                    s.entries
-                                        .push(ChatEntry::System(format!("  {}", m.id)));
-                                }
                             }
                             ServerMessage::ModelChanged { model, .. } => {
                                 s.model = model.clone();

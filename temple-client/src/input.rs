@@ -387,20 +387,24 @@ fn handle_key_event(
             s.prompt_cursor = 0;
         }
         KeyCode::Tab => {
-            if let Some(_rest) = s.prompt.strip_prefix("/model ") {
-                let models = s.available_models.clone();
-                if models.is_empty() {
-                    return true;
-                }
-                let prefix = &s.prompt["/model ".len()..];
+            let models = s.available_models.clone();
+            if models.is_empty() {
+                return true;
+            }
+            // Tab-complete: /model (no space yet) → /model <first>
+            if s.prompt == "/model" {
+                s.prompt = format!("/model {}", models[0]);
+                s.prompt_cursor = s.prompt.chars().count();
+                return true;
+            }
+            // Tab-complete: /model <partial> → cycle through matches
+            if let Some(prefix) = s.prompt.strip_prefix("/model ") {
                 let matches: Vec<&String> = models
                     .iter()
                     .filter(|m| m.to_lowercase().starts_with(&prefix.to_lowercase()))
                     .collect();
                 if matches.is_empty() {
-                    let new_prompt = format!("/model {}", models[0]);
-                    s.prompt = new_prompt;
-                    s.prompt_cursor = s.prompt.chars().count();
+                    s.prompt = format!("/model {}", models[0]);
                 } else {
                     let cur = matches
                         .iter()
@@ -408,8 +412,8 @@ fn handle_key_event(
                         .map(|i| (i + 1) % matches.len())
                         .unwrap_or(0);
                     s.prompt = format!("/model {}", matches[cur]);
-                    s.prompt_cursor = s.prompt.chars().count();
                 }
+                s.prompt_cursor = s.prompt.chars().count();
             }
         }
         _ => {}
