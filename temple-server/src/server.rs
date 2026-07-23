@@ -3,11 +3,9 @@ use std::sync::Arc;
 use temple_protocol::*;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio_tungstenite::accept_hdr_async;
 use uuid::Uuid;
 
 use crate::agent::{Agent, AgentEvent};
-use crate::auth::check_token;
 use crate::config::Config;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
@@ -52,53 +50,11 @@ async fn handle_connection(
     memory: Arc<Memory>,
     config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The person who authenticated (from token file) — sessions are
-    // owned/listed under this name, not the client's system username.
+    // Auth is handled at session-open time via daemon_pubkey verification.
+    // All connections are accepted; unauthenticated clients cannot create
+    // sessions with tools (the OpenSession handler rejects invalid pubkeys).
     let mut auth_owner: Option<String> = None;
-
-    let ws = if let Some(ref token_file) = config.auth_token_file {
-        let token_file = token_file.clone();
-        // Capture the token from the callback via shared state
-        let captured_token = Arc::new(Mutex::new(None::<String>));
-        let ct = captured_token.clone();
-        let tf = token_file.clone();
-        #[allow(clippy::result_large_err)] // tungstenite's callback signature is fixed.
-        let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            if let Some(auth) = req.headers().get("Authorization") {
-                let auth_str = auth.to_str().unwrap_or("");
-                if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                    if check_token(&tf, token).is_ok() {
-                        let ct = ct.clone();
-                        if let Ok(mut guard) = ct.try_lock() {
-                            *guard = Some(token.to_string());
-                        }
-                        return Ok(response);
-                    }
-                }
-            }
-            // Reject with 401
-            let mut resp = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::default();
-            *resp.status_mut() = http_status_unauthorized();
-            Err(resp)
-        };
-        let ws = match accept_hdr_async(stream, callback).await {
-            Ok(ws) => ws,
-            Err(_) => {
-                tracing::warn!("Rejected unauthorized connection");
-                return Ok(());
-            }
-        };
-        // Resolve the person from the captured token
-        if let Some(token) = captured_token.lock().await.as_deref() {
-            if let Ok(user) = check_token(&token_file, token) {
-                auth_owner = Some(user.username);
-            }
-        }
-        ws
-    } else {
-        // No auth configured — accept all (LAN-only mode)
-        tokio_tungstenite::accept_async(stream).await?
-    };
+    let ws = tokio_tungstenite::accept_async(stream).await?;
 
     // Split into independent read/write halves — no shared mutex, no deadlock.
     let (mut ws_write, mut ws_read) = ws.split();
@@ -107,6 +63,7 @@ async fn handle_connection(
     let mut session_id = Uuid::nil();
     let mut permissions: Option<Arc<Mutex<PermissionScope>>> = None;
     let mut client_cwd: Option<String> = None;
+    let mut daemon_username: Option<String> = None;
 
     // Writer task: forwards channel messages to the socket
     let send_task = tokio::spawn(async move {
@@ -167,6 +124,8 @@ async fn handle_connection(
                         });
                         continue;
                     }
+                    daemon_username = Some(open.username.clone());
+                    agent.register_daemon(&open.username).await;
                 }
                 // Auto-create a persisted Coding session (no SSH — tools run
                 // client-side via ToolRequest, so every `temple` invocation
@@ -595,13 +554,11 @@ async fn handle_connection(
     if session_id != Uuid::nil() {
         agent.close_session(session_id).await;
     }
+    if let Some(username) = &daemon_username {
+        agent.unregister_daemon(username).await;
+    }
     send_task.abort();
     Ok(())
-}
-
-/// Build a 401 Unauthorized HTTP status response.
-fn http_status_unauthorized() -> tokio_tungstenite::tungstenite::http::StatusCode {
-    tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
 }
 
 /// Verify that a daemon's public key is authorized for the given user.

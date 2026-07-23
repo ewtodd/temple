@@ -185,6 +185,9 @@ pub struct Agent {
     /// Last time a real request started (keep-warm skips while this is fresh)
     last_request: std::sync::Mutex<Instant>,
     tools: Mutex<Vec<ToolDefinition>>,
+    /// Active daemon connections: username → count (multiple sessions per user).
+    /// Used for Signal sandboxing — users without a daemon get restricted tools.
+    daemon_connections: Mutex<HashMap<String, u32>>,
 }
 
 impl Agent {
@@ -205,7 +208,93 @@ impl Agent {
                 Instant::now() - std::time::Duration::from_secs(3600),
             ),
             tools: Mutex::new(Vec::new()),
+            daemon_connections: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Register a daemon connection for a user. Called when a client
+    /// authenticates via pubkey on OpenSession.
+    pub async fn register_daemon(&self, username: &str) {
+        let mut map = self.daemon_connections.lock().await;
+        *map.entry(username.to_string()).or_insert(0) += 1;
+        tracing::info!("daemon connected: {username} (total: {})", map[username]);
+    }
+
+    /// Unregister a daemon connection. Called when the WS connection closes.
+    pub async fn unregister_daemon(&self, username: &str) {
+        let mut map = self.daemon_connections.lock().await;
+        if let Some(count) = map.get_mut(username) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(username);
+            }
+        }
+        tracing::info!("daemon disconnected: {username}");
+    }
+
+    /// Check if a user has at least one active daemon connection.
+    pub async fn has_daemon(&self, username: &str) -> bool {
+        self.daemon_connections.lock().await.contains_key(username)
+    }
+
+    /// Sandboxed tool set — memories and tasks only, no filesystem or shell.
+    /// For Signal users without a daemon.
+    fn sandboxed_tools() -> Vec<ToolDefinition> {
+        use crate::litellm::ToolFunctionDef;
+        vec![
+            ToolDefinition {
+                type_field: "function".into(),
+                function: ToolFunctionDef {
+                    name: "save_memory".into(),
+                    description: "Save a key-value memory that persists across sessions.".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string"},
+                            "value": {"type": "string"},
+                        },
+                        "required": ["key", "value"],
+                    }),
+                },
+            },
+            ToolDefinition {
+                type_field: "function".into(),
+                function: ToolFunctionDef {
+                    name: "recall_memory".into(),
+                    description: "Recall previously saved memories by key or list all.".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string"},
+                        },
+                    }),
+                },
+            },
+            ToolDefinition {
+                type_field: "function".into(),
+                function: ToolFunctionDef {
+                    name: "todo".into(),
+                    description: "Maintain a task list for this session.".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "required": ["items"],
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["content", "status"],
+                                    "properties": {
+                                        "content": {"type": "string"},
+                                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                                    },
+                                },
+                            },
+                        },
+                    }),
+                },
+            },
+        ]
     }
 
     /// Create a oneshot for a pending tool execution. The server sends a
@@ -1437,7 +1526,21 @@ impl Agent {
                 }
             }
 
-            let tools = self.tools.lock().await.clone();
+            let sandboxed = {
+                let owner = {
+                    let sessions = self.sessions.lock().await;
+                    sessions.get(&session_id).map(|s| s.owner.clone())
+                };
+                match owner {
+                    Some(o) => !self.has_daemon(&o).await,
+                    None => false,
+                }
+            };
+            let tools = if sandboxed {
+                Self::sandboxed_tools()
+            } else {
+                self.tools.lock().await.clone()
+            };
             let req = ChatRequest {
                 model: model.to_string(),
                 messages,

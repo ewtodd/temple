@@ -18,8 +18,6 @@ let
     litellm_url = cfg.litellmUrl;
     db_path = "${cfg.dataDir}/memory.db";
     allowed_dirs = cfg.allowedDirs;
-    default_permission = cfg.defaultPermission;
-    auth_token_file = "${cfg.dataDir}/tokens";
     signal = {
       enabled = cfg.signal.enable;
       socket_addr = cfg.signal.socketAddr;
