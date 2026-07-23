@@ -92,9 +92,7 @@ impl Memory {
             stmt.as_mut().is_some_and(|s| {
                 s.query_map([], |row| row.get::<_, String>(1))
                     .ok()
-                    .is_some_and(|rows| {
-                        rows.filter_map(|r| r.ok()).any(|name| name == col)
-                    })
+                    .is_some_and(|rows| rows.filter_map(|r| r.ok()).any(|name| name == col))
             })
         };
 

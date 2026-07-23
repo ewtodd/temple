@@ -52,7 +52,7 @@ impl CronScheduler {
         memory: Arc<Memory>,
         signal: Arc<Signal>,
         #[allow(dead_code)] // Reserved for upcoming calendar-aware cron jobs.
-    nextcloud: Arc<Mutex<Nextcloud>>,
+        nextcloud: Arc<Mutex<Nextcloud>>,
     ) -> Self {
         Self {
             agent,

@@ -27,8 +27,7 @@ pub struct SessionInfo {
 
 // ── Permissions ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PermissionMode {
     /// Unrestricted access to CWD
     #[default]
@@ -40,7 +39,6 @@ pub enum PermissionMode {
     /// Full system access, no prompts
     Yolo,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRequest {

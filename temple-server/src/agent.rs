@@ -974,10 +974,12 @@ impl Agent {
         // Classification costs ~500ms for a ~10-token response — acceptable
         // for the correctness gain.
         let is_command = content.starts_with('/') || content.starts_with(':');
-        let complexity = if is_command || session_kind == SessionKind::Headless || model_override {
-            None // commands + headless skip routing; /model override uses session model directly
-        } else if last_routed_model.is_some() {
-            None // session model already locked — reuse without re-classifying
+        let complexity = if is_command
+            || session_kind == SessionKind::Headless
+            || model_override
+            || last_routed_model.is_some()
+        {
+            None // commands, headless, /model override, or locked session model skip routing
         } else {
             let heuristic = Router::classify(content);
             if heuristic == ComplexityClass::Medium {
@@ -2163,11 +2165,9 @@ Git conventions:
         // here and remind it of the relevant instruction.
         if let Some(path) = args["path"].as_str() {
             if path.contains("/var/lib/temple") {
-                return Err(
-                    "REJECTED: path must be relative to the working directory. \
+                return Err("REJECTED: path must be relative to the working directory. \
                      Do not prepend the server's base path."
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
         if let Some(cmd) = args["command"].as_str() {

@@ -303,10 +303,7 @@ impl Signal {
     /// Handler args: (sender, message, timestamp, group_id).
     ///
     /// Returns when the connection is permanently lost (after retry backoff).
-    pub async fn receive_loop(
-        &self,
-        handler: SignalHandler,
-    ) {
+    pub async fn receive_loop(&self, handler: SignalHandler) {
         if !self.config.enabled {
             return;
         }
@@ -326,10 +323,7 @@ impl Signal {
     }
 
     /// One receive cycle: connect, read notifications until disconnect.
-    async fn receive_once(
-        &self,
-        handler: SignalHandler,
-    ) -> Result<(), String> {
+    async fn receive_once(&self, handler: SignalHandler) -> Result<(), String> {
         let stream = TcpStream::connect(&self.config.socket_addr)
             .await
             .map_err(|e| format!("signal connect: {e}"))?;

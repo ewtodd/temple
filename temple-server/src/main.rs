@@ -186,9 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let active_for_handler = active_sessions.clone();
             // Pending permission requests: sender → (request_id, session_id, group)
-            type PendingPerms =
-                Arc<Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>>;
-            let pending_perms: PendingPerms = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            type PendingPerms = Arc<
+                Mutex<std::collections::HashMap<String, (uuid::Uuid, uuid::Uuid, Option<String>)>>,
+            >;
+            let pending_perms: PendingPerms =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
             let perms_for_handler = pending_perms.clone();
             let handler = Arc::new(
                 move |sender: String,
@@ -528,7 +530,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // be driven by future group/DM messages.
                                 {
                                     let mut active_lock = active.lock().await;
-                                    let ids: Vec<uuid::Uuid> = active_lock.values().copied().collect();
+                                    let ids: Vec<uuid::Uuid> =
+                                        active_lock.values().copied().collect();
                                     for id in ids {
                                         if !agent.has_session(id).await {
                                             active_lock.retain(|_, v| *v != id);
@@ -571,17 +574,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if trimmed == "/delete" || trimmed.starts_with("/delete ") {
-                            let prefix = trimmed.strip_prefix("/delete").unwrap().trim().to_lowercase();
+                            let prefix = trimmed
+                                .strip_prefix("/delete")
+                                .unwrap()
+                                .trim()
+                                .to_lowercase();
                             if prefix.is_empty() {
-                                send_conv(&signal, &sender, &group_id, "usage: /delete <id-prefix>").await;
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "usage: /delete <id-prefix>",
+                                )
+                                .await;
                                 return;
                             }
-                            let list_owner = if group_id.is_some() { "group" } else { &username };
+                            let list_owner = if group_id.is_some() {
+                                "group"
+                            } else {
+                                &username
+                            };
                             match memory.list_sessions(list_owner, 50).await {
                                 Ok(rows) => {
-                                    let found = rows.iter().find(|r| {
-                                        r.id.simple().to_string().starts_with(&prefix)
-                                    });
+                                    let found = rows
+                                        .iter()
+                                        .find(|r| r.id.simple().to_string().starts_with(&prefix));
                                     match found {
                                         Some(r) => {
                                             agent.close_session(r.id).await;
@@ -591,24 +608,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let mut active_lock = active.lock().await;
                                                     active_lock.retain(|_, v| *v != r.id);
                                                     drop(active_lock);
-                                                    let target = r.ssh_target.as_deref().unwrap_or("quick");
-                                                    let title = r.title.as_deref().unwrap_or("(untitled)");
-                                                    send_conv(&signal, &sender, &group_id, &format!(
-                                                        "🗑 deleted {target} · {title}"
-                                                    )).await;
+                                                    let target =
+                                                        r.ssh_target.as_deref().unwrap_or("quick");
+                                                    let title =
+                                                        r.title.as_deref().unwrap_or("(untitled)");
+                                                    send_conv(
+                                                        &signal,
+                                                        &sender,
+                                                        &group_id,
+                                                        &format!("🗑 deleted {target} · {title}"),
+                                                    )
+                                                    .await;
                                                 }
                                                 Err(e) => {
-                                                    send_conv(&signal, &sender, &group_id, &format!("delete failed: {e}")).await;
+                                                    send_conv(
+                                                        &signal,
+                                                        &sender,
+                                                        &group_id,
+                                                        &format!("delete failed: {e}"),
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
                                         None => {
-                                            send_conv(&signal, &sender, &group_id, "no session matching that prefix").await;
+                                            send_conv(
+                                                &signal,
+                                                &sender,
+                                                &group_id,
+                                                "no session matching that prefix",
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}")).await;
+                                    send_conv(&signal, &sender, &group_id, &format!("error: {e}"))
+                                        .await;
                                 }
                             }
                             return;
@@ -1052,34 +1088,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     });
                                 }
-                                agent::AgentEvent::TodoUpdated(items)
-                                    if !items.is_empty() => {
-                                        let done = items
-                                            .iter()
-                                            .filter(|i| {
-                                                i.status == temple_protocol::TodoStatus::Done
-                                            })
-                                            .count();
-                                        let mut msg =
-                                            format!("📋 tasks ({done}/{}):\n", items.len());
-                                        for item in &items {
-                                            let mark = match item.status {
-                                                temple_protocol::TodoStatus::Pending => "▫️",
-                                                temple_protocol::TodoStatus::InProgress => "▸",
-                                                temple_protocol::TodoStatus::Done => "▪️",
-                                            };
-                                            msg.push_str(&format!("{mark} {}\n", item.content));
-                                        }
-                                        tokio::spawn({
-                                            let signal = signal_for_emit.clone();
-                                            let sender = sender_for_emit.clone();
-                                            let group = group_for_emit.clone();
-                                            async move {
-                                                send_conv(&signal, &sender, &group, msg.trim_end())
-                                                    .await;
-                                            }
-                                        });
+                                agent::AgentEvent::TodoUpdated(items) if !items.is_empty() => {
+                                    let done = items
+                                        .iter()
+                                        .filter(|i| i.status == temple_protocol::TodoStatus::Done)
+                                        .count();
+                                    let mut msg = format!("📋 tasks ({done}/{}):\n", items.len());
+                                    for item in &items {
+                                        let mark = match item.status {
+                                            temple_protocol::TodoStatus::Pending => "▫️",
+                                            temple_protocol::TodoStatus::InProgress => "▸",
+                                            temple_protocol::TodoStatus::Done => "▪️",
+                                        };
+                                        msg.push_str(&format!("{mark} {}\n", item.content));
                                     }
+                                    tokio::spawn({
+                                        let signal = signal_for_emit.clone();
+                                        let sender = sender_for_emit.clone();
+                                        let group = group_for_emit.clone();
+                                        async move {
+                                            send_conv(&signal, &sender, &group, msg.trim_end())
+                                                .await;
+                                        }
+                                    });
+                                }
                                 _ => {}
                             }
                         };

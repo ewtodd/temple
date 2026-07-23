@@ -157,6 +157,8 @@ struct AppState {
     /// Current permission mode (from server), shown in the status bar and
     /// cycled with Shift+Tab.
     mode: PermissionMode,
+    /// Time of the last key event (for paste detection)
+    last_key_time: Option<std::time::Instant>,
 }
 
 // ── Background WebSocket thread ──
@@ -1096,10 +1098,7 @@ fn render_markdown_lite(content: &str, width: usize) -> Vec<StyledLine> {
 
 /// Insert a character at a given char index in a String.
 fn insert_char_at(s: &mut String, idx: usize, c: char) {
-    let byte_idx = s.char_indices()
-        .nth(idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
+    let byte_idx = s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len());
     s.insert(byte_idx, c);
 }
 
@@ -1426,7 +1425,28 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 }
                 PageUp => { s.scroll = s.scroll.saturating_add(10); }
                 PageDown => { s.scroll = s.scroll.saturating_sub(10); }
+                Enter if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let i = s.prompt_cursor;
+                    insert_char_at(&mut s.prompt, i, '\n');
+                    s.prompt_cursor = i + 1;
+                    s.last_key_time = Some(std::time::Instant::now());
+                }
                 Enter => {
+                    // Paste detection: if Enter arrives very quickly after the
+                    // previous key event (within 50ms), it's likely a pasted
+                    // newline — insert a space instead of submitting.
+                    let now = std::time::Instant::now();
+                    if let Some(last) = s.last_key_time {
+                        if now.duration_since(last) < Duration::from_millis(50) {
+                            let i = s.prompt_cursor;
+                            insert_char_at(&mut s.prompt, i, ' ');
+                            s.prompt_cursor = i + 1;
+                            s.last_key_time = Some(now);
+                            return;
+                        }
+                    }
+                    s.last_key_time = Some(now);
+
                     let content = std::mem::take(&mut s.prompt);
                     s.scroll = 0;
                     s.history_pos = None;
@@ -1584,11 +1604,15 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     }).ok();
                 }
                 Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if !c.is_control() {
-                        let i = s.prompt_cursor.min(s.prompt.chars().count());
-                        insert_char_at(&mut s.prompt, i, c);
-                        s.prompt_cursor += 1;
-                    }
+                    // Allow newlines (from pasting) through — they're valid
+                    // prompt content for multi-line editing. Filter other
+                    // control chars (backspace, tab, etc.) which have their
+                    // own handlers.
+                    if c.is_control() && c != '\n' { return; }
+                    let i = s.prompt_cursor.min(s.prompt.chars().count());
+                    insert_char_at(&mut s.prompt, i, c);
+                    s.prompt_cursor += 1;
+                    s.last_key_time = Some(std::time::Instant::now());
                 }
                 Backspace => {
                     let cur = s.prompt_cursor;
@@ -1839,33 +1863,41 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     const MAX_PROMPT_ROWS: usize = 8;
     let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
     let prompt_h = shown_rows + 2; // + border rows
-    let mut prompt_window: Vec<String> =
-        prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
+    let mut prompt_window: Vec<String> = prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
 
     // Cursor at caret position — iocraft draws no terminal cursor.
     // When on a character, invert it (dark on light); when at end,
     // show a block cursor. Hidden while a permission prompt owns the box.
     let cursor_pos: Option<(usize, usize)> = if s.permission.is_none() {
         // Map cursor char index to position in sanitized, wrapped text.
-        let cursor_vis: usize = s.prompt
+        let cursor_vis: usize = s
+            .prompt
             .chars()
             .take(s.prompt_cursor.min(s.prompt.chars().count()))
             .filter(|c| !c.is_control())
             .count();
         // Find which wrapped line and column the cursor falls on.
+        // Search against the FULL prompt_lines, not the already-sliced
+        // window, so cursor_line is absolute.
         let mut char_count = 0usize;
-        let (cursor_line, cursor_col) = prompt_window.iter().enumerate().find_map(|(i, line)| {
-            let line_len = line.chars().count();
-            if char_count + line_len > cursor_vis {
-                Some((i, cursor_vis - char_count))
-            } else {
-                char_count += line_len;
-                None
-            }
-        }).unwrap_or_else(|| {
-            (prompt_window.len().max(1) - 1,
-             prompt_window.last().map(|l| l.chars().count()).unwrap_or(0))
-        });
+        let (cursor_line, cursor_col) = prompt_lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, line)| {
+                let line_len = line.chars().count();
+                if char_count + line_len > cursor_vis {
+                    Some((i, cursor_vis - char_count))
+                } else {
+                    char_count += line_len;
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                (
+                    prompt_lines.len().max(1) - 1,
+                    prompt_lines.last().map(|l| l.chars().count()).unwrap_or(0),
+                )
+            });
         // Ensure the prompt window shows the line containing the cursor.
         let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
         let cursor_from_end = prompt_lines.len().saturating_sub(cursor_line + 1);
@@ -2025,7 +2057,6 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     } else {
         Color::DarkGrey
     };
-    let cursor_pos = cursor_pos;
     children.push(
         element! {
             View(
@@ -2115,7 +2146,9 @@ fn main() {
     let cwd =
         std::fs::canonicalize(&cli.cwd).unwrap_or_else(|_| std::path::PathBuf::from(&cli.cwd));
     let cwd_str = cwd.to_string_lossy().to_string();
-    let client_id = cli.client_id.unwrap_or_else(|| whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()));
+    let client_id = cli
+        .client_id
+        .unwrap_or_else(|| whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()));
 
     let state = Arc::new(Mutex::new(AppState {
         session_id: Uuid::nil(),
@@ -2141,6 +2174,7 @@ fn main() {
         work_started: None,
         last_total: 0,
         mode: PermissionMode::Default,
+        last_key_time: None,
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();

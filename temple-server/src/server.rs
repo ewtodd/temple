@@ -242,7 +242,7 @@ async fn handle_connection(
                             .filter(|c| !c.is_empty())
                             .or_else(|| {
                                 (!meta.cwd.is_empty() && meta.cwd != "/var/lib/temple")
-                                    .then(|| meta.cwd.as_str())
+                                    .then_some(meta.cwd.as_str())
                             })
                             .unwrap_or(".");
                         let scope = PermissionScope::new(
@@ -291,19 +291,14 @@ async fn handle_connection(
                         if client_cwd.is_some() {
                             // Client-side session: use the stored client cwd
                             let scope = PermissionScope::new(
-                                std::path::Path::new(
-                                    client_cwd.as_deref().unwrap_or("."),
-                                ),
+                                std::path::Path::new(client_cwd.as_deref().unwrap_or(".")),
                                 PermissionMode::Default,
                                 &config.allowed_dirs,
                             )
                             .await;
                             permissions = Some(Arc::new(Mutex::new(scope)));
                         } else if permissions.is_none() {
-                            let cwd = agent
-                                .session_cwd(sid)
-                                .await
-                                .unwrap_or_else(|| ".".into());
+                            let cwd = agent.session_cwd(sid).await.unwrap_or_else(|| ".".into());
                             let scope = PermissionScope::new(
                                 std::path::Path::new(&cwd),
                                 PermissionMode::Default,
