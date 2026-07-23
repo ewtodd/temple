@@ -554,9 +554,6 @@ impl App {
                     }
                 });
 
-                // Request session list on connect (for --continue and /session)
-                let _ = tx_session.send(ClientMessage::ListSessions);
-
                 // Writer: UI channel → socket, + pings
                 loop {
                     tokio::select! {

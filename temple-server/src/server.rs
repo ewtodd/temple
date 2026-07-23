@@ -108,24 +108,30 @@ async fn handle_connection(
         match client_msg {
             ClientMessage::OpenSession(open) => {
                 session_id = Uuid::new_v4();
+                // Pubkey auth: scan all authorized_keys files for a match.
+                // The client sends its system username (e.g. "e-work") but
+                // authorized_keys files are keyed by owner (e.g. "ethan").
+                if let Some(ref pubkey) = open.daemon_pubkey {
+                    match verify_daemon_pubkey(pubkey) {
+                        Some(owner) => {
+                            auth_owner = Some(owner);
+                            daemon_username = Some(open.username.clone());
+                            agent.register_daemon(&open.username).await;
+                        }
+                        None => {
+                            let _ = tx.send(ServerMessage::ChatError {
+                                session_id,
+                                error: format!(
+                                    "daemon public key not authorized for user {}",
+                                    open.username
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                }
                 if auth_owner.is_none() {
                     auth_owner = Some(open.username.clone());
-                }
-                // If daemon_pubkey is set, verify it's authorized for this user.
-                // TUI clients leave this unset and rely on token auth alone.
-                if let Some(ref pubkey) = open.daemon_pubkey {
-                    if !verify_daemon_pubkey(&open.username, pubkey) {
-                        let _ = tx.send(ServerMessage::ChatError {
-                            session_id,
-                            error: format!(
-                                "daemon public key not authorized for user {}",
-                                open.username
-                            ),
-                        });
-                        continue;
-                    }
-                    daemon_username = Some(open.username.clone());
-                    agent.register_daemon(&open.username).await;
                 }
                 // Auto-create a persisted Coding session (no SSH — tools run
                 // client-side via ToolRequest, so every `temple` invocation
@@ -561,17 +567,31 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Verify that a daemon's public key is authorized for the given user.
-/// Keys are stored one-per-line in `/var/lib/temple/authorized_keys/<username>`.
-/// The key line must match exactly (whitespace-insensitive comparison after trim).
-fn verify_daemon_pubkey(username: &str, pubkey: &str) -> bool {
+/// Verify a daemon public key against all authorized_keys/* files.
+/// Returns the owning username if found, or None.
+fn verify_daemon_pubkey(pubkey: &str) -> Option<String> {
     let key = pubkey.trim();
     if key.is_empty() {
-        return false;
+        return None;
     }
-    let path = std::path::PathBuf::from("/var/lib/temple/authorized_keys").join(username);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => contents.lines().any(|line| line.trim() == key),
-        Err(_) => false,
+    let dir = std::path::PathBuf::from("/var/lib/temple/authorized_keys");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if contents.lines().any(|line| line.trim() == key) {
+                return path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string());
+            }
+        }
     }
+    None
 }
