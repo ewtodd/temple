@@ -77,6 +77,20 @@ struct PromptState {
     kind: PromptKind,
 }
 
+/// Internal-only messages routed from the smol UI thread to the Tokio
+/// WebSocket thread. These must never be serialized to the wire.
+#[derive(Debug)]
+enum InternalCmd {
+    /// Execute a local tool on the Tokio thread and send the result
+    /// string back via the responder channel.
+    ExecuteLocalTool {
+        name: String,
+        args_json: String,
+        cwd: String,
+        responder: tokio::sync::mpsc::Sender<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 enum ChatEntry {
     /// User message
@@ -155,6 +169,7 @@ fn spawn_ws(
     force_tls: bool,
     state: Arc<Mutex<AppState>>,
     ui_cmd: mpsc::Receiver<ClientMessage>,
+    mut internal_rx: tokio::sync::mpsc::Receiver<InternalCmd>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -596,6 +611,24 @@ fn spawn_ws(
                     while let Ok(cmd) = ui_cmd.try_recv() {
                         if tx.send(cmd).is_err() {
                             return;
+                        }
+                    }
+                }
+            });
+
+            // Internal command executor: runs local tools requested by
+            // the smol UI thread, and sends results back via responder.
+            tokio::spawn(async move {
+                while let Some(cmd) = internal_rx.recv().await {
+                    match cmd {
+                        InternalCmd::ExecuteLocalTool {
+                            name,
+                            args_json,
+                            cwd,
+                            responder,
+                        } => {
+                            let result = execute_local_tool(&name, &args_json, &cwd).await;
+                            let _ = responder.send(result).await;
                         }
                     }
                 }
@@ -1115,14 +1148,17 @@ fn wrap_piece(line: &str, width: usize) -> Vec<String> {
 struct TempleProps {
     state: Arc<Mutex<AppState>>,
     cmd_tx: mpsc::Sender<ClientMessage>,
+    internal_tx: tokio::sync::mpsc::Sender<InternalCmd>,
 }
 
 impl Default for TempleProps {
     fn default() -> Self {
         let (tx, _) = mpsc::channel::<ClientMessage>();
+        let (int_tx, _) = tokio::sync::mpsc::channel(32);
         Self {
             state: Arc::new(Mutex::new(AppState::default())),
             cmd_tx: tx,
+            internal_tx: int_tx,
         }
     }
 }
@@ -1148,6 +1184,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
     let cmd_tx = props.cmd_tx.clone();
     let state = props.state.clone();
+    let internal_tx = props.internal_tx.clone();
 
     // Exit checks
     {
@@ -1161,6 +1198,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Keyboard + mouse
     let state_h = state.clone();
     let cmd_h = cmd_tx.clone();
+    let int_h = internal_tx.clone();
     hooks.use_terminal_events(move |event| {
         use KeyCode::*;
         match event {
@@ -1222,15 +1260,25 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 }).ok();
                             }
                             PromptKind::Local { request_id, session_id, name, args_json } => {
-                                // Consent granted — execute the tool locally
-                                // and return the result to the server.
+                                // Consent granted — delegate tool execution
+                                // to the Tokio thread, then return result.
                                 let cwd = s.cwd.clone();
-                                let tx = cmd_h.clone();
-                                tokio::spawn(async move {
-                                    let result = execute_local_tool(&name, &args_json, &cwd).await;
-                                    let _ = tx.send(ClientMessage::ToolResult {
-                                        request_id, session_id, result,
+                                let (responder_tx, mut responder_rx) =
+                                    tokio::sync::mpsc::channel::<String>(1);
+                                let _ = int_h.try_send(
+                                    InternalCmd::ExecuteLocalTool {
+                                        name,
+                                        args_json,
+                                        cwd,
+                                        responder: responder_tx,
+                                    },
+                                );
+                                let result = smol::block_on(responder_rx.recv())
+                                    .unwrap_or_else(|| {
+                                        "Error: tool execution failed".into()
                                     });
+                                let _ = cmd_h.send(ClientMessage::ToolResult {
+                                    request_id, session_id, result,
                                 });
                             }
                         }
@@ -1984,6 +2032,7 @@ fn main() {
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientMessage>();
+    let (internal_tx, internal_rx) = tokio::sync::mpsc::channel::<InternalCmd>(32);
     spawn_ws(
         cli.server,
         cwd_str,
@@ -1993,6 +2042,7 @@ fn main() {
         cli.tls,
         state.clone(),
         cmd_rx,
+        internal_rx,
     );
 
     smol::block_on(async {
@@ -2056,6 +2106,7 @@ fn main() {
                 Temple(
                     state: state.clone(),
                     cmd_tx: cmd_tx.clone(),
+                    internal_tx: internal_tx.clone(),
                 )
             };
 
