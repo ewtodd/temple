@@ -2125,14 +2125,22 @@ Git conventions:
             sessions.get(&session_id).map(|s| s.cwd.clone())
         };
 
-        // Reject absolute paths that leak the server's base directory.
+        // Reject paths and commands that leak the server's base directory.
         // The model sometimes confuses /var/lib/temple (its ssh key path
         // from the system prompt) with a workspace root. Catch it here
         // and remind it of the relevant instruction.
         if let Some(path) = args["path"].as_str() {
-            if path.starts_with("/var/lib/temple") {
+            if path.contains("/var/lib/temple") {
                 return Err(format!(
                     "REJECTED: path must be relative to the working directory: {}",
+                    session_cwd.as_deref().unwrap_or(".")
+                ));
+            }
+        }
+        if let Some(cmd) = args["command"].as_str() {
+            if cmd.contains("/var/lib/temple") {
+                return Err(format!(
+                    "REJECTED: command must not reference /var/lib/temple. Work in: {}",
                     session_cwd.as_deref().unwrap_or(".")
                 ));
             }
