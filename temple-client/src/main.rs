@@ -123,6 +123,8 @@ struct AppState {
     status: String,
     model: String,
     prompt: String,
+    /// Character index into `prompt` (0..=prompt.chars().count())
+    prompt_cursor: usize,
     permission: Option<PromptState>,
     running: bool,
     editor_pending: bool,
@@ -1085,6 +1087,23 @@ fn render_markdown_lite(content: &str, width: usize) -> Vec<StyledLine> {
     out
 }
 
+/// Insert a character at a given char index in a String.
+fn insert_char_at(s: &mut String, idx: usize, c: char) {
+    let byte_idx = s.char_indices()
+        .nth(idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    s.insert(byte_idx, c);
+}
+
+/// Remove the character at a given char index from a String.
+fn remove_char_at(s: &mut String, idx: usize) {
+    if let Some((byte_idx, ch)) = s.char_indices().nth(idx) {
+        s.remove(byte_idx);
+        let _ = ch;
+    }
+}
+
 /// Wrap text to `width` display columns. Handles embedded newlines and
 /// strips control characters — every display path funnels through here.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -1379,6 +1398,7 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     }
                     if let Some(p) = s.history_pos {
                         s.prompt = s.input_history[p].clone();
+                        s.prompt_cursor = s.prompt.chars().count();
                     }
                 }
                 Down => {
@@ -1388,10 +1408,12 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         Some(p) if p + 1 < s.input_history.len() => {
                             s.history_pos = Some(p + 1);
                             s.prompt = s.input_history[p + 1].clone();
+                            s.prompt_cursor = s.prompt.chars().count();
                         }
                         Some(_) => {
                             s.history_pos = None;
                             s.prompt = std::mem::take(&mut s.history_stash);
+                            s.prompt_cursor = s.prompt.chars().count();
                         }
                     }
                 }
@@ -1555,14 +1577,43 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     }).ok();
                 }
                 Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Drop pasted control characters (they'd desync the
-                    // prompt line or send pasted lines as separate messages)
                     if !c.is_control() {
-                        s.prompt.push(c);
+                        let i = s.prompt_cursor.min(s.prompt.chars().count());
+                        insert_char_at(&mut s.prompt, i, c);
+                        s.prompt_cursor += 1;
                     }
                 }
-                Backspace => { s.prompt.pop(); }
-                Esc => { s.prompt.clear(); }
+                Backspace => {
+                    let cur = s.prompt_cursor;
+                    if cur > 0 {
+                        remove_char_at(&mut s.prompt, cur - 1);
+                        s.prompt_cursor = cur - 1;
+                    }
+                }
+                Delete => {
+                    let len = s.prompt.chars().count();
+                    let i = s.prompt_cursor.min(len);
+                    if i < len {
+                        remove_char_at(&mut s.prompt, i);
+                    }
+                }
+                Left => {
+                    s.prompt_cursor = s.prompt_cursor.saturating_sub(1);
+                }
+                Right => {
+                    let len = s.prompt.chars().count();
+                    s.prompt_cursor = (s.prompt_cursor + 1).min(len);
+                }
+                Home => {
+                    s.prompt_cursor = 0;
+                }
+                End => {
+                    s.prompt_cursor = s.prompt.chars().count();
+                }
+                Esc => {
+                    s.prompt.clear();
+                    s.prompt_cursor = 0;
+                }
                 _ => {}
             }
             }
@@ -1784,17 +1835,48 @@ fn Temple(props: &TempleProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let mut prompt_window: Vec<String> =
         prompt_lines[prompt_lines.len() - shown_rows..].to_vec();
 
-    // Blinking cursor at the end of the input — iocraft draws no terminal
+    // Solid cursor at the caret position — iocraft draws no terminal
     // cursor, so we render one ourselves. Hidden while a permission
     // prompt owns the box (the y/N answer is single-key, not typed).
     if s.permission.is_none() {
-        let cursor = if (tick_val as usize / 4) % 2 == 0 {
-            "▌"
+        // Map cursor char index to position in sanitized, wrapped text.
+        // Sanitize strips control chars, so count visible chars up to
+        // prompt_cursor to find the effective index.
+        let cursor_vis: usize = s.prompt
+            .chars()
+            .take(s.prompt_cursor.min(s.prompt.chars().count()))
+            .filter(|c| !c.is_control())
+            .count();
+        // Find which wrapped line and column the cursor falls on.
+        let mut char_count = 0usize;
+        let (cursor_line, cursor_col) = prompt_window.iter().enumerate().find_map(|(i, line)| {
+            let line_len = line.chars().count();
+            if char_count + line_len > cursor_vis {
+                Some((i, cursor_vis - char_count))
+            } else {
+                char_count += line_len;
+                None
+            }
+        }).unwrap_or_else(|| {
+            // Cursor at the very end
+            (prompt_window.len().max(1) - 1,
+             prompt_window.last().map(|l| l.chars().count()).unwrap_or(0))
+        });
+        // Ensure the prompt window shows the line containing the cursor.
+        let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
+        let cursor_from_end = prompt_lines.len().saturating_sub(cursor_line + 1);
+        let start = if cursor_from_end < shown_rows {
+            0
         } else {
-            " "
+            cursor_from_end - shown_rows + 1
         };
-        if let Some(last) = prompt_window.last_mut() {
-            last.push_str(cursor);
+        prompt_window = prompt_lines[start..start + shown_rows].to_vec();
+        // Place cursor in the correct line.
+        let adj_line = cursor_line - start;
+        if let Some(line) = prompt_window.get_mut(adj_line) {
+            let col = cursor_col.min(line.chars().count());
+            let byte_idx = line.char_indices().nth(col).map(|(i, _)| i).unwrap_or(line.len());
+            line.insert_str(byte_idx, "▌");
         }
     }
     // Scroll window
@@ -2012,6 +2094,7 @@ fn main() {
         status: "connecting…".into(),
         model: String::new(),
         prompt: String::new(),
+        prompt_cursor: 0,
         permission: None,
         running: true,
         editor_pending: false,
@@ -2097,6 +2180,7 @@ fn main() {
 
                     let mut s = state.lock().unwrap();
                     s.prompt = edited;
+                    s.prompt_cursor = s.prompt.chars().count();
                     s.editor_pending = false;
                     continue;
                 }
