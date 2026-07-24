@@ -237,6 +237,8 @@ pub enum ServerMessage {
         session_id: Uuid,
         name: String,
         args_json: String,
+        /// The session's working directory — client resolves paths relative to this
+        session_cwd: String,
     },
     /// Client response with the result of a tool execution.
     ToolResult {

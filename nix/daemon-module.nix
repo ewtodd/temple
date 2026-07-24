@@ -39,18 +39,13 @@ in
             example = "e-play";
             description = "System user to run this daemon as.";
           };
-          cwd = mkOption {
-            type = types.str;
-            example = "/home/e-play/Software";
-            description = "Working directory for this daemon.";
-          };
         };
       });
       default = { };
       example = lib.literalExpression ''
         {
-          "e-play" = { cwd = "/home/e-play/Software"; };
-          "e-work" = { cwd = "/home/e-work"; };
+          "e-play" = { };
+          "e-work" = { };
         }
       '';
       description = "Per-user daemon configurations, keyed by username.";
@@ -76,8 +71,6 @@ in
             "${cfg.package}/bin/temple"
             "--server"
             cfg.server
-            "--cwd"
-            daemonCfg.cwd
             "--daemon"
             "--identity"
             "%h/.ssh/id_ed25519"

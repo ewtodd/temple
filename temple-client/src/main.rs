@@ -83,7 +83,7 @@ fn main() {
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = daemon::run(cli.server, cwd, client_id, pubkey.unwrap()).await {
+            if let Err(e) = daemon::run(cli.server, client_id, pubkey.unwrap()).await {
                 eprintln!("temple-daemon: fatal: {e}");
                 std::process::exit(1);
             }

@@ -116,6 +116,7 @@ impl App {
                             session_id,
                             ref name,
                             ref args_json,
+                            ..
                         } = msg
                         {
                             let (cwd_str, active_sid, mode) = {

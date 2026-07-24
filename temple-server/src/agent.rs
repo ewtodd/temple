@@ -87,6 +87,7 @@ pub enum AgentEvent {
         request_id: Uuid,
         name: String,
         args_json: String,
+        session_cwd: String,
     },
 }
 
@@ -2217,10 +2218,18 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let session_cwd = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| ".".into());
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "read_file".to_string(),
                     args_json: args_json.to_string(),
+                    session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
             }
@@ -2250,10 +2259,18 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let session_cwd = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| ".".into());
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "write_file".to_string(),
                     args_json: args_json.to_string(),
+                    session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
             }
@@ -2282,10 +2299,18 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let session_cwd = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| ".".into());
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "list_dir".to_string(),
                     args_json: args_json.to_string(),
+                    session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
             }
@@ -2319,10 +2344,18 @@ Git conventions:
                 }
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let session_cwd = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| ".".into());
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "execute_command".to_string(),
                     args_json: args_json.to_string(),
+                    session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
             }
@@ -2369,10 +2402,18 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let session_cwd = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| ".".into());
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "edit_file".to_string(),
                     args_json: args_json.to_string(),
+                    session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
             }

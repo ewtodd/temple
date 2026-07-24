@@ -487,11 +487,13 @@ async fn handle_connection(
                                 request_id,
                                 name,
                                 args_json,
+                                session_cwd,
                             } => ServerMessage::ToolRequest {
                                 request_id,
                                 session_id: sid,
                                 name,
                                 args_json,
+                                session_cwd,
                             },
                             AgentEvent::TodoUpdated(items) => ServerMessage::TodoUpdate {
                                 session_id: sid,

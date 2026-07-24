@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 use temple_protocol::*;
 
@@ -11,13 +10,7 @@ use crate::tools::execute_local_tool;
 ///
 /// `pubkey` is an SSH ed25519 public key string (required). The server
 /// verifies it is authorized for the claimed owner.
-pub async fn run(
-    server: String,
-    cwd: PathBuf,
-    client_id: String,
-    pubkey: String,
-) -> Result<(), String> {
-    let cwd_str = cwd.to_string_lossy().to_string();
+pub async fn run(server: String, client_id: String, pubkey: String) -> Result<(), String> {
     let hostname = whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into());
     let username = whoami::username();
 
@@ -27,10 +20,7 @@ pub async fn run(
     loop {
         let sess = SessionOpen {
             client_id: client_id.clone(),
-            cwd: std::fs::canonicalize(&cwd)
-                .unwrap_or_else(|_| cwd.clone())
-                .to_string_lossy()
-                .into(),
+            cwd: "/".into(),
             hostname: hostname.clone(),
             username: username.clone(),
             daemon_pubkey: Some(pubkey.clone()),
@@ -51,7 +41,7 @@ pub async fn run(
         let tx = conn.write;
         let mut incoming = conn.incoming;
 
-        eprintln!("temple-daemon: connected to {server}, cwd={cwd_str}",);
+        eprintln!("temple-daemon: connected to {server}");
 
         // Main message loop
         while let Some(msg) = incoming.recv().await {
@@ -60,15 +50,23 @@ pub async fn run(
                 session_id,
                 name,
                 args_json,
+                session_cwd,
             } = msg
             else {
                 continue;
             };
 
             // Execute every tool immediately — permission decisions come
-            // from the session, not the daemon.
-            let result =
-                execute_local_tool(&name, &args_json, &cwd_str, None, request_id, session_id).await;
+            // from the session, not the daemon. Use the session's CWD.
+            let result = execute_local_tool(
+                &name,
+                &args_json,
+                &session_cwd,
+                None,
+                request_id,
+                session_id,
+            )
+            .await;
 
             let _ = tx.send(ClientMessage::ToolResult {
                 request_id,
