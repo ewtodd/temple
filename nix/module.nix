@@ -195,16 +195,19 @@ in
 
     # ── Daemon authentication ──
     daemonAuthorizedKeys = mkOption {
-      type = types.attrsOf types.str;
+      type = types.attrsOf (types.listOf types.str);
       default = { };
       example = {
-        ethan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... e-work@e-desktop";
-        val = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... v-work@v-desktop";
+        ethan = [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... e-work@e-desktop"
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... e-play@e-desktop"
+        ];
+        val = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... v-work@v-desktop" ];
       };
       description = ''
         Public keys authorized for daemon authentication, keyed by username.
-        Each entry becomes a file at /var/lib/temple/authorized_keys/<name>.
-        Reuses the user's existing SSH public key — no separate key needed.
+        Each entry becomes a file at /var/lib/temple/authorized_keys/<name>
+        with one key per line. Reuses existing SSH public keys.
       '';
     };
   };
@@ -229,8 +232,8 @@ in
         "d ${cfg.dataDir}/authorized_keys 0700 temple temple - -"
       ]
       ++ mapAttrsToList (
-        username: key:
-        "f ${cfg.dataDir}/authorized_keys/${username} 0400 temple temple - ${key}\n"
+        username: keys:
+        "f ${cfg.dataDir}/authorized_keys/${username} 0400 temple temple - ${concatStringsSep "\n" keys}\n"
       ) cfg.daemonAuthorizedKeys
       ++ lib.optional (cfg.gitSafeDirectories != [ ])
         "L+ ${cfg.dataDir}/.gitconfig - - - - /etc/temple/gitconfig";
