@@ -15,6 +15,15 @@ use crate::state::{AppState, ChatEntry, InternalCmd, PromptKind, PromptState, Sh
 use crate::tools::{execute_local_tool, mode_tag};
 use crate::ui;
 
+/// Format token/count numbers for display: 1234 → "1.2k", 456 → "456".
+fn fmt_k(n: u32) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Try to read the user's default SSH public key for daemon-auth.
 /// Returns None if no key is found (TUI/legacy clients fall back to token auth).
 fn discover_pubkey() -> Option<String> {
@@ -258,7 +267,9 @@ impl App {
                                 prompt_tokens,
                                 completion_tokens,
                                 duration_ms,
-                                tokens_per_second,
+                                context_length,
+                                prefill_tps,
+                                decode_tps,
                                 ..
                             } => {
                                 s.working = false;
@@ -267,9 +278,13 @@ impl App {
                                     s.model = model;
                                 }
                                 let stats = format!(
-                                    "{prompt_tokens}+{completion_tokens} tk \
-                                     {duration_ms}ms \
-                                     {tokens_per_second:.0} t/s",
+                                    "prefill {:.0} tok/s \u{b7} decode {:.1} tok/s \u{b7} {} ctx \u{b7} {}+{} \u{b7} {:.1}s",
+                                    prefill_tps,
+                                    decode_tps,
+                                    fmt_k(context_length),
+                                    fmt_k(prompt_tokens),
+                                    fmt_k(completion_tokens),
+                                    duration_ms as f64 / 1000.0,
                                 );
                                 if let Some(ChatEntry::Assistant {
                                     stats: ref mut st,

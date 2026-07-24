@@ -63,7 +63,6 @@ async fn handle_connection(
     let mut session_id = Uuid::nil();
     let mut permissions: Option<Arc<Mutex<PermissionScope>>> = None;
     let mut client_cwd: Option<String> = None;
-    let mut daemon_username: Option<String> = None;
     let mut daemon_owner: Option<String> = None;
 
     // Writer task: forwards channel messages to the socket
@@ -116,7 +115,6 @@ async fn handle_connection(
                     match verify_daemon_pubkey(pubkey) {
                         Some(owner) => {
                             auth_owner = Some(owner.clone());
-                            daemon_username = Some(open.username.clone());
                             daemon_owner = Some(owner.clone());
                             agent.register_daemon(&owner).await;
                         }

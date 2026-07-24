@@ -372,7 +372,7 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
         };
 
         let max_h = (filtered.len() + 3).min(16);
-        let popup_w = (f.area().width as usize / 2).min(60).max(30);
+        let popup_w = (f.area().width as usize / 2).clamp(30, 60);
         let popup_h = max_h as u16;
         let popup_x = (f.area().width.saturating_sub(popup_w as u16)) / 2;
         let popup_y = (f.area().height.saturating_sub(popup_h)) / 2;
@@ -404,7 +404,7 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
                     let id8: String = m.id.simple().to_string().chars().take(8).collect();
                     Line::from(vec![
                         Span::styled(format!(" {id8}  "), Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("{}", m.username), Style::default().fg(Color::Cyan)),
+                        Span::styled(m.username.clone(), Style::default().fg(Color::Cyan)),
                         Span::styled(format!(" — {title}"), Style::default().fg(Color::White)),
                     ])
                 })
