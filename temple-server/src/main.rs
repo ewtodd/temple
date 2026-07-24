@@ -2,6 +2,7 @@ mod agent;
 mod auth;
 mod config;
 mod cron;
+mod direct_tools;
 mod litellm;
 mod mcp;
 mod memory;

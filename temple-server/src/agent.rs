@@ -168,6 +168,7 @@ struct SessionCtx {
 pub struct Agent {
     pub litellm: LiteLLM,
     pub mcp: McpClient,
+    pub direct: crate::direct_tools::DirectTools,
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
@@ -211,6 +212,7 @@ impl Agent {
         Self {
             litellm,
             mcp,
+            direct: crate::direct_tools::DirectTools::new(),
             memory,
             permissions: Arc::new(PermissionResolver::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -2437,6 +2439,48 @@ Git conventions:
                 }
             }
 
+            "grep_code" => {
+                let pattern = args["pattern"]
+                    .as_str()
+                    .ok_or("grep_code: missing pattern")?;
+                if pattern.is_empty() {
+                    return Err("grep_code: empty pattern".into());
+                }
+                let cwd = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into())
+                };
+                crate::direct_tools::DirectTools::grep_code(&cwd, pattern, 50)
+            }
+            "fetch-fetch" => {
+                let url = args["url"].as_str().ok_or("fetch: missing url")?;
+                self.direct.fetch(url).await
+            }
+            "searxng-web_search" => {
+                let query = args["query"].as_str().ok_or("searxng: missing query")?;
+                let count = args["count"].as_u64().unwrap_or(5) as usize;
+                self.direct.searxng_search(query, count).await
+            }
+            "nixos-nix" => {
+                let action = args["action"].as_str().unwrap_or("search");
+                let query = args["query"].as_str().unwrap_or("");
+                let channel = args["channel"].as_str().unwrap_or("unstable");
+                let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+                self.direct.nixos_nix(action, query, channel, limit).await
+            }
+            "arxiv-search" | "arxiv_search" => {
+                let query = args["query"].as_str().ok_or("arxiv: missing query")?;
+                let max_results = args["max_results"].as_u64().unwrap_or(10) as usize;
+                self.direct.arxiv_search(query, max_results).await
+            }
+            "context7-search" | "context7_search" => {
+                let query = args["query"].as_str().ok_or("context7: missing query")?;
+                self.direct.context7_search(query).await
+            }
+
             _ => self.mcp.call_tool(name, args).await,
         }
     }
@@ -2716,6 +2760,95 @@ fn local_tools() -> Vec<ToolDefinition> {
                     "required": ["id"],
                     "properties": {
                         "id": {"type": "string", "description": "The document id from search_documents results."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "grep_code".into(),
+                description: "Search code in the working directory using ripgrep. Returns file:line: match lines. Use for finding functions, types, patterns, or strings across the codebase.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["pattern"],
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Ripgrep-compatible regex pattern to search for."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "fetch-fetch".into(),
+                description: "Fetch content from a URL and extract plain text.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": {"type": "string", "description": "URL to fetch."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "searxng-web_search".into(),
+                description: "Search the web via SearXNG.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query."},
+                        "count": {"type": "integer", "description": "Max results (default 5)."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "nixos-nix".into(),
+                description: "Search NixOS packages and options.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["action", "query"],
+                    "properties": {
+                        "action": {"type": "string", "description": "One of: search, info."},
+                        "query": {"type": "string", "description": "Search term or package name."},
+                        "channel": {"type": "string", "description": "NixOS channel (default: unstable)."},
+                        "limit": {"type": "integer", "description": "Max results (default: 10)."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "arxiv-search".into(),
+                description: "Search for papers on arXiv.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query with arXiv syntax."},
+                        "max_results": {"type": "integer", "description": "Max papers (default 10)."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "context7-search".into(),
+                description: "Search programming library documentation via Context7.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "description": "Library name or documentation query."},
                     },
                 }),
             },
