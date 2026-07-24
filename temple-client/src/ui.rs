@@ -35,7 +35,7 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
         match entry {
             ChatEntry::User(text) => {
                 lines.push(Line::from(vec![Span::styled(
-                    "  you",
+                    "you",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(ratatui::style::Modifier::BOLD),
@@ -58,9 +58,9 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
             } => {
                 let model_tag = s.model.as_str();
                 let header = if model_tag.is_empty() {
-                    "  renco".to_string()
+                    "renco".to_string()
                 } else {
-                    format!("  renco \u{b7} {model_tag}")
+                    format!("renco \u{b7} {model_tag}")
                 };
                 lines.push(Line::from(vec![Span::styled(
                     header,
@@ -72,7 +72,7 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                 if let Some(ref r) = reasoning {
                     if !r.trim().is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!("  \u{2026}{r}"),
+                            format!(" \u{2026}{r}"),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(ratatui::style::Modifier::ITALIC),
@@ -125,7 +125,7 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     ToolStatus::Failed => ("\u{2717}", Color::Red),
                 };
                 lines.push(Line::from(Span::styled(
-                    format!("   {icon} {name}"),
+                    format!(" {icon} {name}"),
                     Style::default().fg(color),
                 )));
                 if !detail.is_empty() {
@@ -136,9 +136,9 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     } else {
                         detail.chars().take(200).collect()
                     };
-                    for l in wrap_text(&d, content_width.saturating_sub(6)) {
+                    for l in wrap_text(&d, content_width.saturating_sub(4)) {
                         lines.push(Line::from(Span::styled(
-                            format!("   \u{2502} {l}"),
+                            format!(" \u{2502} {l}"),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
@@ -150,7 +150,7 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     .filter(|i| i.status == temple_protocol::TodoStatus::Done)
                     .count();
                 lines.push(Line::from(Span::styled(
-                    format!("   tasks ({done}/{})", items.len()),
+                    format!(" tasks ({done}/{})", items.len()),
                     Style::default().fg(Color::Green),
                 )));
                 for item in items {
@@ -159,14 +159,14 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                         temple_protocol::TodoStatus::InProgress => ("\u{25B8}", Color::Yellow),
                         temple_protocol::TodoStatus::Done => ("\u{2713}", Color::Green),
                     };
-                    for (i, l) in wrap_text(&item.content, content_width.saturating_sub(6))
+                    for (i, l) in wrap_text(&item.content, content_width.saturating_sub(4))
                         .iter()
                         .enumerate()
                     {
                         let prefix = if i == 0 {
-                            format!("   {icon} ")
+                            format!(" {icon} ")
                         } else {
-                            "     ".into()
+                            "   ".into()
                         };
                         lines.push(Line::from(Span::styled(
                             format!("{prefix}{l}"),

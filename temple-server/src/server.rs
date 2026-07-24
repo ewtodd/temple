@@ -444,15 +444,12 @@ async fn handle_connection(
                                 reasoning: None,
                                 done: false,
                             },
-                            AgentEvent::DeltaReasoning(r) => {
-                                let reasoning = Some(r.clone());
-                                ServerMessage::ChatDelta {
-                                    session_id: sid,
-                                    delta: r,
-                                    reasoning,
-                                    done: false,
-                                }
-                            }
+                            AgentEvent::DeltaReasoning(r) => ServerMessage::ChatDelta {
+                                session_id: sid,
+                                delta: String::new(),
+                                reasoning: Some(r),
+                                done: false,
+                            },
                             AgentEvent::ToolDelta { name, delta } => ServerMessage::ToolDelta {
                                 session_id: sid,
                                 name,
