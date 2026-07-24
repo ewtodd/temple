@@ -526,6 +526,7 @@ impl App {
                                 s.entries.push(ChatEntry::System(format!(
                                     "deleted session {id8}"
                                 )));
+                                s.last_sessions.retain(|m| m.id != sid);
                                 if sid == s.session_id {
                                     s.entries.clear();
                                     s.last_total = 0;
