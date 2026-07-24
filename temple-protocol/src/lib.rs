@@ -132,6 +132,8 @@ pub enum ClientMessage {
     Ping,
     /// Web client requests a verification code (displayed to user).
     WebAuth,
+    /// Admin: delete ALL sessions from the database (requires confirmation).
+    NukeSessions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

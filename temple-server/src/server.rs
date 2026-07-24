@@ -564,6 +564,32 @@ async fn handle_connection(
                 let code = agent.generate_web_code(tx.clone()).await;
                 let _ = tx.send(ServerMessage::WebAuthCode { code });
             }
+
+            ClientMessage::NukeSessions => {
+                let owner = auth_owner.clone().unwrap_or_default();
+                let is_admin = memory.is_admin_username(&owner).await.unwrap_or(false);
+                if !is_admin {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: "admin only".into(),
+                    });
+                    continue;
+                }
+                match memory.nuke_sessions().await {
+                    Ok(count) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("deleted {count} sessions"),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("nuke: {e}"),
+                        });
+                    }
+                }
+            }
         }
     }
 

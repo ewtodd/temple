@@ -631,6 +631,19 @@ Commands:                     Keys:
         s.running = false;
         return true;
     }
+    if content == "/nuke confirm" {
+        cmd_tx.send(ClientMessage::NukeSessions).ok();
+        s.entries.push(crate::state::ChatEntry::System(
+            "nuking all sessions...".into(),
+        ));
+        return true;
+    }
+    if content == "/nuke" {
+        s.entries.push(crate::state::ChatEntry::System(
+            "type /nuke confirm to permanently delete ALL sessions".into(),
+        ));
+        return true;
+    }
     if content.starts_with('/') {
         s.entries.push(crate::state::ChatEntry::System(format!(
             "unknown: {content}"

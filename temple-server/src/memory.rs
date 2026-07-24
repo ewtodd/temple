@@ -576,6 +576,16 @@ impl Memory {
         Ok(())
     }
 
+    /// Nuke ALL sessions and conversations. Returns count of deleted sessions.
+    pub async fn nuke_sessions(&self) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction()?;
+        let count = tx.execute("DELETE FROM sessions", [])?;
+        tx.execute("DELETE FROM conversations", [])?;
+        tx.commit()?;
+        Ok(count)
+    }
+
     /// Get all admin users' phone numbers + UUIDs.
     pub async fn get_admins(&self) -> rusqlite::Result<Vec<(String, Option<String>)>> {
         let conn = self.conn.lock().await;
