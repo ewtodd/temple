@@ -3,7 +3,6 @@
 #   imports = [ temple.nixosModules.temple-daemon ];
 #
 # Creates systemd system services that start at boot (no login required).
-# Supports multiple daemons per host for multi-user desktops.
 {
   config,
   lib,
@@ -17,30 +16,27 @@ let
 in
 {
   options.services.temple-daemon = {
-    enable = mkEnableOption "temple headless daemons — execute tool requests locally";
+    enable = mkEnableOption "temple headless daemons";
 
     package = mkOption {
       type = types.package;
       default = templePackage;
-      description = "The temple package providing the temple binary.";
     };
 
     server = mkOption {
       type = types.str;
       default = "https://temple.ethanwtodd.com";
-      description = "Temple server WebSocket URL.";
     };
 
     userDaemons = mkOption {
       type = types.listOf types.str;
       default = [ ];
       example = [ "e-play" "e-work" ];
-      description = "System usernames to run daemons for.";
     };
   };
 
-  config = mkIf cfg.enable (
-    map (name:
+  config = mkIf cfg.enable {
+    systemd.services = listToAttrs (map (name:
       nameValuePair "temple-daemon-${name}" {
         description = "temple headless daemon — ${name}";
         wantedBy = [ "multi-user.target" ];
@@ -87,6 +83,6 @@ in
           RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
         };
       }
-    ) cfg.userDaemons
-  );
+    ) cfg.userDaemons);
+  };
 }
