@@ -63,10 +63,10 @@ in
     modelEndpoints = mkOption {
       type = types.attrsOf types.str;
       default = {
-        "deepseek-v4-flash-high" = "http://son-of-anton:8000/v1";
-        "qwen3.6-27b-coding" = "http://anton:8000/v1";
-        "gemma-4-31b" = "http://anton:8000/v1";
-        "gemma-4-12b-router" = "http://son-of-anton:8000/v1";
+        "deepseek-v4-flash-high" = "http://son-of-anton:8080/v1";
+        "qwen3.6-27b-coding" = "http://anton:8080/v1";
+        "gemma-4-31b" = "http://anton:8080/v1";
+        "gemma-4-12b-router" = "http://son-of-anton:8080/v1";
       };
       description = "Per-model llama-swap endpoint URLs (model name → base URL).";
     };

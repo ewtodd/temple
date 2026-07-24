@@ -140,11 +140,11 @@ impl Default for Config {
             model_endpoints: HashMap::from([
                 (
                     "deepseek-v4-flash-high".into(),
-                    "http://son-of-anton:8000".into(),
+                    "http://son-of-anton:8080/v1".into(),
                 ),
-                ("qwen3-4b-instruct".into(), "http://anton:8000".into()),
-                ("qwen3.6-27b-coding".into(), "http://anton:8000".into()),
-                ("gemma-4-31b".into(), "http://anton:8000".into()),
+                ("qwen3-4b-instruct".into(), "http://anton:8080/v1".into()),
+                ("qwen3.6-27b-coding".into(), "http://anton:8080/v1".into()),
+                ("gemma-4-31b".into(), "http://anton:8080/v1".into()),
             ]),
             model_api_keys: HashMap::new(),
             db_path: PathBuf::from("./temple-memory.db"),
