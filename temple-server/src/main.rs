@@ -141,16 +141,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let litellm = litellm::LiteLLM::new(&cfg.litellm_url, &api_key);
     let mcp = mcp::McpClient::new(&cfg.litellm_url, &api_key);
 
+    // Initialize integrations
+    let signal = Arc::new(signal::Signal::new(&cfg.signal));
+    let nextcloud = Arc::new(Mutex::new(nextcloud::Nextcloud::new(&cfg.nextcloud)));
+
     // Initialize agent
-    let agent = agent::Agent::new(litellm, mcp, memory.clone(), cfg.models.clone());
+    let agent = agent::Agent::new(
+        litellm,
+        mcp,
+        memory.clone(),
+        cfg.models.clone(),
+        nextcloud.clone(),
+    );
     let agent = Arc::new(agent);
 
     // Load tools (local + MCP)
     agent.refresh_tools().await;
-
-    // Initialize integrations
-    let signal = Arc::new(signal::Signal::new(&cfg.signal));
-    let nextcloud = Arc::new(Mutex::new(nextcloud::Nextcloud::new(&cfg.nextcloud)));
 
     // Signal two-way loop: inbound messages → agent → outbound reply
     if cfg.signal.enabled {

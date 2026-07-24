@@ -333,6 +333,48 @@ impl DirectTools {
             Err(e) => Err(format!("rg error: {e}")),
         }
     }
+
+    /// Run ast-grep (tree-sitter structured pattern search) in the given
+    /// directory. Falls back gracefully if sg is not installed.
+    pub fn ast_grep(
+        cwd: &str,
+        pattern: &str,
+        language: &str,
+        max_results: usize,
+    ) -> Result<String, String> {
+        let mut cmd = std::process::Command::new("sg");
+        cmd.args(["--pattern", pattern, "--lang", language])
+            .current_dir(cwd);
+        let output = cmd.output();
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                if stdout.is_empty() && !o.status.success() {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    return Err(format!("sg failed: {}", stderr));
+                }
+                if stdout.is_empty() {
+                    return Ok(format!(
+                        "No matches for pattern in {} (lang: {language})",
+                        cwd
+                    ));
+                }
+                let lines: Vec<&str> = stdout.lines().take(max_results).collect();
+                let mut out = lines.join("\n");
+                if stdout.lines().count() > max_results {
+                    out.push_str(&format!(
+                        "\n…[{} more matches truncated]",
+                        stdout.lines().count() - max_results
+                    ));
+                }
+                Ok(out)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err("ast-grep (sg) is not installed. Install it for structured code search.".into())
+            }
+            Err(e) => Err(format!("sg error: {e}")),
+        }
+    }
 }
 
 fn strip_html(html: &str) -> String {

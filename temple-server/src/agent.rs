@@ -193,6 +193,7 @@ pub struct Agent {
     /// Active daemon connections: username → count (multiple sessions per user).
     /// Used for Signal sandboxing — users without a daemon get restricted tools.
     daemon_connections: Mutex<HashMap<String, u32>>,
+    pub nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
     /// Pending web authentication: code → (tx_channel, expiry).
     /// The tx channel is used to notify the WebSocket connection when
     /// verification succeeds via Signal.
@@ -208,7 +209,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(litellm: LiteLLM, mcp: McpClient, memory: Arc<Memory>, models: ModelConfig) -> Self {
+    pub fn new(
+        litellm: LiteLLM,
+        mcp: McpClient,
+        memory: Arc<Memory>,
+        models: ModelConfig,
+        nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
+    ) -> Self {
         Self {
             litellm,
             mcp,
@@ -227,6 +234,7 @@ impl Agent {
             ),
             tools: Mutex::new(Vec::new()),
             daemon_connections: Mutex::new(HashMap::new()),
+            nextcloud,
             pending_web_auth: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -2546,6 +2554,39 @@ Git conventions:
                 Ok(out.trim_end().to_string())
             }
 
+            "ast_grep" | "ast-grep" => {
+                let pattern = args["pattern"]
+                    .as_str()
+                    .ok_or("ast_grep: missing pattern")?;
+                let lang = args["language"].as_str().unwrap_or("rust");
+                let cwd = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into())
+                };
+                crate::direct_tools::DirectTools::ast_grep(&cwd, pattern, lang, 50)
+            }
+            "calendar_events" => {
+                let nc = self.nextcloud.lock().await;
+                if !nc.enabled() {
+                    return Err("calendar: Nextcloud not configured".into());
+                }
+                let events = nc
+                    .get_today_events()
+                    .await
+                    .map_err(|e| format!("calendar: {e}"))?;
+                if events.is_empty() {
+                    return Ok("No events scheduled for today.".into());
+                }
+                let mut out = String::from("Today's events:\n");
+                for e in &events {
+                    out.push_str(&format!("- {e}\n"));
+                }
+                Ok(out.trim_end().to_string())
+            }
+
             _ => self.mcp.call_tool(name, args).await,
         }
     }
@@ -2929,6 +2970,32 @@ fn local_tools() -> Vec<ToolDefinition> {
                     "properties": {
                         "path": {"type": "string", "description": "Path to the image file (png, jpg, gif, webp, bmp)."},
                     },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "ast_grep".into(),
+                description: "Search code using tree-sitter AST patterns via ast-grep. Provide a pattern (like 'function $NAME($$$ARGS) { $$$BODY }') and language. More precise than regex for code structure queries.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["pattern", "language"],
+                    "properties": {
+                        "pattern": {"type": "string", "description": "ast-grep pattern (e.g. 'fn $NAME($$$) { $$$ }' for Rust functions)."},
+                        "language": {"type": "string", "description": "Language identifier (rust, python, nix, javascript, typescript, go, etc.)."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "calendar_events".into(),
+                description: "Get today's calendar events from Nextcloud CalDAV. Returns a list of scheduled events for the current day.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
                 }),
             },
         },
