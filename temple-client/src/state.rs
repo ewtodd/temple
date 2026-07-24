@@ -110,6 +110,8 @@ pub struct AppState {
     pub mode: PermissionMode,
     /// Available models for tab-completion (populated on connect + /model)
     pub available_models: Vec<String>,
+    /// Session search overlay: active + search text
+    pub session_search: Option<String>,
 }
 
 impl AppState {
@@ -139,6 +141,7 @@ impl AppState {
             last_total: 0,
             mode: PermissionMode::Default,
             available_models: Vec::new(),
+            session_search: None,
         }
     }
 }

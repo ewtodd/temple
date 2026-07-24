@@ -352,6 +352,77 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
     // Status
     draw_status(f, s, status_area, tick_count);
 
+    // Session search overlay (Ctrl+F)
+    if let Some(ref search) = s.session_search {
+        let sessions = &s.last_sessions;
+        let filtered: Vec<&temple_protocol::SessionMeta> = if search.is_empty() {
+            sessions.iter().collect()
+        } else {
+            sessions
+                .iter()
+                .filter(|m| {
+                    let label = format!(
+                        "{} — {}",
+                        m.ssh_target.as_deref().unwrap_or("local"),
+                        m.title.as_deref().unwrap_or("(untitled)")
+                    );
+                    label.to_lowercase().contains(&search.to_lowercase())
+                })
+                .collect()
+        };
+
+        let max_h = (filtered.len() + 3).min(16);
+        let popup_w = (f.area().width as usize / 2).min(60).max(30);
+        let popup_h = max_h as u16;
+        let popup_x = (f.area().width.saturating_sub(popup_w as u16)) / 2;
+        let popup_y = (f.area().height.saturating_sub(popup_h)) / 2;
+        let popup_area = Rect {
+            x: popup_x,
+            y: popup_y,
+            width: popup_w as u16,
+            height: popup_h,
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(format!(
+                " sessions ({} matches) — Ctrl+F to close ",
+                filtered.len()
+            ))
+            .border_style(Style::default().fg(Color::Cyan));
+        f.render_widget(block.clone(), popup_area);
+
+        let inner = block.inner(popup_area);
+        let lines: Vec<Line> = if filtered.is_empty() {
+            vec![Line::from(Span::styled(
+                " no matching sessions",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            filtered
+                .iter()
+                .map(|m| {
+                    let host = m.ssh_target.as_deref().unwrap_or("local");
+                    let title = m.title.as_deref().unwrap_or("(untitled)");
+                    let id8: String = m.id.simple().to_string().chars().take(8).collect();
+                    Line::from(vec![
+                        Span::styled(format!(" {id8}  "), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{host}"), Style::default().fg(Color::Cyan)),
+                        Span::styled(format!(" — {title}"), Style::default().fg(Color::White)),
+                    ])
+                })
+                .collect()
+        };
+        f.render_widget(Paragraph::new(lines), inner);
+
+        // Clear the fg color for subsequent rendering
+        f.buffer_mut().set_style(
+            popup_area,
+            Style::default().bg(Color::Reset).fg(Color::Reset),
+        );
+    }
+
     (prompt_area, visible_text)
 }
 

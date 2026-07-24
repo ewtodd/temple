@@ -233,7 +233,62 @@ fn handle_key_event(
         }
     }
 
+    // ── Session search overlay (Ctrl+F) ──
+    if s.session_search.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                s.session_search = None;
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                s.session_search = None;
+            }
+            KeyCode::Enter => {
+                if let Some(ref search) = s.session_search {
+                    let search = search.clone();
+                    let sid = s
+                        .last_sessions
+                        .iter()
+                        .find(|m| {
+                            let label = format!(
+                                "{} — {}",
+                                m.ssh_target.as_deref().unwrap_or("local"),
+                                m.title.as_deref().unwrap_or("(untitled)")
+                            );
+                            label.to_lowercase().contains(&search.to_lowercase())
+                        })
+                        .map(|m| m.id);
+                    s.session_search = None;
+                    if let Some(id) = sid {
+                        cmd_tx
+                            .send(ClientMessage::ResumeSession { session_id: id })
+                            .ok();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut s) = s.session_search {
+                    s.pop();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(ref mut s) = s.session_search {
+                    s.push(c);
+                }
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     match key.code {
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Fetch sessions if none loaded, then open search
+            if s.last_sessions.is_empty() {
+                cmd_tx.send(ClientMessage::ListSessions).ok();
+            }
+            s.session_search = Some(String::new());
+            return true;
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             cmd_tx
                 .send(ClientMessage::CancelChat {

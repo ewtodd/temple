@@ -276,7 +276,7 @@ impl Agent {
         map.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
         if let Some((tx, _)) = map.remove(code) {
             let session_id = uuid::Uuid::new_v4();
-            use crate::router::SessionKind;
+            
             self.open_session(
                 session_id,
                 username,
