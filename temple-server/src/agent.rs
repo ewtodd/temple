@@ -276,7 +276,7 @@ impl Agent {
         map.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
         if let Some((tx, _)) = map.remove(code) {
             let session_id = uuid::Uuid::new_v4();
-            
+
             self.open_session(
                 session_id,
                 username,
@@ -577,6 +577,7 @@ impl Agent {
             id: session_id,
             title: row.title.clone(),
             ssh_target: row.ssh_target.clone(),
+            username: row.username.clone(),
             cwd: row.cwd.clone(),
             mode: row.mode.clone(),
             updated_at: String::new(),

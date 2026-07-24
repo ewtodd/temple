@@ -565,10 +565,6 @@ Commands:                     Keys:
                 cmd_tx
                     .send(ClientMessage::DeleteSession { session_id: sid })
                     .ok();
-                s.entries.push(crate::state::ChatEntry::System(format!(
-                    "deleted session {}",
-                    sid.simple().to_string().chars().take(8).collect::<String>()
-                )));
             } else {
                 s.entries.push(crate::state::ChatEntry::System(format!(
                     "no session at index {idx}"

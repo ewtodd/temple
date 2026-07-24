@@ -252,6 +252,7 @@ pub struct SessionMeta {
     pub id: Uuid,
     pub title: Option<String>,
     pub ssh_target: Option<String>,
+    pub username: String,
     pub cwd: String,
     pub mode: String,
     pub updated_at: String,

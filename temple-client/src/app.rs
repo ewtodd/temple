@@ -441,11 +441,7 @@ impl App {
                                     let target_w = sessions
                                         .iter()
                                         .map(|m| {
-                                            m.ssh_target
-                                                .as_deref()
-                                                .unwrap_or("quick")
-                                                .chars()
-                                                .count()
+                                            m.username.chars().count()
                                         })
                                         .max()
                                         .unwrap_or(5)
@@ -458,18 +454,14 @@ impl App {
                                             .chars()
                                             .take(8)
                                             .collect();
-                                        let target = m
-                                            .ssh_target
-                                            .as_deref()
-                                            .unwrap_or("quick");
                                         let title = m
                                             .title
                                             .as_deref()
                                             .unwrap_or("(untitled)");
-                                        let target_padded =
-                                            format!("{target:<width$}", width = target_w);
+                                        let user_padded =
+                                            format!("{:<width$}", m.username, width = target_w);
                                         s.entries.push(ChatEntry::System(format!(
-                                            "  [{i}] {id8} \u{b7} {target_padded} \u{b7} {title}"
+                                            "  [{i}] {id8} \u{b7} {user_padded} \u{b7} {title}"
                                         )));
                                     }
                                     s.entries.push(ChatEntry::System(
@@ -508,7 +500,7 @@ impl App {
                                 s.selection = None;
                                 s.sel_anchor = None;
                                 s.entries.push(ChatEntry::System(format!(
-                                    "\u{1F4CB} session {target} \u{b7} {title}"
+                                    "session {target} \u{b7} {title}"
                                 )));
                                 for (role, content) in transcript {
                                     if role == "user" {

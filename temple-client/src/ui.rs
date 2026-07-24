@@ -363,7 +363,7 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
                 .filter(|m| {
                     let label = format!(
                         "{} — {}",
-                        m.ssh_target.as_deref().unwrap_or("local"),
+                        m.username,
                         m.title.as_deref().unwrap_or("(untitled)")
                     );
                     label.to_lowercase().contains(&search.to_lowercase())
@@ -386,10 +386,7 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(format!(
-                " sessions ({} matches) — Ctrl+F to close ",
-                filtered.len()
-            ))
+            .title(" sessions — Ctrl+F to close ".to_string())
             .border_style(Style::default().fg(Color::Cyan));
         f.render_widget(block.clone(), popup_area);
 
@@ -403,12 +400,11 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
             filtered
                 .iter()
                 .map(|m| {
-                    let host = m.ssh_target.as_deref().unwrap_or("local");
                     let title = m.title.as_deref().unwrap_or("(untitled)");
                     let id8: String = m.id.simple().to_string().chars().take(8).collect();
                     Line::from(vec![
                         Span::styled(format!(" {id8}  "), Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("{host}"), Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("{}", m.username), Style::default().fg(Color::Cyan)),
                         Span::styled(format!(" — {title}"), Style::default().fg(Color::White)),
                     ])
                 })
