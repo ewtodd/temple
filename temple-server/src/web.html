@@ -18,6 +18,19 @@
   --magenta: #bc8cff;
   --blue: #58a6ff;
 }
+:root.light {
+  --bg: #ffffff;
+  --surface: #f6f8fa;
+  --border: #d0d7de;
+  --text: #1f2328;
+  --dim: #656d76;
+  --cyan: #0969da;
+  --green: #1a7f37;
+  --red: #cf222e;
+  --yellow: #9a6700;
+  --magenta: #8250df;
+  --blue: #0969da;
+}
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
@@ -118,7 +131,7 @@ header .status { font-size: 12px; color: var(--dim); }
 .msg.system { color: var(--dim); font-style: italic; font-size: 12px; align-self: center; padding: 2px 8px; background: none; max-width: 95%; }
 .msg.error { color: var(--red); align-self: center; font-size: 12px; background: none; }
 .msg.tool { color: var(--yellow); align-self: center; font-size: 11px; background: none; padding: 2px 8px; }
-.msg pre { background: #0d1117; padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 4px 0; border: 1px solid var(--border); }
+.msg pre { background: var(--bg); padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 4px 0; border: 1px solid var(--border); }
 .msg code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
 .msg p { margin: 4px 0; }
 .msg p:first-child { margin-top: 0; }
@@ -225,6 +238,7 @@ footer {
     <div class="logo">temple · renco</div>
   </div>
   <div class="status-row">
+    <button class="hamburger" onclick="toggleTheme()" title="toggle theme" style="margin-right:4px">◐</button>
     <span class="status" id="status">connecting…</span>
   </div>
 </header>
@@ -536,6 +550,7 @@ function renderDocs(docs) {
 function uploadFile(event) {
   const file = event.target.files[0];
   if (!file || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const isImg = file.type.startsWith('image/');
   const reader = new FileReader();
   reader.onload = () => {
     ws.send(JSON.stringify({
@@ -544,10 +559,83 @@ function uploadFile(event) {
       content: reader.result,
       mime_type: file.type || 'text/plain'
     }));
+    if (isImg) addMsg('system', `uploaded image: ${file.name}`);
     setTimeout(loadSessions, 500);
   };
-  reader.readAsText(file);
+  reader[isImg ? 'readAsDataURL' : 'readAsText'](file);
 }
+
+// --- image paste ---
+document.addEventListener('paste', (e) => {
+  if (!sessionId) return;
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        addMsg('system', `pasted image: ${file.name || 'clipboard.png'}`);
+        ws.send(JSON.stringify({
+          type: 'UploadDocument',
+          filename: file.name || `paste_${Date.now()}.png`,
+          content: reader.result,
+          mime_type: file.type
+        }));
+        setTimeout(loadSessions, 500);
+      };
+      reader.readAsDataURL(file);
+      break;
+    }
+  }
+});
+
+// --- theme ---
+function toggleTheme() {
+  document.documentElement.classList.toggle('light');
+  localStorage.setItem('temple-theme', document.documentElement.classList.contains('light') ? 'light' : 'dark');
+}
+(function() {
+  if (localStorage.getItem('temple-theme') === 'light') document.documentElement.classList.add('light');
+})();
+
+// --- notifications ---
+function notify(title, body) {
+  if (Notification.permission === 'granted') {
+    new Notification(title, { body, icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">\u{26E9}</text></svg>' });
+  }
+}
+function ensureNotify() {
+  if (Notification.permission === 'default') Notification.requestPermission();
+}
+
+// --- keyboard shortcuts ---
+document.addEventListener('keydown', (e) => {
+  const t = e.target.tagName;
+  if (t === 'INPUT' || t === 'TEXTAREA') {
+    if (e.key === 'Enter' && e.ctrlKey && sessionId) {
+      document.getElementById('input-row').dispatchEvent(new Event('submit'));
+    }
+    return;
+  }
+  if (e.key === 'k' && e.ctrlKey) { e.preventDefault(); toggleSidebar(); }
+  if (e.key === 'Escape') { if (sidebarOpen) toggleSidebar(); }
+});
+
+// --- handle update for notifications ---
+const origHandle = handle;
+handle = function(msg) {
+  origHandle(msg);
+  if (msg.type === 'ChatStats') {
+    ensureNotify();
+    if (document.hidden) notify('renco', 'Response ready');
+  }
+  if (msg.type === 'ChatError' && document.hidden) {
+    ensureNotify();
+    notify('renco', msg.error);
+  }
+};
 
 connect();
 </script>
