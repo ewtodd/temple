@@ -39,6 +39,10 @@ let
       researcher_model = cfg.researcherModel;
       router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
     };
+    tls = {
+      cert = cfg.tlsCertFile;
+      key = cfg.tlsKeyFile;
+    };
   });
 
   port = toString (lib.last (lib.splitString ":" cfg.listen));
@@ -128,6 +132,20 @@ in
       type = types.path;
       default = "/var/lib/temple";
       description = "State directory: memory DB, tokens, authorized keys.";
+    };
+
+    tlsCertFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = "/var/lib/acme/temple.ethanwtodd.com/fullchain.pem";
+      description = "PEM certificate file for TLS (e.g. from ACME).";
+    };
+
+    tlsKeyFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = "/var/lib/acme/temple.ethanwtodd.com/key.pem";
+      description = "PEM private key file for TLS (e.g. from ACME).";
     };
 
     environmentFile = mkOption {

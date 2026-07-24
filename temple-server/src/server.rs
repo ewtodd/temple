@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use temple_protocol::*;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -8,6 +9,9 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
 use crate::memory::Memory;
+
+trait WebSocketStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> WebSocketStream for T {}
 use crate::permissions::PermissionScope;
 
 pub async fn run_server(
@@ -17,6 +21,11 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&config.listen).await?;
     tracing::info!("Temple server listening on {}", config.listen);
+
+    let tls_acceptor = config.tls.acceptor()?;
+    if tls_acceptor.is_some() {
+        tracing::info!("TLS enabled");
+    }
 
     // Keep-alive: ping the warm model every 30s so llamaswap doesn't unload it
     let keep_alive = agent.clone();
@@ -35,9 +44,10 @@ pub async fn run_server(
         let agent = agent.clone();
         let memory = memory.clone();
         let config = config.clone();
+        let acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, agent, memory, config).await {
+            if let Err(e) = handle_connection(stream, agent, memory, config, acceptor).await {
                 tracing::error!("connection error: {e}");
             }
         });
@@ -49,12 +59,20 @@ async fn handle_connection(
     agent: Arc<Agent>,
     memory: Arc<Memory>,
     config: Arc<Config>,
+    tls: Option<tokio_native_tls::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Auth is handled at session-open time via daemon_pubkey verification.
     // All connections are accepted; unauthenticated clients cannot create
     // sessions with tools (the OpenSession handler rejects invalid pubkeys).
     let mut auth_owner: Option<String> = None;
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let ws = if let Some(a) = tls {
+        let tls_stream = a.accept(stream).await?;
+        let boxed: Box<dyn WebSocketStream> = Box::new(tls_stream);
+        tokio_tungstenite::accept_async(boxed).await?
+    } else {
+        let boxed: Box<dyn WebSocketStream> = Box::new(stream);
+        tokio_tungstenite::accept_async(boxed).await?
+    };
 
     // Split into independent read/write halves — no shared mutex, no deadlock.
     let (mut ws_write, mut ws_read) = ws.split();
