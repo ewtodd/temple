@@ -302,6 +302,7 @@ in
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
       (lib.toIntBase10 port)
+      8080
     ];
   };
 }
