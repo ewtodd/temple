@@ -64,6 +64,7 @@ async fn handle_connection(
     let mut permissions: Option<Arc<Mutex<PermissionScope>>> = None;
     let mut client_cwd: Option<String> = None;
     let mut daemon_username: Option<String> = None;
+    let mut daemon_owner: Option<String> = None;
 
     // Writer task: forwards channel messages to the socket
     let send_task = tokio::spawn(async move {
@@ -114,9 +115,10 @@ async fn handle_connection(
                 if let Some(ref pubkey) = open.daemon_pubkey {
                     match verify_daemon_pubkey(pubkey) {
                         Some(owner) => {
-                            auth_owner = Some(owner);
+                            auth_owner = Some(owner.clone());
                             daemon_username = Some(open.username.clone());
-                            agent.register_daemon(&open.username).await;
+                            daemon_owner = Some(owner.clone());
+                            agent.register_daemon(&owner).await;
                         }
                         None => {
                             let _ = tx.send(ServerMessage::ChatError {
@@ -568,8 +570,8 @@ async fn handle_connection(
     if session_id != Uuid::nil() {
         agent.close_session(session_id).await;
     }
-    if let Some(username) = &daemon_username {
-        agent.unregister_daemon(username).await;
+    if let Some(owner) = &daemon_owner {
+        agent.unregister_daemon(owner).await;
     }
     send_task.abort();
     Ok(())
