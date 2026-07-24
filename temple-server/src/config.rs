@@ -120,6 +120,23 @@ pub struct CronConfig {
     pub skills_extract: String,
     pub flake_update: String,
     pub self_maintenance: String,
+    /// Per-user cron jobs. Map of username → list of cron job definitions.
+    #[serde(default)]
+    pub user_cron: std::collections::HashMap<String, Vec<UserCronJob>>,
+}
+
+/// A user-specific cron job that runs an agent prompt on a schedule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UserCronJob {
+    pub name: String,
+    /// Cron schedule expression (5-field: "min hour dom month dow")
+    pub schedule: String,
+    /// System prompt given to the agent for this job
+    pub system_prompt: String,
+    /// Optional state file path (relative to data dir) that the agent can
+    /// read from and write to across invocations
+    #[serde(default)]
+    pub state_file: Option<String>,
 }
 
 impl Default for CronConfig {
@@ -128,6 +145,7 @@ impl Default for CronConfig {
             skills_extract: "0 3 * * *".into(),
             flake_update: "0 4 * * *".into(),
             self_maintenance: "0 5 * * 0".into(),
+            user_cron: std::collections::HashMap::new(),
         }
     }
 }

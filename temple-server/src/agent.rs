@@ -802,6 +802,17 @@ impl Agent {
         self.sessions.lock().await.remove(&session_id);
     }
 
+    /// Make a session persist to the DB, with an optional account tag.
+    pub async fn set_session_persisted(&self, session_id: Uuid, account: Option<String>) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(&session_id) {
+            s.persist = true;
+            if let Some(acct) = account {
+                s.account = Some(acct);
+            }
+        }
+    }
+
     /// Cancel an in-progress agent loop for this session.
     pub async fn cancel_chat(&self, session_id: Uuid) {
         if let Some((_, token)) = self.cancel_tokens.lock().await.remove(&session_id) {

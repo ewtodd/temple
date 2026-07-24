@@ -44,6 +44,7 @@ pub struct CronScheduler {
     signal: Arc<Signal>,
     #[allow(dead_code)] // Reserved for upcoming calendar-aware cron jobs.
     nextcloud: Arc<Mutex<Nextcloud>>,
+    config: Arc<crate::config::Config>,
 }
 
 impl CronScheduler {
@@ -53,12 +54,14 @@ impl CronScheduler {
         signal: Arc<Signal>,
         #[allow(dead_code)] // Reserved for upcoming calendar-aware cron jobs.
         nextcloud: Arc<Mutex<Nextcloud>>,
+        config: Arc<crate::config::Config>,
     ) -> Self {
         Self {
             agent,
             memory,
             signal,
             nextcloud,
+            config,
         }
     }
 
@@ -383,6 +386,81 @@ impl CronScheduler {
         Ok(())
     }
 
+    /// Run user-specific cron jobs defined in the config.
+    pub async fn run_user_cron(&self) {
+        if self.config.cron.user_cron.is_empty() {
+            return;
+        }
+        let now = chrono::Local::now();
+        let hm = now.format("%H:%M").to_string();
+        let weekday = now.weekday().num_days_from_sunday();
+
+        for (username, jobs) in &self.config.cron.user_cron {
+            for job in jobs {
+                if !cron_matches(&job.schedule, &hm, weekday) {
+                    continue;
+                }
+                tracing::info!("user cron: running '{}' for {username}", job.name);
+
+                let mut prompt = job.system_prompt.clone();
+                if let Some(ref sf) = job.state_file {
+                    let cwd = self.config.data_dir_workspace();
+                    let state_path = std::path::PathBuf::from(&cwd).join(sf);
+                    if let Ok(existing) = tokio::fs::read_to_string(&state_path).await {
+                        prompt.push_str("\n\n## Current state from previous runs\n");
+                        prompt.push_str(&existing.chars().take(2000).collect::<String>());
+                    }
+                }
+
+                let req = crate::litellm::ChatRequest {
+                    model: self.agent.models.default_model.clone(),
+                    messages: vec![crate::litellm::ChatMessage::system(&prompt)],
+                    tools: None,
+                    stream: Some(false),
+                    stream_options: None,
+                    max_tokens: Some(1024),
+                    temperature: Some(0.2),
+                };
+
+                match self.agent.litellm.chat(req).await {
+                    Ok(resp) => {
+                        if let Some(choice) = resp.choices.first() {
+                            if let Some(content) = choice.message.content_text() {
+                                tracing::info!(
+                                    "user cron: '{}' response: {}",
+                                    job.name,
+                                    content.chars().take(100).collect::<String>()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("user cron: '{}' for {username} failed: {e}", job.name);
+                    }
+                }
+
+                // Update state file with run timestamp
+                if let Some(ref sf) = job.state_file {
+                    let cwd = self.config.data_dir_workspace();
+                    let state_path = std::path::PathBuf::from(&cwd).join(sf);
+                    if let Some(parent) = state_path.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+                    let entry =
+                        format!("## {}\nRun: {}\n\n", job.name, now.format("%Y-%m-%d %H:%M"));
+                    if let Ok(existing) = tokio::fs::read_to_string(&state_path).await {
+                        tokio::fs::write(&state_path, format!("{entry}\n{existing}"))
+                            .await
+                            .ok();
+                    } else {
+                        tokio::fs::write(&state_path, &entry).await.ok();
+                    }
+                    tracing::info!("user cron: updated state file '{}'", sf);
+                }
+            }
+        }
+    }
+
     pub async fn run_forever(&self) -> Result<(), String> {
         // Track last-run dates so a job that misses its window (long model
         // call, server restart) still runs once that day instead of being
@@ -429,7 +507,59 @@ impl CronScheduler {
                 }
             }
 
+            // Run per-user cron jobs every minute
+            self.run_user_cron().await;
+
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     }
+}
+
+/// Simple cron expression matcher. Parses "min hour dom month dow" fields
+/// and checks if they match the current time. Returns true for wildcards (*).
+fn cron_matches(expr: &str, hm: &str, weekday: u32) -> bool {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() < 2 {
+        return false;
+    }
+    let parts: Vec<&str> = hm.split(':').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let cur_min: u32 = parts[1].parse().unwrap_or(0);
+    let cur_hour: u32 = parts[0].parse().unwrap_or(0);
+
+    let min_matches = cron_field_matches(fields[0], cur_min);
+    let hour_matches = cron_field_matches(fields[1], cur_hour);
+    if !min_matches || !hour_matches {
+        return false;
+    }
+    if fields.len() > 2 && fields[2] != "*" {
+        return false; // dom/day-of-month not supported yet
+    }
+    if fields.len() > 3 && fields[3] != "*" {
+        return false; // month not supported yet
+    }
+    if fields.len() > 4 && fields[4] != "*" {
+        let dow_match = cron_field_matches(fields[4], weekday);
+        if !dow_match {
+            return false;
+        }
+    }
+    true
+}
+
+fn cron_field_matches(field: &str, value: u32) -> bool {
+    if field == "*" {
+        return true;
+    }
+    if let Ok(n) = field.parse::<u32>() {
+        return n == value;
+    }
+    if let Some((start, end)) = field.split_once('-') {
+        let s: u32 = start.parse().unwrap_or(0);
+        let e: u32 = end.parse().unwrap_or(60);
+        return value >= s && value <= e;
+    }
+    false
 }

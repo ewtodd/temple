@@ -29,14 +29,17 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                 sep.clone(),
                 Style::default().fg(Color::DarkGray),
             )));
+            lines.push(Line::from(Span::styled(String::new(), Style::default())));
         }
 
         match entry {
             ChatEntry::User(text) => {
-                lines.push(Line::from(Span::styled(
-                    " you",
-                    Style::default().fg(Color::Blue),
-                )));
+                lines.push(Line::from(vec![Span::styled(
+                    "  you",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )]));
                 for l in render_markdown_lite(text, content_width.saturating_sub(2)) {
                     let color = match l.kind {
                         LineKind::Code => Color::Gray,
@@ -51,14 +54,16 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
             ChatEntry::Assistant { content, stats } => {
                 let model_tag = s.model.as_str();
                 let header = if model_tag.is_empty() {
-                    " renco".to_string()
+                    "  renco".to_string()
                 } else {
-                    format!(" renco \u{b7} {model_tag}")
+                    format!("  renco \u{b7} {model_tag}")
                 };
-                lines.push(Line::from(Span::styled(
+                lines.push(Line::from(vec![Span::styled(
                     header,
-                    Style::default().fg(Color::Green),
-                )));
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )]));
                 let body = render_markdown_lite(content, content_width.saturating_sub(2));
                 for l in body.iter() {
                     let color = match l.kind {
@@ -326,7 +331,27 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
         let art_area = layout[0];
         let art_text: Vec<Line> = TEMPLE_ART
             .lines()
-            .map(|l| Line::from(Span::raw(l.to_string())))
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 || i == 5 {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(Color::Cyan),
+                    ))
+                } else if i == 7 {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                }
+            })
             .collect();
         f.render_widget(Paragraph::new(art_text), art_area);
         let hint_area = Rect {

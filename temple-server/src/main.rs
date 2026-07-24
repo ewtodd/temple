@@ -1005,6 +1005,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
+                        // Mark non-group sessions as persisted so conversations
+                        // survive restarts and are resumable via /sessions.
+                        if group_id.is_none() {
+                            agent
+                                .set_session_persisted(target_session, Some(username.clone()))
+                                .await;
+                        }
+
                         // Send typing indicator
                         let typing_result = match &group_id {
                             Some(g) => signal.send_typing_group(g).await,
@@ -1269,8 +1277,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let memory = memory.clone();
         let signal = signal.clone();
         let nextcloud = nextcloud.clone();
+        let config = cfg.clone();
         tokio::spawn(async move {
-            let scheduler = cron::CronScheduler::new(agent, memory, signal, nextcloud);
+            let scheduler = cron::CronScheduler::new(agent, memory, signal, nextcloud, config);
             if let Err(e) = scheduler.run_forever().await {
                 tracing::error!("cron error: {e}");
             }
