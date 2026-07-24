@@ -625,6 +625,72 @@ async fn handle_connection(
                     }
                 }
             }
+
+            ClientMessage::ListDocuments => {
+                let owner = auth_owner.clone().unwrap_or_default();
+                match memory.list_documents(&owner, 50).await {
+                    Ok(docs) => {
+                        let metas: Vec<DocMeta> = docs
+                            .into_iter()
+                            .map(|d| DocMeta {
+                                id: d.id,
+                                filename: d.filename,
+                                username: d.username,
+                                mime_type: d.mime_type,
+                                size: d.size,
+                                uploaded_at: d.uploaded_at,
+                            })
+                            .collect();
+                        let _ = tx.send(ServerMessage::DocumentList { documents: metas });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("list documents: {e}"),
+                        });
+                    }
+                }
+            }
+
+            ClientMessage::UploadDocument {
+                filename,
+                content,
+                mime_type,
+            } => {
+                let owner = auth_owner.clone().unwrap_or_default();
+                match memory
+                    .upload_document(&filename, &content, &owner, &mime_type)
+                    .await
+                {
+                    Ok(_id) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("uploaded: {filename}"),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("upload: {e}"),
+                        });
+                    }
+                }
+            }
+
+            ClientMessage::DeleteDocument { id } => {
+                let owner = auth_owner.clone().unwrap_or_default();
+                match memory.delete_document(id, &owner).await {
+                    Ok(_) => {
+                        let _ = tx.send(ServerMessage::DocumentDeleted { id });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id,
+                            error: format!("delete document: {e}"),
+                        });
+                    }
+                }
+            }
         }
     }
 

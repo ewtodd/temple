@@ -80,6 +80,16 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                content TEXT NOT NULL,
+                username TEXT NOT NULL,
+                mime_type TEXT NOT NULL DEFAULT 'text/plain',
+                size INTEGER NOT NULL DEFAULT 0,
+                uploaded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_username ON documents(username);
             ",
         )?;
 
@@ -144,6 +154,21 @@ impl Memory {
         migrate(
             3,
             "ALTER TABLE sessions ADD COLUMN todos TEXT NOT NULL DEFAULT '[]';",
+        )?;
+
+        // Version 4: add documents table for user-uploaded files
+        migrate(
+            4,
+            "CREATE TABLE IF NOT EXISTS documents (\
+                id TEXT PRIMARY KEY,\
+                filename TEXT NOT NULL,\
+                content TEXT NOT NULL,\
+                username TEXT NOT NULL,\
+                mime_type TEXT NOT NULL DEFAULT 'text/plain',\
+                size INTEGER NOT NULL DEFAULT 0,\
+                uploaded_at TEXT NOT NULL\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_documents_username ON documents(username);",
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -599,6 +624,144 @@ impl Memory {
         }
         Ok(results)
     }
+
+    // ── Documents ──
+
+    pub async fn upload_document(
+        &self,
+        filename: &str,
+        content: &str,
+        username: &str,
+        mime_type: &str,
+    ) -> rusqlite::Result<Uuid> {
+        let id = Uuid::new_v4();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO documents (id, filename, content, username, mime_type, size, uploaded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.to_string(),
+                filename,
+                content,
+                username,
+                mime_type,
+                content.len() as i64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub async fn list_documents(
+        &self,
+        username: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<DocRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, username, mime_type, size, uploaded_at \
+             FROM documents WHERE username = ?1 \
+             ORDER BY uploaded_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![username, limit as i64], |row| {
+            Ok(DocRow {
+                id: row.get::<_, String>(0)?.parse().unwrap_or_default(),
+                filename: row.get(1)?,
+                username: row.get(2)?,
+                mime_type: row.get(3)?,
+                size: row.get(4)?,
+                uploaded_at: row.get(5)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows.flatten() {
+            results.push(r);
+        }
+        Ok(results)
+    }
+
+    pub async fn search_documents(
+        &self,
+        username: &str,
+        query: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<DocRow>> {
+        let conn = self.conn.lock().await;
+        let like = format!("%{query}%");
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, username, mime_type, size, uploaded_at \
+             FROM documents WHERE username = ?1 AND (filename LIKE ?2 OR content LIKE ?2) \
+             ORDER BY uploaded_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![username, like, limit as i64], |row| {
+            Ok(DocRow {
+                id: row.get::<_, String>(0)?.parse().unwrap_or_default(),
+                filename: row.get(1)?,
+                username: row.get(2)?,
+                mime_type: row.get(3)?,
+                size: row.get(4)?,
+                uploaded_at: row.get(5)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows.flatten() {
+            results.push(r);
+        }
+        Ok(results)
+    }
+
+    pub async fn get_document(&self, id: Uuid) -> rusqlite::Result<Option<DocFull>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT id, filename, content, username, mime_type, size, uploaded_at \
+             FROM documents WHERE id = ?1",
+            params![id.to_string()],
+            |row| {
+                Ok(DocFull {
+                    id: row.get::<_, String>(0)?.parse().unwrap_or_default(),
+                    filename: row.get(1)?,
+                    content: row.get(2)?,
+                    username: row.get(3)?,
+                    mime_type: row.get(4)?,
+                    size: row.get(5)?,
+                    uploaded_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub async fn delete_document(&self, id: Uuid, username: &str) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "DELETE FROM documents WHERE id = ?1 AND username = ?2",
+            params![id.to_string(), username],
+        )?;
+        Ok(n)
+    }
+}
+
+/// A document stored by a user (Signal/web upload).
+#[derive(Debug, Clone)]
+pub struct DocRow {
+    pub id: Uuid,
+    pub filename: String,
+    pub username: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub uploaded_at: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DocFull {
+    pub id: Uuid,
+    pub filename: String,
+    pub content: String,
+    pub username: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub uploaded_at: String,
 }
 
 /// A session persisted to the DB — survives server restarts, shared

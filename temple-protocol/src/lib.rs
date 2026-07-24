@@ -134,6 +134,18 @@ pub enum ClientMessage {
     WebAuth,
     /// Admin: delete ALL sessions from the database (requires confirmation).
     NukeSessions,
+    /// List uploaded documents for the authenticated user
+    ListDocuments,
+    /// Upload a document (content is base64 or plain text)
+    UploadDocument {
+        filename: String,
+        content: String,
+        mime_type: String,
+    },
+    /// Delete an uploaded document by id
+    DeleteDocument {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +258,14 @@ pub enum ServerMessage {
         username: String,
         session_id: Uuid,
     },
+    /// Uploaded documents for the authenticated user
+    DocumentList {
+        documents: Vec<DocMeta>,
+    },
+    /// Confirmation that a document was deleted
+    DocumentDeleted {
+        id: Uuid,
+    },
 }
 
 /// Summary of a persisted session (for listing and resuming).
@@ -258,6 +278,17 @@ pub struct SessionMeta {
     pub cwd: String,
     pub mode: String,
     pub updated_at: String,
+}
+
+/// Metadata for an uploaded document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocMeta {
+    pub id: Uuid,
+    pub filename: String,
+    pub username: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub uploaded_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

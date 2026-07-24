@@ -2381,6 +2381,62 @@ Git conventions:
                 Ok(rendered)
             }
 
+            "search_documents" => {
+                let query = args["query"].as_str().unwrap_or("");
+                if query.is_empty() {
+                    return Err("search_documents: missing query".into());
+                }
+                let username = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&session_id)
+                        .map(|s| s.username.clone())
+                        .unwrap_or_default()
+                };
+                let results = self
+                    .memory
+                    .search_documents(&username, query, 20)
+                    .await
+                    .map_err(|e| format!("search_documents: {e}"))?;
+                if results.is_empty() {
+                    return Ok("No documents found matching that query.".into());
+                }
+                let mut out = String::new();
+                for d in &results {
+                    out.push_str(&format!(
+                        "{} — {} ({} bytes, {})\n",
+                        d.id.simple(),
+                        d.filename,
+                        d.size,
+                        d.uploaded_at
+                    ));
+                }
+                Ok(out.trim_end().to_string())
+            }
+            "read_document" => {
+                let id_str = args["id"].as_str().ok_or("read_document: missing id")?;
+                let id = uuid::Uuid::parse_str(id_str)
+                    .map_err(|e| format!("read_document: invalid id: {e}"))?;
+                let doc = self
+                    .memory
+                    .get_document(id)
+                    .await
+                    .map_err(|e| format!("read_document: {e}"))?
+                    .ok_or("read_document: document not found")?;
+                let truncated: String = doc.content.chars().take(24000).collect();
+                if truncated.len() < doc.content.len() {
+                    Ok(format!(
+                        "{} ({}) — {} bytes, uploaded {}\n\n{}…[truncated]",
+                        doc.filename, doc.mime_type, doc.size, doc.uploaded_at, truncated
+                    ))
+                } else {
+                    Ok(format!(
+                        "{} ({}) — {} bytes, uploaded {}\n\n{}",
+                        doc.filename, doc.mime_type, doc.size, doc.uploaded_at, truncated
+                    ))
+                }
+            }
+
             _ => self.mcp.call_tool(name, args).await,
         }
     }
@@ -2632,6 +2688,34 @@ fn local_tools() -> Vec<ToolDefinition> {
                                 },
                             },
                         },
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "search_documents".into(),
+                description: "Search uploaded user documents by query. Matches filenames and content.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "description": "Words/terms to search for in document filenames and content."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "read_document".into(),
+                description: "Read a previously uploaded document by its id (from search_documents results).".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "The document id from search_documents results."},
                     },
                 }),
             },

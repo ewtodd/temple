@@ -580,7 +580,9 @@ impl App {
                             | ServerMessage::WebAuthCode { .. }
                             | ServerMessage::WebAuthDone { .. }
                             | ServerMessage::ToolResult { .. }
-                            | ServerMessage::ToolRequest { .. } => {}
+                            | ServerMessage::ToolRequest { .. }
+                            | ServerMessage::DocumentList { .. }
+                            | ServerMessage::DocumentDeleted { .. } => {}
                         }
                     }
                 });

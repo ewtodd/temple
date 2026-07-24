@@ -26,18 +26,82 @@ body {
   height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 header {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  padding: 8px 16px;
+  padding: 6px 12px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-shrink: 0;
+  gap: 8px;
 }
-header h1 { font-size: 14px; font-weight: 600; color: var(--cyan); }
+header .logo {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  color: var(--cyan);
+  line-height: 1.2;
+  white-space: pre;
+  user-select: none;
+}
+header .status-row { display: flex; align-items: center; gap: 8px; }
 header .status { font-size: 12px; color: var(--dim); }
+.hamburger {
+  background: none; border: 1px solid var(--border); border-radius: 4px;
+  color: var(--dim); font-size: 16px; cursor: pointer; padding: 2px 6px;
+  line-height: 1;
+}
+.hamburger:hover { color: var(--cyan); border-color: var(--cyan); }
+#app { display: flex; flex: 1; overflow: hidden; }
+#sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  width: 0;
+  overflow: hidden;
+  transition: width 0.2s;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+#sidebar.open { width: 260px; }
+#sidebar-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cyan);
+  flex-shrink: 0;
+}
+#sidebar-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+#sidebar-list::-webkit-scrollbar { width: 4px; }
+#sidebar-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.sidebar-group {
+  padding: 6px 12px 2px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cyan);
+}
+.sidebar-item {
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none; border: none; color: var(--text);
+  font-family: inherit;
+}
+.sidebar-item:hover { background: var(--border); }
+.sidebar-item .id { color: var(--dim); font-family: monospace; font-size: 11px; margin-right: 6px; }
+.sidebar-item .title { color: var(--text); }
+.sidebar-item .cwd { color: var(--dim); font-size: 10px; display: block; margin-left: 58px; }
+#chat-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 #chat {
   flex: 1;
   overflow-y: auto;
@@ -51,13 +115,39 @@ header .status { font-size: 12px; color: var(--dim); }
 .msg { max-width: 85%; line-height: 1.5; font-size: 13px; padding: 8px 12px; border-radius: 8px; }
 .msg.user { background: var(--blue); color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
 .msg.agent { background: var(--surface); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 2px; }
-.msg.system { color: var(--dim); font-style: italic; font-size: 12px; align-self: center; padding: 2px 8px; background: none; }
-.msg.error { color: var(--red); align-self: center; font-size: 12px; }
-.msg pre { background: #0d1117; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+.msg.system { color: var(--dim); font-style: italic; font-size: 12px; align-self: center; padding: 2px 8px; background: none; max-width: 95%; }
+.msg.error { color: var(--red); align-self: center; font-size: 12px; background: none; }
+.msg.tool { color: var(--yellow); align-self: center; font-size: 11px; background: none; padding: 2px 8px; }
+.msg pre { background: #0d1117; padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 4px 0; border: 1px solid var(--border); }
 .msg code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
 .msg p { margin: 4px 0; }
 .msg p:first-child { margin-top: 0; }
 .msg p:last-child { margin-bottom: 0; }
+.msg ul, .msg ol { margin: 4px 0; padding-left: 20px; }
+.msg li { margin: 2px 0; }
+.msg strong { color: var(--text); }
+.msg em { color: var(--dim); }
+.typing-indicator {
+  display: none;
+  align-self: flex-start;
+  padding: 8px 12px;
+}
+.typing-indicator.active { display: block; }
+.typing-indicator span {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--dim);
+  margin: 0 2px;
+  animation: bounce 1.4s infinite ease-in-out;
+}
+.typing-indicator span:nth-child(1) { animation-delay: 0s; }
+.typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); }
+  40% { transform: translateY(-6px); }
+}
 footer {
   background: var(--surface);
   border-top: 1px solid var(--border);
@@ -107,38 +197,71 @@ footer {
   width: 90%;
 }
 .auth-box h2 { font-size: 18px; margin-bottom: 8px; }
-.auth-box p { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+.auth-box p { color: var(--dim); font-size: 13px; margin-bottom: 16px; }
+.code-row { display: flex; align-items: center; justify-content: center; gap: 8px; }
 .code-display {
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 36px;
   letter-spacing: 8px;
   color: var(--cyan);
-  margin: 16px 0;
-  user-select: all;
-  cursor: pointer;
 }
-.code-display:hover { background: var(--border); border-radius: 6px; }
+.copy-btn {
+  background: var(--border);
+  border: none; border-radius: 4px;
+  color: var(--text); font-size: 11px;
+  padding: 4px 8px; cursor: pointer;
+  transition: background 0.15s;
+}
+.copy-btn:hover { background: var(--cyan); color: #fff; }
+.copy-btn.copied { background: var(--green); color: #fff; }
 .spinner { animation: spin 1s linear infinite; font-size: 24px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
 <header>
-  <h1>⚛ renco</h1>
-  <span class="status" id="status">connecting…</span>
+  <div style="display:flex;align-items:center;gap:8px">
+    <button class="hamburger" onclick="toggleSidebar()" title="sessions">≡</button>
+    <div class="logo">temple · renco</div>
+  </div>
+  <div class="status-row">
+    <span class="status" id="status">connecting…</span>
+  </div>
 </header>
-<div id="chat"></div>
-<footer>
-  <form id="input-row" autocomplete="off">
-    <input id="input" placeholder="message renco…" disabled autofocus>
-    <button id="send" disabled>send</button>
-  </form>
-</footer>
+<div id="app">
+  <div id="sidebar">
+    <div id="sidebar-header">sessions</div>
+    <div id="sidebar-list"><div style="padding:12px;color:var(--dim);font-size:11px">loading…</div></div>
+    <div style="border-top:1px solid var(--border);margin:8px 0 0 0"></div>
+    <div style="padding:6px 12px 2px 12px;font-size:11px;font-weight:600;color:var(--cyan);display:flex;justify-content:space-between;align-items:center">
+      documents
+      <label style="cursor:pointer;font-size:16px;color:var(--dim);line-height:1" title="upload a file">+
+        <input type="file" id="upload-input" style="display:none" onchange="uploadFile(event)">
+      </label>
+    </div>
+    <div id="docs-list"><div style="padding:12px;color:var(--dim);font-size:11px"></div></div>
+  </div>
+  <div id="chat-wrap">
+    <div id="chat"></div>
+    <div class="typing-indicator" id="typing">
+      <span></span><span></span><span></span>
+    </div>
+    <footer>
+      <form id="input-row" autocomplete="off">
+        <input id="input" placeholder="message renco…" disabled autofocus>
+        <button id="send" disabled>send</button>
+      </form>
+    </footer>
+  </div>
+</div>
 <div class="auth-overlay" id="auth">
   <div class="auth-box">
     <h2>verify with Signal</h2>
     <p id="auth-msg">opening connection…</p>
-    <div class="code-display" id="auth-code" style="display:none"></div>
+    <div class="code-row" id="code-row" style="display:none">
+      <div class="code-display" id="auth-code"></div>
+      <button class="copy-btn" id="copy-btn" onclick="copyCode()">copy</button>
+    </div>
     <p style="font-size:11px;color:var(--dim);margin-top:12px">
       text this code to renco on Signal to log in
     </p>
@@ -146,7 +269,7 @@ footer {
 </div>
 <script>
 const WS_URL = `wss://${location.host}`;
-let ws, sessionId, username;
+let ws, sessionId, username, sidebarOpen = false;
 
 function connect() {
   ws = new WebSocket(WS_URL);
@@ -162,6 +285,7 @@ function connect() {
     document.getElementById('status').textContent = 'disconnected';
     document.getElementById('input').disabled = true;
     document.getElementById('send').disabled = true;
+    setTyping(false);
     setTimeout(connect, 2000);
   };
 }
@@ -170,7 +294,7 @@ function handle(msg) {
   switch (msg.type) {
     case 'WebAuthCode':
       document.getElementById('auth-code').textContent = msg.code;
-      document.getElementById('auth-code').style.display = 'block';
+      document.getElementById('code-row').style.display = 'flex';
       document.getElementById('auth-msg').textContent = 'text this code to renco on Signal';
       break;
     case 'WebAuthDone':
@@ -182,43 +306,203 @@ function handle(msg) {
       document.getElementById('send').disabled = false;
       document.getElementById('input').focus();
       addMsg('system', `connected as ${username}`);
+      loadSessions();
       break;
     case 'ChatDelta':
-      if (msg.done) break;
+      if (msg.done) { setTyping(false); break; }
+      setTyping(true);
       appendOrCreate(msg.delta);
       break;
     case 'ToolEvent':
-      if (msg.status === 'Started') addMsg('system', `⟳ ${msg.name}`);
-      else if (msg.status === 'Finished') addMsg('system', `✓ ${msg.name}${msg.detail ? ': ' + msg.detail.split('\n')[0] : ''}`);
-      else if (msg.status === 'Failed') addMsg('error', `✗ ${msg.name}`);
+      setTyping(msg.status === 'Started');
+      if (msg.status === 'Started') addMsg('tool', `\u{27F3} ${msg.name}`);
+      else if (msg.status === 'Finished') addMsg('tool', `\u{2713} ${msg.name}${msg.detail ? ': ' + msg.detail.replace(/\n/g, ' · ') : ''}`);
+      else if (msg.status === 'Failed') addMsg('error', `\u{2717} ${msg.name}`);
       break;
     case 'ChatError':
+      setTyping(false);
       document.getElementById('status').textContent = msg.error;
       break;
     case 'ChatStats':
+      setTyping(false);
       document.getElementById('status').textContent = `ready — ${username}`;
+      break;
+    case 'SessionList':
+      renderSidebar(msg.sessions);
+      break;
+    case 'SessionResumed':
+      sessionId = msg.session_id;
+      document.getElementById('chat').innerHTML = '';
+      addMsg('system', `session: ${msg.meta.title || '(untitled)'}`);
+      for (const [role, content] of msg.transcript) {
+        addMsg(role === 'user' ? 'user' : 'agent', content);
+      }
+      document.getElementById('input').focus();
+      loadSessions();
+      break;
+    case 'TodoUpdate':
+      renderTodos(msg.items);
+      break;
+    case 'Shutdown':
+      addMsg('system', 'server shutdown');
+      setTyping(false);
+      break;
+    case 'DocumentList':
+      renderDocs(msg.documents);
+      break;
+    case 'DocumentDeleted':
+      loadSessions();
       break;
   }
 }
 
+// --- typing indicator ---
+function setTyping(on) {
+  document.getElementById('typing').classList.toggle('active', on);
+}
+
+// --- code copy ---
+function copyCode() {
+  const code = document.getElementById('auth-code').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = 'copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
+  }).catch(() => {
+    document.getElementById('copy-btn').textContent = 'failed';
+  });
+}
+
+// --- sidebar ---
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  document.getElementById('sidebar').classList.toggle('open', sidebarOpen);
+  if (sidebarOpen) loadSessions();
+}
+
+function loadSessions() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'ListSessions' }));
+    ws.send(JSON.stringify({ type: 'ListDocuments' }));
+  }
+}
+
+function renderSidebar(sessions) {
+  const el = document.getElementById('sidebar-list');
+  if (!sessions || sessions.length === 0) {
+    el.innerHTML = '<div style="padding:12px;color:var(--dim);font-size:11px">no sessions</div>';
+    return;
+  }
+  const seen = [];
+  let html = '';
+  for (const s of sessions) {
+    if (!seen.includes(s.username)) {
+      if (seen.length > 0) html += '<div style="border-top:1px solid var(--border);margin:4px 12px"></div>';
+      html += `<div class="sidebar-group">${esc(s.username)}</div>`;
+      seen.push(s.username);
+    }
+    const id8 = s.id.replace(/-/g, '').slice(0, 8);
+    const title = s.title || '(untitled)';
+    const cwd = s.cwd.length > 30 ? '…' + s.cwd.slice(-28) : s.cwd;
+    html += `<button class="sidebar-item" onclick="resumeSession('${s.id}')" title="${esc(s.cwd)}">`;
+    html += `<span class="id">${id8}</span>`;
+    html += `<span class="title">${esc(title)}</span>`;
+    html += `<span class="cwd">${esc(cwd)}</span>`;
+    html += '</button>';
+  }
+  el.innerHTML = html;
+}
+
+function resumeSession(id) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'ResumeSession', session_id: id }));
+  }
+}
+
+function esc(s) {
+  if (!s) return '';
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// --- chat rendering ---
 let currentAgent;
+let accumulatedText = '';
+
 function appendOrCreate(delta) {
   if (!currentAgent) {
     currentAgent = document.createElement('div');
     currentAgent.className = 'msg agent';
     document.getElementById('chat').appendChild(currentAgent);
+    accumulatedText = '';
   }
-  currentAgent.innerHTML += delta.replace(/\n/g, '<br>');
+  accumulatedText += delta;
+  renderMarkdown(currentAgent, accumulatedText);
   document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
 }
+
+function renderMarkdown(el, text) {
+  let html = '';
+  let inCodeBlock = false;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')) {
+      if (inCodeBlock) {
+        html += '</code></pre>';
+        inCodeBlock = false;
+      } else {
+        html += '<pre><code>';
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      html += esc(line) + '\n';
+      continue;
+    }
+    let processed = esc(line);
+    processed = processed.replace(/`([^`]+)`/g, '<code>$1</code>');
+    processed = processed.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    processed = processed.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    html += processed + '<br>';
+  }
+  if (inCodeBlock) html += '</code></pre>';
+  el.innerHTML = html;
+}
+
 function addMsg(cls, text) {
   currentAgent = null;
+  accumulatedText = '';
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
-  d.innerHTML = text.replace(/\n/g, '<br>');
+  if (cls === 'tool' || cls === 'system' || cls === 'error') {
+    d.textContent = text;
+  } else {
+    d.innerHTML = esc(text).replace(/\n/g, '<br>');
+  }
   document.getElementById('chat').appendChild(d);
   document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
 }
+
+function renderTodos(items) {
+  let existing = document.getElementById('todos');
+  if (existing) existing.remove();
+  if (!items || items.length === 0) return;
+  const d = document.createElement('div');
+  d.id = 'todos';
+  d.className = 'msg system';
+  d.style.textAlign = 'left';
+  const done = items.filter(i => i.status === 'done').length;
+  d.innerHTML = `<strong>tasks (${done}/${items.length})</strong><br>`;
+  for (const item of items) {
+    const icon = item.status === 'done' ? '\u{2713}' : item.status === 'in_progress' ? '\u{25B8}' : '\u{25AB}';
+    const color = item.status === 'done' ? 'var(--green)' : item.status === 'in_progress' ? 'var(--yellow)' : 'var(--dim)';
+    d.innerHTML += `<span style="color:${color}">  ${icon} ${esc(item.content)}</span><br>`;
+  }
+  document.getElementById('chat').appendChild(d);
+  document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+}
+
 document.getElementById('input-row').addEventListener('submit', (e) => {
   e.preventDefault();
   const input = document.getElementById('input');
@@ -228,7 +512,43 @@ document.getElementById('input-row').addEventListener('submit', (e) => {
   input.value = '';
   ws.send(JSON.stringify({ type: 'ChatInput', session_id: sessionId, content: text }));
   document.getElementById('status').textContent = 'thinking…';
+  setTyping(true);
 });
+// --- documents ---
+function renderDocs(docs) {
+  const el = document.getElementById('docs-list');
+  if (!docs || docs.length === 0) {
+    el.innerHTML = '<div style="padding:4px 12px;color:var(--dim);font-size:10px">nothing uploaded yet</div>';
+    return;
+  }
+  let html = '';
+  for (const d of docs) {
+    const id8 = d.id.replace(/-/g, '').slice(0, 8);
+    html += `<div class="sidebar-item" style="cursor:default" title="${esc(d.filename)} (${d.size} bytes)">`;
+    html += `<span class="id">${id8}</span>`;
+    html += `<span class="title">${esc(d.filename)}</span>`;
+    html += `<span class="cwd">${d.size} bytes · ${d.uploaded_at.slice(0,10)}</span>`;
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function uploadFile(event) {
+  const file = event.target.files[0];
+  if (!file || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    ws.send(JSON.stringify({
+      type: 'UploadDocument',
+      filename: file.name,
+      content: reader.result,
+      mime_type: file.type || 'text/plain'
+    }));
+    setTimeout(loadSessions, 500);
+  };
+  reader.readAsText(file);
+}
+
 connect();
 </script>
 </body>
