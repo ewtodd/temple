@@ -177,13 +177,13 @@ impl Memory {
             "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(\
                 filename, content, content=documents, content_rowid=rowid\
             );\
-            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN\
+            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN \
                 INSERT INTO documents_fts(rowid, filename, content) VALUES (new.rowid, new.filename, new.content);\
             END;\
-            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN\
+            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN \
                 INSERT INTO documents_fts(documents_fts, rowid, filename, content) VALUES ('delete', old.rowid, old.filename, old.content);\
             END;\
-            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN\
+            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN \
                 INSERT INTO documents_fts(documents_fts, rowid, filename, content) VALUES ('delete', old.rowid, old.filename, old.content);\
                 INSERT INTO documents_fts(rowid, filename, content) VALUES (new.rowid, new.filename, new.content);\
             END;",
