@@ -397,15 +397,33 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {
+            let idx = s.session_search_idx.min(filtered.len().saturating_sub(1));
             filtered
                 .iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(i, m)| {
                     let title = m.title.as_deref().unwrap_or("(untitled)");
                     let id8: String = m.id.simple().to_string().chars().take(8).collect();
+                    let hl = i == idx;
+                    let sid_style = if hl {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let user_style = if hl {
+                        Style::default().bg(Color::DarkGray).fg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let title_style = if hl {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
                     Line::from(vec![
-                        Span::styled(format!(" {id8}  "), Style::default().fg(Color::DarkGray)),
-                        Span::styled(m.username.clone(), Style::default().fg(Color::Cyan)),
-                        Span::styled(format!(" — {title}"), Style::default().fg(Color::White)),
+                        Span::styled(format!(" {id8}  "), sid_style),
+                        Span::styled(m.username.clone(), user_style),
+                        Span::styled(format!(" — {title}"), title_style),
                     ])
                 })
                 .collect()

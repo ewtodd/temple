@@ -453,8 +453,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              /mode [default|ask|lockdown|yolo] — show/set permission mode\n\
                              /stop — interrupt the running request\n\
                              /reset — cancel ALL in-flight requests (admin)\n\
-                             /clear <user|account> — delete sessions for a user (admin)\n\
-                             /targets — list ssh targets\n\
+                             /clear <user|account> \u{2014} delete sessions for a user (admin)\n\
+                              /nuke \u{2014} delete ALL sessions (admin, confirm with /nuke confirm)\n\
+                              /targets \u{2014} list ssh targets\n\
                              /help — this",
                             )
                             .await;
@@ -561,6 +562,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
 
+                        if trimmed == "/nuke confirm" {
+                            let admins = memory.get_admins().await.unwrap_or_default();
+                            let is_admin = admins.iter().any(|(phone, uuid)| {
+                                phone == &sender || uuid.as_deref() == Some(&sender)
+                            });
+                            if !is_admin {
+                                send_conv(&signal, &sender, &group_id, "admin only").await;
+                                return;
+                            }
+                            match memory.nuke_sessions().await {
+                                Ok(count) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("nuked all {count} sessions"),
+                                    )
+                                    .await;
+                                    // Unload in-memory sessions for any account we found
+                                    let _ = agent.cancel_all().await;
+                                }
+                                Err(e) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("nuke error: {e}"),
+                                    )
+                                    .await;
+                                }
+                            }
+                            return;
+                        }
+
+                        if trimmed == "/nuke" {
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                "type /nuke confirm to permanently delete ALL sessions (admin only)",
+                            )
+                            .await;
+                            return;
+                        }
+
                         if trimmed == "/delete" || trimmed.starts_with("/delete ") {
                             let prefix = trimmed
                                 .strip_prefix("/delete")
@@ -652,9 +698,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for r in &rows {
                                         let id8: String =
                                             r.id.simple().to_string().chars().take(8).collect();
-                                        let target = "session";
                                         let title = r.title.as_deref().unwrap_or("(untitled)");
-                                        body.push_str(&format!("• {id8} · {target} · {title}\n"));
+                                        body.push_str(&format!(
+                                            "• {id8} · {} · {title} · {}\n",
+                                            r.username, r.cwd
+                                        ));
                                     }
                                     body.push_str("\nresume with /session <id-prefix>");
                                     send_conv(&signal, &sender, &group_id, &body).await;

@@ -242,27 +242,36 @@ fn handle_key_event(
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 s.session_search = None;
             }
+            KeyCode::Up => {
+                s.session_search_idx = s.session_search_idx.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                s.session_search_idx += 1;
+            }
             KeyCode::Enter => {
-                if let Some(ref search) = s.session_search {
-                    let search = search.clone();
-                    let sid = s
-                        .last_sessions
+                let search = s.session_search.clone().unwrap_or_default();
+                let filtered: Vec<&temple_protocol::SessionMeta> = if search.is_empty() {
+                    s.last_sessions.iter().collect()
+                } else {
+                    s.last_sessions
                         .iter()
-                        .find(|m| {
+                        .filter(|m| {
                             let label = format!(
                                 "{} — {}",
-                                m.ssh_target.as_deref().unwrap_or("local"),
+                                m.username,
                                 m.title.as_deref().unwrap_or("(untitled)")
                             );
                             label.to_lowercase().contains(&search.to_lowercase())
                         })
-                        .map(|m| m.id);
-                    s.session_search = None;
-                    if let Some(id) = sid {
-                        cmd_tx
-                            .send(ClientMessage::ResumeSession { session_id: id })
-                            .ok();
-                    }
+                        .collect()
+                };
+                let idx = s.session_search_idx.min(filtered.len().saturating_sub(1));
+                let sid = filtered.get(idx).map(|m| m.id);
+                s.session_search = None;
+                if let Some(id) = sid {
+                    cmd_tx
+                        .send(ClientMessage::ResumeSession { session_id: id })
+                        .ok();
                 }
             }
             KeyCode::Backspace => {
@@ -287,6 +296,7 @@ fn handle_key_event(
                 cmd_tx.send(ClientMessage::ListSessions).ok();
             }
             s.session_search = Some(String::new());
+            s.session_search_idx = 0;
             return true;
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {

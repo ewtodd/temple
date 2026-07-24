@@ -518,7 +518,8 @@ impl Agent {
             },
         );
         drop(sessions);
-        self.persist_session(session_id).await;
+        // Don't persist yet — wait until the first user message arrives
+        // so empty sessions never hit the DB.
         Ok(session_id)
     }
 

@@ -453,31 +453,47 @@ impl App {
                                         "sessions ({}):",
                                         sessions.len()
                                     )));
-                                    let target_w = sessions
-                                        .iter()
-                                        .map(|m| {
-                                            m.username.chars().count()
-                                        })
-                                        .max()
-                                        .unwrap_or(5)
-                                        .min(20);
-                                    for (i, m) in sessions.iter().enumerate() {
-                                        let id8: String = m
-                                            .id
-                                            .simple()
-                                            .to_string()
-                                            .chars()
-                                            .take(8)
-                                            .collect();
-                                        let title = m
-                                            .title
-                                            .as_deref()
-                                            .unwrap_or("(untitled)");
-                                        let user_padded =
-                                            format!("{:<width$}", m.username, width = target_w);
+                                    // Group by username, preserving chronological order
+                                    let mut seen_users: Vec<&String> = Vec::new();
+                                    for m in &sessions {
+                                        if !seen_users.contains(&&m.username) {
+                                            seen_users.push(&m.username);
+                                        }
+                                    }
+                                    let mut global_idx = 0usize;
+                                    for user in &seen_users {
+                                        if !seen_users.first().map(|u| *u == *user).unwrap_or(true) {
+                                            s.entries.push(ChatEntry::System(format!(
+                                                "  {}",
+                                                "\u{2500}".repeat(30)
+                                            )));
+                                        }
                                         s.entries.push(ChatEntry::System(format!(
-                                            "  [{i}] {id8} \u{b7} {user_padded} \u{b7} {title}"
+                                            "  {}",
+                                            user
                                         )));
+                                        for m in sessions.iter().filter(|m| &m.username == *user) {
+                                            let id8: String = m
+                                                .id
+                                                .simple()
+                                                .to_string()
+                                                .chars()
+                                                .take(8)
+                                                .collect();
+                                            let title = m
+                                                .title
+                                                .as_deref()
+                                                .unwrap_or("(untitled)");
+                                            let cwd_short = if m.cwd.len() > 30 {
+                                                format!("…{}", &m.cwd[m.cwd.len().saturating_sub(28)..])
+                                            } else {
+                                                m.cwd.clone()
+                                            };
+                                            s.entries.push(ChatEntry::System(format!(
+                                                "    [{global_idx}] {id8} \u{b7} {title} \u{b7} {cwd_short}"
+                                            )));
+                                            global_idx += 1;
+                                        }
                                     }
                                     s.entries.push(ChatEntry::System(
                                         "  resume: /session <n>".into(),

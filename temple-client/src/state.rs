@@ -112,6 +112,8 @@ pub struct AppState {
     pub available_models: Vec<String>,
     /// Session search overlay: active + search text
     pub session_search: Option<String>,
+    /// Selected index in the session search overlay (keyboard nav)
+    pub session_search_idx: usize,
 }
 
 impl AppState {
@@ -142,6 +144,7 @@ impl AppState {
             mode: PermissionMode::Default,
             available_models: Vec::new(),
             session_search: None,
+            session_search_idx: 0,
         }
     }
 }

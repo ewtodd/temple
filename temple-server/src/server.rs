@@ -394,6 +394,43 @@ async fn handle_connection(
                     continue;
                 };
 
+                // Intercept /nuke commands from any client (Web UI, etc.)
+                let trimmed = content.trim();
+                if trimmed == "/nuke confirm" {
+                    let owner = auth_owner.clone().unwrap_or_default();
+                    let is_admin = memory.is_admin_username(&owner).await.unwrap_or(false);
+                    if !is_admin {
+                        let _ = tx.send(ServerMessage::ChatError {
+                            session_id: sid,
+                            error: "admin only".into(),
+                        });
+                        continue;
+                    }
+                    match memory.nuke_sessions().await {
+                        Ok(count) => {
+                            let _ = tx.send(ServerMessage::ChatError {
+                                session_id: sid,
+                                error: format!("nuked all {count} sessions"),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ServerMessage::ChatError {
+                                session_id: sid,
+                                error: format!("nuke: {e}"),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                if trimmed == "/nuke" {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id: sid,
+                        error: "type /nuke confirm to permanently delete ALL sessions (admin only)"
+                            .into(),
+                    });
+                    continue;
+                }
+
                 // Run agent loop in a task; forward events to this client
                 let agent = agent.clone();
                 let tx = tx.clone();
