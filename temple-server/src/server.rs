@@ -352,6 +352,7 @@ async fn handle_connection(
                         let _ = tx.send(ServerMessage::ChatDelta {
                             session_id,
                             delta: format!("deleted {n} sessions for {account} ({dropped} unloaded from memory)\n"),
+                            reasoning: None,
                             done: true,
                         });
                     }
@@ -440,7 +441,22 @@ async fn handle_connection(
                             AgentEvent::Delta(d) => ServerMessage::ChatDelta {
                                 session_id: sid,
                                 delta: d,
+                                reasoning: None,
                                 done: false,
+                            },
+                            AgentEvent::DeltaReasoning(r) => {
+                                let reasoning = Some(r.clone());
+                                ServerMessage::ChatDelta {
+                                    session_id: sid,
+                                    delta: r,
+                                    reasoning,
+                                    done: false,
+                                }
+                            }
+                            AgentEvent::ToolDelta { name, delta } => ServerMessage::ToolDelta {
+                                session_id: sid,
+                                name,
+                                delta,
                             },
                             AgentEvent::ToolEvent {
                                 name,
@@ -474,6 +490,7 @@ async fn handle_connection(
                                 let _ = tx.send(ServerMessage::ChatDelta {
                                     session_id: sid,
                                     delta: String::new(),
+                                    reasoning: None,
                                     done: true,
                                 });
                                 ServerMessage::ChatStats {
@@ -519,6 +536,21 @@ async fn handle_connection(
             } => {
                 if sid == session_id {
                     agent.resolve_tool(request_id, result).await;
+                }
+            }
+
+            ClientMessage::ToolDelta {
+                request_id: _,
+                session_id: sid,
+                delta,
+            } => {
+                // Echo streaming tool output back to the client (TUI) for display
+                if sid == session_id {
+                    let _ = tx.send(ServerMessage::ToolDelta {
+                        session_id: sid,
+                        name: String::new(), // TUI appends to last tool entry
+                        delta,
+                    });
                 }
             }
 

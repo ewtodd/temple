@@ -108,6 +108,12 @@ pub enum ClientMessage {
         session_id: Uuid,
         result: String,
     },
+    /// Streaming output from a running tool (sent by client while executing)
+    ToolDelta {
+        request_id: Uuid,
+        session_id: Uuid,
+        delta: String,
+    },
     /// List persisted sessions for the authenticated user
     ListSessions,
     /// Resume a persisted session (loads history + SSH target)
@@ -162,6 +168,9 @@ pub enum ServerMessage {
     ChatDelta {
         session_id: Uuid,
         delta: String,
+        /// Reasoning/thinking content (DeepSeek-R1 style) — rendered dimmed
+        #[serde(default)]
+        reasoning: Option<String>,
         done: bool,
     },
     ChatError {
@@ -174,6 +183,12 @@ pub enum ServerMessage {
         name: String,
         status: ToolStatus,
         detail: String,
+    },
+    /// Streaming delta from a running tool (e.g. build output)
+    ToolDelta {
+        session_id: Uuid,
+        name: String,
+        delta: String,
     },
     ModelList {
         models: Vec<ModelInfo>,

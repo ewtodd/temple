@@ -80,8 +80,10 @@ pub async fn run(
 
             // In YOLO mode, execute immediately. In other modes, apply
             // client-side consent: allow only tools within the daemon's cwd.
+            let rid = request_id;
+            let sid = session_id;
             let result = if mode == PermissionMode::Yolo {
-                execute_local_tool(&name, &args_json, &cwd_str).await
+                execute_local_tool(&name, &args_json, &cwd_str, None, rid, sid).await
             } else {
                 // Client-side consent for non-YOLO daemon
                 let needs_consent = match name.as_str() {
@@ -106,7 +108,7 @@ pub async fn run(
                 if needs_consent {
                     format!("Error: {name} denied — daemon is not in YOLO mode")
                 } else {
-                    execute_local_tool(&name, &args_json, &cwd_str).await
+                    execute_local_tool(&name, &args_json, &cwd_str, None, rid, sid).await
                 }
             };
 

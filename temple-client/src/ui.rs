@@ -51,7 +51,11 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     )));
                 }
             }
-            ChatEntry::Assistant { content, stats } => {
+            ChatEntry::Assistant {
+                content,
+                reasoning,
+                stats,
+            } => {
                 let model_tag = s.model.as_str();
                 let header = if model_tag.is_empty() {
                     "  renco".to_string()
@@ -64,6 +68,17 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                         .fg(Color::Green)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 )]));
+                // Reasoning/thinking content rendered dimmed and italic
+                if let Some(ref r) = reasoning {
+                    if !r.trim().is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  \u{2026}{r}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(ratatui::style::Modifier::ITALIC),
+                        )));
+                    }
+                }
                 let body = render_markdown_lite(content, content_width.saturating_sub(2));
                 for l in body.iter() {
                     let color = match l.kind {
@@ -331,26 +346,11 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
         let art_area = layout[0];
         let art_text: Vec<Line> = TEMPLE_ART
             .lines()
-            .enumerate()
-            .map(|(i, l)| {
-                if i == 0 || i == 5 {
-                    Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default().fg(Color::Cyan),
-                    ))
-                } else if i == 7 {
-                    Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ))
-                }
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::Cyan),
+                ))
             })
             .collect();
         f.render_widget(Paragraph::new(art_text), art_area);

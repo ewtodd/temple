@@ -40,6 +40,8 @@ pub enum InternalCmd {
         args_json: String,
         cwd: String,
         responder: std::sync::mpsc::SyncSender<String>,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
     },
 }
 
@@ -50,6 +52,8 @@ pub enum ChatEntry {
     /// Assistant message (streams in), with optional stats footer
     Assistant {
         content: String,
+        /// Reasoning/thinking content (DeepSeek-R1 style)
+        reasoning: Option<String>,
         stats: Option<String>,
     },
     /// System/info line (command output, session notices — cyan)

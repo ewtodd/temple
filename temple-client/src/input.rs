@@ -141,6 +141,8 @@ fn handle_key_event(
                             args_json,
                             cwd,
                             responder: responder_tx,
+                            request_id,
+                            session_id,
                         });
                         let result = responder_rx
                             .recv()

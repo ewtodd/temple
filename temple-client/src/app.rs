@@ -133,8 +133,10 @@ impl App {
                             }
 
                             if mode == PermissionMode::Yolo {
-                                let result =
-                                    execute_local_tool(name, args_json, &cwd_str).await;
+                                let progress_tx = Some(tx_task.clone());
+                                let result = execute_local_tool(
+                                    name, args_json, &cwd_str, progress_tx, request_id, session_id
+                                ).await;
                                 let _ = tx_task.send(ClientMessage::ToolResult {
                                     request_id,
                                     session_id,
@@ -201,8 +203,10 @@ impl App {
                                 continue;
                             }
 
-                            let result =
-                                execute_local_tool(name, args_json, &cwd_str).await;
+                            let progress_tx = Some(tx_task.clone());
+                            let result = execute_local_tool(
+                                name, args_json, &cwd_str, progress_tx, request_id, session_id
+                            ).await;
                             let _ = tx_task.send(ClientMessage::ToolResult {
                                 request_id,
                                 session_id,
@@ -231,30 +235,44 @@ impl App {
                             ServerMessage::ChatDelta {
                                 session_id,
                                 delta,
+                                reasoning,
                                 done,
                                 ..
                             } => {
-                                // Stale message for a session we switched away
-                                // from — ignore rather than corrupt the view.
                                 if session_id != s.session_id {
                                     continue;
                                 }
                                 if done {
-                                    // stream finished; stats come separately
-                                } else if let Some(ChatEntry::Assistant {
-                                    content: ref mut c,
-                                    ..
-                                }) = s.entries.last_mut()
-                                {
-                                    c.push_str(&delta);
-                                } else if !delta.trim().is_empty() {
-                                    // Don't open an assistant bubble for
-                                    // whitespace-only deltas — tool-call-only
-                                    // rounds emit stray newlines.
-                                    s.entries.push(ChatEntry::Assistant {
-                                        content: delta,
-                                        stats: None,
-                                    });
+                                } else {
+                                    let r_clone = reasoning.clone();
+                                    if let Some(ChatEntry::Assistant {
+                                        content: ref mut c,
+                                        reasoning: ref mut r,
+                                        ..
+                                    }) = s.entries.last_mut()
+                                    {
+                                        c.push_str(&delta);
+                                        if let Some(ref re) = r_clone {
+                                            if let Some(ref mut existing) = r {
+                                                existing.push_str(re);
+                                            } else {
+                                                *r = Some(re.clone());
+                                            }
+                                        }
+                                    } else {
+                                        let text = if let Some(ref textual_re) = r_clone {
+                                            format!("{}{}", textual_re, delta)
+                                        } else {
+                                            delta.clone()
+                                        };
+                                        if !text.trim().is_empty() {
+                                            s.entries.push(ChatEntry::Assistant {
+                                                content: delta,
+                                                reasoning: r_clone,
+                                                stats: None,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             ServerMessage::ChatError { error, .. } => {
@@ -311,6 +329,20 @@ impl App {
                                     status,
                                     detail,
                                 });
+                            }
+                            ServerMessage::ToolDelta {
+                                name: _,
+                                delta,
+                                ..
+                            } => {
+                                if let Some(ChatEntry::Tool {
+                                    detail: ref mut d,
+                                    ..
+                                }) = s.entries.iter_mut().rev().find(|e| {
+                                    matches!(e, ChatEntry::Tool { .. })
+                                }) {
+                                    d.push_str(&delta);
+                                }
                             }
                             ServerMessage::ModelList { models } => {
                                 s.available_models =
@@ -539,6 +571,7 @@ impl App {
                                     } else {
                                         s.entries.push(ChatEntry::Assistant {
                                             content,
+                                            reasoning: None,
                                             stats: None,
                                         });
                                     }
@@ -608,8 +641,9 @@ impl App {
                             None => break,
                         },
                         internal = internal_rx.recv() => match internal {
-                            Some(InternalCmd::ExecuteLocalTool { name, args_json, cwd, responder }) => {
-                                let result = execute_local_tool(&name, &args_json, &cwd).await;
+                            Some(InternalCmd::ExecuteLocalTool { name, args_json, cwd, responder, request_id, session_id }) => {
+                                let progress_tx = Some(tx_ping.clone());
+                                let result = execute_local_tool(&name, &args_json, &cwd, progress_tx, request_id, session_id).await;
                                 let _ = responder.send(result);
                             }
                             None => break,

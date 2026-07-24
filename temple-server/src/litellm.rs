@@ -184,6 +184,8 @@ pub struct Usage {
 /// Accumulated result of one streaming completion round.
 pub struct StreamResult {
     pub content: String,
+    #[allow(dead_code)] // Accumulated for future use but currently only streamed incrementally
+    pub reasoning_content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     #[allow(dead_code)] // Kept on the wire result for diagnostics.
@@ -205,6 +207,8 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
@@ -225,6 +229,8 @@ struct DeltaToolFunction {
 pub enum StreamEvent {
     /// Content delta for live display
     Delta(String),
+    /// Reasoning/thinking delta (DeepSeek-R1 style)
+    Reasoning(String),
     /// Stream finished — full accumulated result
     Done(StreamResult),
     /// Error mid-stream
@@ -333,6 +339,7 @@ impl LiteLLM {
         }
 
         let mut content = String::new();
+        let mut reasoning_content = String::new();
         let mut usage: Option<Usage> = None;
         let mut finish_reason: Option<String> = None;
         // tool call accumulators: index -> (id, name, args)
@@ -414,6 +421,12 @@ impl LiteLLM {
                                 let _ = tx.send(StreamEvent::Delta(c));
                             }
                         }
+                        if let Some(r) = choice.delta.reasoning_content {
+                            if !r.is_empty() {
+                                reasoning_content.push_str(&r);
+                                let _ = tx.send(StreamEvent::Reasoning(r));
+                            }
+                        }
                         if let Some(tcs) = choice.delta.tool_calls {
                             for tc in tcs {
                                 let idx = tc.index.unwrap_or(0);
@@ -467,6 +480,7 @@ impl LiteLLM {
 
         let _ = tx.send(StreamEvent::Done(StreamResult {
             content,
+            reasoning_content,
             tool_calls,
             usage,
             finish_reason,

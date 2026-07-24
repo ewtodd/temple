@@ -61,10 +61,18 @@ impl PermissionResolver {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Delta(String),
+    /// Reasoning/thinking delta (DeepSeek-R1 style)
+    DeltaReasoning(String),
     ToolEvent {
         name: String,
         status: ToolStatus,
         detail: String,
+    },
+    /// Streaming output chunk from a running tool
+    #[allow(dead_code)] // Emitted by client-side streaming, constructed via server echo
+    ToolDelta {
+        name: String,
+        delta: String,
     },
     PermissionNeeded(PermissionRequest),
     Done(ChatStatsData),
@@ -1698,6 +1706,9 @@ impl Agent {
                                 }
                                 emit(AgentEvent::Delta(d));
                             }
+                            StreamEvent::Reasoning(r) => {
+                                emit(AgentEvent::DeltaReasoning(r));
+                            }
                             StreamEvent::Done(r) => {
                                 stream_result = Some(r);
                                 break;
@@ -1992,6 +2003,9 @@ impl Agent {
                         StreamEvent::Delta(d) => {
                             text.push_str(&d);
                             emit(AgentEvent::Delta(d));
+                        }
+                        StreamEvent::Reasoning(r) => {
+                            emit(AgentEvent::DeltaReasoning(r));
                         }
                         StreamEvent::Done(_) => break,
                         StreamEvent::Error(e) => {

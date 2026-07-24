@@ -87,7 +87,14 @@ fn resolve_tool_path_for(path: &str, cwd: &str, for_write: bool) -> Result<PathB
 /// Execute a server-requested tool against the local filesystem, confined
 /// to `cwd`. Consent for risky operations is handled by the caller — this
 /// function assumes the operation is allowed.
-pub async fn execute_local_tool(name: &str, args_json: &str, cwd: &str) -> String {
+pub async fn execute_local_tool(
+    name: &str,
+    args_json: &str,
+    cwd: &str,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<temple_protocol::ClientMessage>>,
+    request_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+) -> String {
     let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
 
     match name {
@@ -156,42 +163,108 @@ pub async fn execute_local_tool(name: &str, args_json: &str, cwd: &str) -> Strin
         }
         "execute_command" => {
             let command = args["command"].as_str().unwrap_or("");
-            let child = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(cwd)
-                .kill_on_drop(true)
-                .output();
-            match tokio::time::timeout(CMD_TIMEOUT, child).await {
-                Err(_) => format!("Error: command timed out after {}s", CMD_TIMEOUT.as_secs()),
-                Ok(Err(e)) => format!("Error: {e}"),
-                Ok(Ok(output)) => {
-                    let cap = |bytes: &[u8]| -> String {
-                        if bytes.len() > MAX_CMD_OUTPUT {
-                            let mut s =
-                                String::from_utf8_lossy(&bytes[..MAX_CMD_OUTPUT]).to_string();
-                            s.push_str("\n[truncated]");
-                            s
-                        } else {
-                            String::from_utf8_lossy(bytes).to_string()
+            if let Some(ref tx) = progress_tx {
+                // Streaming mode: spawn, read stdout line-by-line, send
+                // ToolDelta updates as output arrives.
+                let mut child = match tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(cwd)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => return format!("Error: {e}"),
+                };
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let mut total = 0usize;
+                let mut out = String::new();
+                if let Some(stdout) = stdout {
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if total < MAX_CMD_OUTPUT {
+                            let send = format!("{line}\n");
+                            let _ = tx.send(temple_protocol::ClientMessage::ToolDelta {
+                                request_id,
+                                session_id,
+                                delta: send.clone(),
+                            });
+                            out.push_str(&send);
+                            total += line.len() + 1;
                         }
-                    };
-                    let stdout = cap(&output.stdout);
-                    let stderr = cap(&output.stderr);
-                    let mut out = String::new();
-                    if !stdout.is_empty() {
-                        out.push_str(&stdout);
                     }
-                    if !stderr.is_empty() {
-                        out.push_str(&format!("\n[stderr]\n{stderr}"));
+                }
+                if let Some(stderr) = stderr {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if total < MAX_CMD_OUTPUT {
+                            let send = format!("[stderr] {line}\n");
+                            let _ = tx.send(temple_protocol::ClientMessage::ToolDelta {
+                                request_id,
+                                session_id,
+                                delta: send.clone(),
+                            });
+                            out.push_str(&send);
+                            total += line.len() + 10;
+                        }
                     }
-                    if !output.status.success() {
-                        out.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
-                    }
-                    if out.is_empty() {
-                        out.push_str("(no output)");
-                    }
+                }
+                let status = child.wait().await.unwrap_or_default();
+                if !status.success() {
+                    out.push_str(&format!("\n[exit {}]", status.code().unwrap_or(-1)));
+                }
+                if out.is_empty() {
+                    "(no output)".to_string()
+                } else {
                     out
+                }
+            } else {
+                let child = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(cwd)
+                    .kill_on_drop(true)
+                    .output();
+                match tokio::time::timeout(CMD_TIMEOUT, child).await {
+                    Err(_) => {
+                        format!("Error: command timed out after {}s", CMD_TIMEOUT.as_secs())
+                    }
+                    Ok(Err(e)) => format!("Error: {e}"),
+                    Ok(Ok(output)) => {
+                        let cap = |bytes: &[u8]| -> String {
+                            if bytes.len() > MAX_CMD_OUTPUT {
+                                let mut s =
+                                    String::from_utf8_lossy(&bytes[..MAX_CMD_OUTPUT]).to_string();
+                                s.push_str("\n[truncated]");
+                                s
+                            } else {
+                                String::from_utf8_lossy(bytes).to_string()
+                            }
+                        };
+                        let stdout = cap(&output.stdout);
+                        let stderr = cap(&output.stderr);
+                        let mut out = String::new();
+                        if !stdout.is_empty() {
+                            out.push_str(&stdout);
+                        }
+                        if !stderr.is_empty() {
+                            out.push_str(&format!("\n[stderr]\n{stderr}"));
+                        }
+                        if !output.status.success() {
+                            out.push_str(&format!(
+                                "\n[exit {}]",
+                                output.status.code().unwrap_or(-1)
+                            ));
+                        }
+                        if out.is_empty() {
+                            out.push_str("(no output)");
+                        }
+                        out
+                    }
                 }
             }
         }
