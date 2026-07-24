@@ -2492,6 +2492,60 @@ Git conventions:
                 self.direct.context7_search(query).await
             }
 
+            "image-viewer" | "image_viewer" => {
+                let path = args["path"].as_str().ok_or("image-viewer: missing path")?;
+                let cwd = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&session_id)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_else(|| ".".into())
+                };
+                let full = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
+                } else {
+                    std::path::Path::new(&cwd).join(path)
+                };
+                let data_url =
+                    crate::direct_tools::DirectTools::read_image_base64(&full.to_string_lossy())?;
+                Ok(format!(
+                    "Image loaded: {path}\nData URL ({})",
+                    data_url.len()
+                ))
+            }
+            "export_session" => {
+                let format = args["format"].as_str().unwrap_or("markdown");
+                let (history, title) = {
+                    let sessions = self.sessions.lock().await;
+                    let s = sessions.get(&session_id).ok_or("session not found")?;
+                    (s.history.clone(), s.title.clone())
+                };
+                let mut out = match format {
+                    "json" => {
+                        let title_str = title.as_deref().unwrap_or("untitled");
+                        format!("# Session: {title_str}\n\n")
+                    }
+                    _ => {
+                        let title_str = title.as_deref().unwrap_or("untitled");
+                        format!("# Session: {title_str}\n\n")
+                    }
+                };
+                for m in &history {
+                    if let Some(text) = m.content_text() {
+                        if format == "json" {
+                            out.push_str(&format!(
+                                "{{\"role\":\"{}\",\"content\":{}}}\n",
+                                m.role,
+                                serde_json::to_string(text).unwrap_or_default()
+                            ));
+                        } else {
+                            out.push_str(&format!("## {}\n\n{}\n\n", m.role, text));
+                        }
+                    }
+                }
+                Ok(out.trim_end().to_string())
+            }
+
             _ => self.mcp.call_tool(name, args).await,
         }
     }
@@ -2860,6 +2914,34 @@ fn local_tools() -> Vec<ToolDefinition> {
                     "required": ["query"],
                     "properties": {
                         "query": {"type": "string", "description": "Library name or documentation query."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "image-viewer".into(),
+                description: "Read an image file and prepare it for vision model analysis. Returns a base64 data URL that can be included in multimodal requests.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the image file (png, jpg, gif, webp, bmp)."},
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            type_field: "function".into(),
+            function: ToolFunctionDef {
+                name: "export_session".into(),
+                description: "Export the current session history as formatted text (markdown or JSON). Use this to save a conversation for later reference.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["format"],
+                    "properties": {
+                        "format": {"type": "string", "enum": ["markdown", "json"], "description": "Export format."},
                     },
                 }),
             },

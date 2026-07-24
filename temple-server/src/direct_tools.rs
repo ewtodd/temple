@@ -2,6 +2,39 @@ use reqwest::Client as HttpClient;
 use serde_json::Value;
 use std::time::Duration;
 
+const MAX_RETRIES: u32 = 3;
+const RETRY_BASE_MS: u64 = 500;
+
+async fn retry_http<T, F, Fut>(name: &str, f: F) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_err = String::new();
+    for attempt in 0..MAX_RETRIES {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = e;
+                if attempt < MAX_RETRIES - 1 {
+                    tokio::time::sleep(Duration::from_millis(RETRY_BASE_MS * (attempt as u64 + 1)))
+                        .await;
+                    tracing::warn!("{name}: retry {}/{}", attempt + 1, MAX_RETRIES - 1);
+                }
+            }
+        }
+    }
+    Err(format!("{name}: {last_err} (after {MAX_RETRIES} retries)"))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    use std::io::Write;
+    let mut enc =
+        base64::write::EncoderStringWriter::new(&base64::engine::general_purpose::STANDARD);
+    enc.write_all(data).ok();
+    enc.into_inner()
+}
+
 /// Direct HTTP tool implementations replacing the LiteLLM MCP gateway.
 /// Each function takes arguments and returns a result string.
 pub struct DirectTools {
@@ -20,47 +53,57 @@ impl DirectTools {
     }
 
     pub async fn fetch(&self, url: &str) -> Result<String, String> {
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("fetch: {e}"))?;
-        let body = resp.text().await.map_err(|e| format!("fetch read: {e}"))?;
-        // Strip HTML tags for plain-text extraction
-        Ok(strip_html(&body))
+        let client = self.client.clone();
+        let url = url.to_string();
+        retry_http("fetch", || {
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                let resp = client.get(&url).send().await.map_err(|e| format!("{e}"))?;
+                let body = resp.text().await.map_err(|e| format!("read: {e}"))?;
+                Ok(strip_html(&body))
+            }
+        })
+        .await
     }
 
     pub async fn searxng_search(&self, query: &str, count: usize) -> Result<String, String> {
-        let resp = self
-            .client
-            .get("http://localhost:8081/search")
-            .query(&[("q", query), ("format", "json"), ("categories", "general")])
-            .send()
-            .await
-            .map_err(|e| format!("searxng: {e}"))?;
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("searxng parse: {e}"))?;
-        let results = json["results"].as_array().ok_or("searxng: no results")?;
-        let mut out = String::new();
-        for (i, r) in results.iter().take(count).enumerate() {
-            let title = r["title"].as_str().unwrap_or("");
-            let url = r["url"].as_str().unwrap_or("");
-            let snippet = r["content"].as_str().unwrap_or("");
-            out.push_str(&format!(
-                "{}. {}\n   {}\n   {}\n\n",
-                i + 1,
-                title,
-                url,
-                snippet
-            ));
-        }
-        if out.is_empty() {
-            return Ok("No results found.".into());
-        }
-        Ok(out.trim_end().to_string())
+        let client = self.client.clone();
+        let query = query.to_string();
+        retry_http("searxng", || {
+            let client = client.clone();
+            let query = query.clone();
+            async move {
+                let fmt = "json".to_string();
+                let cat = "general".to_string();
+                let resp = client
+                    .get("http://localhost:8081/search")
+                    .query(&[("q", &query), ("format", &fmt), ("categories", &cat)])
+                    .send()
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let json: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                let results = json["results"].as_array().ok_or("no results")?;
+                let mut out = String::new();
+                for (i, r) in results.iter().take(count).enumerate() {
+                    let title = r["title"].as_str().unwrap_or("");
+                    let url = r["url"].as_str().unwrap_or("");
+                    let snippet = r["content"].as_str().unwrap_or("");
+                    out.push_str(&format!(
+                        "{}. {}\n   {}\n   {}\n\n",
+                        i + 1,
+                        title,
+                        url,
+                        snippet
+                    ));
+                }
+                if out.is_empty() {
+                    return Ok("No results found.".into());
+                }
+                Ok(out.trim_end().to_string())
+            }
+        })
+        .await
     }
 
     pub async fn nixos_nix(
@@ -70,129 +113,180 @@ impl DirectTools {
         channel: &str,
         limit: usize,
     ) -> Result<String, String> {
-        match action {
-            "search" => {
-                let url = format!(
-                    "https://search.nixos.org/backend/search?query={}&channel={}",
-                    query, channel
-                );
-                let resp = self
-                    .client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("nixos: {e}"))?;
-                let text = resp.text().await.map_err(|e| format!("nixos read: {e}"))?;
-                let json: Value =
-                    serde_json::from_str(&text).map_err(|e| format!("nixos parse: {e}"))?;
-                let results = json["results"].as_array().ok_or("nixos: no results")?;
-                let mut out = String::new();
-                for r in results.iter().take(limit) {
-                    let pkg = r.as_str().unwrap_or("?");
-                    out.push_str(&format!("- {pkg}\n"));
+        let client = self.client.clone();
+        let action = action.to_string();
+        let query = query.to_string();
+        let channel = channel.to_string();
+        retry_http("nixos-nix", || {
+            let client = client.clone();
+            let query = query.clone();
+            let channel = channel.clone();
+            let action = action.clone();
+            async move {
+                match action.as_str() {
+                    "search" => {
+                        let url = format!(
+                            "https://search.nixos.org/backend/search?query={query}&channel={channel}"
+                        );
+                        let resp = client
+                            .get(&url)
+                            .send()
+                            .await
+                            .map_err(|e| format!("{e}"))?;
+                        let text =
+                            resp.text().await.map_err(|e| format!("read: {e}"))?;
+                        let json: Value = serde_json::from_str(&text)
+                            .map_err(|e| format!("parse: {e}"))?;
+                        let results =
+                            json["results"].as_array().ok_or("no results")?;
+                        let mut out = String::new();
+                        for r in results.iter().take(limit) {
+                            let pkg = r.as_str().unwrap_or("?");
+                            out.push_str(&format!("- {pkg}\n"));
+                        }
+                        if out.is_empty() {
+                            return Ok("No packages found.".into());
+                        }
+                        Ok(format!("nixpkgs/{channel}:\n{}", out.trim_end()))
+                    }
+                    "info" => {
+                        let url = format!(
+                            "https://search.nixos.org/backend/search?query={query}&channel={channel}&limit=1"
+                        );
+                        let resp = client
+                            .get(&url)
+                            .send()
+                            .await
+                            .map_err(|e| format!("{e}"))?;
+                        let text =
+                            resp.text().await.map_err(|e| format!("read: {e}"))?;
+                        let json: Value = serde_json::from_str(&text)
+                            .map_err(|e| format!("parse: {e}"))?;
+                        Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+                    }
+                    _ => Err(format!("unsupported action '{action}'")),
                 }
-                if out.is_empty() {
-                    return Ok("No packages found.".into());
-                }
-                Ok(format!("nixpkgs/{channel}:\n{}", out.trim_end()))
             }
-            "info" => {
-                let url = format!(
-                    "https://search.nixos.org/backend/search?query={}&channel={}&limit=1",
-                    query, channel
-                );
-                let resp = self
-                    .client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("nixos: {e}"))?;
-                let text = resp.text().await.map_err(|e| format!("nixos read: {e}"))?;
-                let json: Value =
-                    serde_json::from_str(&text).map_err(|e| format!("nixos parse: {e}"))?;
-                Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
-            }
-            _ => Err(format!("nixos-nix: unsupported action '{action}'")),
-        }
+        })
+        .await
     }
 
     pub async fn arxiv_search(&self, query: &str, max_results: usize) -> Result<String, String> {
-        let url = format!(
-            "http://export.arxiv.org/api/query?search_query=all:{query}&max_results={max_results}&sortBy=relevance"
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("arxiv: {e}"))?;
-        let body = resp.text().await.map_err(|e| format!("arxiv read: {e}"))?;
-        // Simple XML extraction — grab title, summary, and id
-        let mut out = String::new();
-        let entries: Vec<&str> = body.split("<entry>").collect();
-        for (i, entry) in entries.iter().skip(1).take(max_results).enumerate() {
-            let title = extract_xml(entry, "title");
-            let summary = extract_xml(entry, "summary");
-            let id = extract_xml(entry, "id");
-            out.push_str(&format!(
-                "{}. {}\n   {}\n   {}\n\n",
-                i + 1,
-                title.as_deref().unwrap_or("?"),
-                id.as_deref().unwrap_or("?"),
-                summary
-                    .as_deref()
-                    .unwrap_or("?")
-                    .chars()
-                    .take(300)
-                    .collect::<String>(),
-            ));
-        }
-        if out.is_empty() {
-            return Ok("No papers found.".into());
-        }
-        Ok(out.trim_end().to_string())
+        let client = self.client.clone();
+        let query = query.to_string();
+        retry_http("arxiv", || {
+            let client = client.clone();
+            let query = query.clone();
+            async move {
+                let url = format!(
+                    "http://export.arxiv.org/api/query?search_query=all:{query}&max_results={max_results}&sortBy=relevance"
+                );
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let body =
+                    resp.text().await.map_err(|e| format!("read: {e}"))?;
+                let mut out = String::new();
+                let entries: Vec<&str> = body.split("<entry>").collect();
+                for (i, entry) in
+                    entries.iter().skip(1).take(max_results).enumerate()
+                {
+                    let title = extract_xml(entry, "title");
+                    let summary = extract_xml(entry, "summary");
+                    let id = extract_xml(entry, "id");
+                    out.push_str(&format!(
+                        "{}. {}\n   {}\n   {}\n\n",
+                        i + 1,
+                        title.as_deref().unwrap_or("?"),
+                        id.as_deref().unwrap_or("?"),
+                        summary
+                            .as_deref()
+                            .unwrap_or("?")
+                            .chars()
+                            .take(300)
+                            .collect::<String>(),
+                    ));
+                }
+                if out.is_empty() {
+                    return Ok("No papers found.".into());
+                }
+                Ok(out.trim_end().to_string())
+            }
+        })
+        .await
     }
 
     pub async fn context7_search(&self, query: &str) -> Result<String, String> {
-        // Context7 API — resolve library then query docs
-        let resolve_url =
-            format!("https://context7.com/api/resolve?query={query}&libraryName={query}");
-        let resp = self
-            .client
-            .get(&resolve_url)
-            .send()
-            .await
-            .map_err(|e| format!("context7 resolve: {e}"))?;
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("context7 read: {e}"))?;
-        let json: Value =
-            serde_json::from_str(&body).map_err(|e| format!("context7 parse: {e}"))?;
-        if let Some(libraries) = json.as_array() {
-            if let Some(first) = libraries.first() {
-                if let Some(lib_id) = first["id"].as_str() {
-                    let query_url =
-                        format!("https://context7.com/api/query/{lib_id}?query={query}");
-                    let resp2 = self
-                        .client
-                        .get(&query_url)
-                        .send()
-                        .await
-                        .map_err(|e| format!("context7 query: {e}"))?;
-                    let body2 = resp2
-                        .text()
-                        .await
-                        .map_err(|e| format!("context7 read: {e}"))?;
-                    return Ok(body2.chars().take(8000).collect());
+        let client = self.client.clone();
+        let query = query.to_string();
+        retry_http("context7", || {
+            let client = client.clone();
+            let query = query.clone();
+            async move {
+                let resolve_url =
+                    format!("https://context7.com/api/resolve?query={query}&libraryName={query}");
+                let resp = client
+                    .get(&resolve_url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("resolve: {e}"))?;
+                let body = resp.text().await.map_err(|e| format!("read: {e}"))?;
+                let json: Value = serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))?;
+                if let Some(libraries) = json.as_array() {
+                    if let Some(first) = libraries.first() {
+                        if let Some(lib_id) = first["id"].as_str() {
+                            let query_url =
+                                format!("https://context7.com/api/query/{lib_id}?query={query}");
+                            let resp2 = client
+                                .get(&query_url)
+                                .send()
+                                .await
+                                .map_err(|e| format!("query: {e}"))?;
+                            let body2 = resp2.text().await.map_err(|e| format!("read: {e}"))?;
+                            return Ok(body2.chars().take(8000).collect());
+                        }
+                    }
                 }
+                Ok("Context7: no results found.".into())
             }
+        })
+        .await
+    }
+
+    /// Read an image file from disk, base64 encode it, and return a
+    /// data URL suitable for vision model requests.
+    pub fn read_image_base64(path: &str) -> Result<String, String> {
+        let allowed = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !allowed.iter().any(|a| *a == ext) {
+            return Err(format!(
+                "unsupported format '.{ext}'. Supported: {}",
+                allowed.join(", ")
+            ));
         }
-        Ok("Context7: no results found.".into())
+        let data = std::fs::read(path).map_err(|e| format!("cannot read: {e}"))?;
+        if data.len() > 20 * 1024 * 1024 {
+            return Err("image too large (max 20 MB)".into());
+        }
+        let b64 = base64_encode(&data);
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+        Ok(format!("data:{mime};base64,{b64}"))
     }
 
     /// Run ripgrep (rg) with JSON output in the given directory.
-    /// Falls back gracefully if rg is not installed.
     pub fn grep_code(cwd: &str, pattern: &str, max_results: usize) -> Result<String, String> {
         let output = std::process::Command::new("rg")
             .args(["--json", "--line-number", "--no-heading", "--", pattern])
@@ -252,7 +346,6 @@ fn strip_html(html: &str) -> String {
             _ => {}
         }
     }
-    // Collapse multiple blank lines
     let mut result = String::new();
     let mut prev_empty = false;
     for line in out.lines() {

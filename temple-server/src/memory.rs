@@ -170,6 +170,24 @@ impl Memory {
             );\
             CREATE INDEX IF NOT EXISTS idx_documents_username ON documents(username);",
         )?;
+
+        // Version 5: FTS5 fulltext search on documents
+        migrate(
+            5,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(\
+                filename, content, content=documents, content_rowid=rowid\
+            );\
+            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN\
+                INSERT INTO documents_fts(rowid, filename, content) VALUES (new.rowid, new.filename, new.content);\
+            END;\
+            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN\
+                INSERT INTO documents_fts(documents_fts, rowid, filename, content) VALUES ('delete', old.rowid, old.filename, old.content);\
+            END;\
+            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN\
+                INSERT INTO documents_fts(documents_fts, rowid, filename, content) VALUES ('delete', old.rowid, old.filename, old.content);\
+                INSERT INTO documents_fts(rowid, filename, content) VALUES (new.rowid, new.filename, new.content);\
+            END;",
+        )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -687,6 +705,44 @@ impl Memory {
         limit: usize,
     ) -> rusqlite::Result<Vec<DocRow>> {
         let conn = self.conn.lock().await;
+        // Try FTS5 MATCH first; fall back to LIKE if FTS is empty
+        let fts_query = query
+            .split_whitespace()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.filename, d.username, d.mime_type, d.size, d.uploaded_at \
+             FROM documents d \
+             JOIN documents_fts fts ON d.rowid = fts.rowid \
+             WHERE d.username = ?1 AND documents_fts MATCH ?2 \
+             ORDER BY rank LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![username, fts_query, limit as i64], |row| {
+            Ok(DocRow {
+                id: row.get::<_, String>(0)?.parse().unwrap_or_default(),
+                filename: row.get(1)?,
+                username: row.get(2)?,
+                mime_type: row.get(3)?,
+                size: row.get(4)?,
+                uploaded_at: row.get(5)?,
+            })
+        });
+        let mut results = match rows {
+            Ok(r) => {
+                let mut v = Vec::new();
+                for r in r.flatten() {
+                    v.push(r);
+                }
+                if !v.is_empty() {
+                    return Ok(v);
+                }
+                v
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // Fallback to LIKE for partial matches FTS doesn't catch
         let like = format!("%{query}%");
         let mut stmt = conn.prepare(
             "SELECT id, filename, username, mime_type, size, uploaded_at \
@@ -703,7 +759,6 @@ impl Memory {
                 uploaded_at: row.get(5)?,
             })
         })?;
-        let mut results = Vec::new();
         for r in rows.flatten() {
             results.push(r);
         }

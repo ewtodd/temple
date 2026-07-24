@@ -461,6 +461,66 @@ impl CronScheduler {
         }
     }
 
+    /// Daily workout check-in for all registered users. Reads workout.md state
+    /// and prompts the agent to ask about today's workout. Serves as an example
+    /// of the general plugin pattern: trigger + system prompt + state file.
+    async fn workout_checkin(&self, today: &chrono::NaiveDate, hm: &str) {
+        if !hm.starts_with("08:00") {
+            return; // Only fire in the 8:00-8:01 minute window
+        }
+        let users = match self.memory.get_signal_users().await {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let data_dir = self.config.data_dir_workspace();
+        for (_username, _phone, uuid) in &users {
+            let recipient = uuid.as_deref().unwrap_or(_phone.as_str());
+            let state_path =
+                std::path::PathBuf::from(&data_dir).join(format!("workout_{recipient}.md"));
+            let existing = tokio::fs::read_to_string(&state_path)
+                .await
+                .unwrap_or_default();
+            let prompt = if existing.is_empty() {
+                format!(
+                    "You are a supportive fitness coach checking in on {recipient}. \
+                     Today is {today}. Ask if they worked out today. \
+                     Keep it short — 2 sentences max."
+                )
+            } else {
+                format!(
+                    "You are a supportive fitness coach checking in on {recipient}. \
+                     Today is {today}. Their log:\n\n{existing}\n\n\
+                     Review their recent activity. Encourage or celebrate accordingly. \
+                     Ask about today. Keep it short."
+                )
+            };
+            let req = crate::litellm::ChatRequest {
+                model: self.agent.models.default_model.clone(),
+                messages: vec![crate::litellm::ChatMessage::system(&prompt)],
+                tools: None,
+                stream: Some(false),
+                stream_options: None,
+                max_tokens: Some(256),
+                temperature: Some(0.7),
+            };
+            if let Ok(resp) = self.agent.litellm.chat(req).await {
+                if let Some(choice) = resp.choices.first() {
+                    if let Some(content) = choice.message.content_text() {
+                        self.signal.send(recipient, content).await.ok();
+                        let entry = format!("## {today}\n{content}\n\n");
+                        let updated = if existing.is_empty() {
+                            entry
+                        } else {
+                            format!("{entry}\n{existing}")
+                        };
+                        tokio::fs::create_dir_all(&data_dir).await.ok();
+                        tokio::fs::write(&state_path, &updated).await.ok();
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn run_forever(&self) -> Result<(), String> {
         // Track last-run dates so a job that misses its window (long model
         // call, server restart) still runs once that day instead of being
@@ -507,8 +567,9 @@ impl CronScheduler {
                 }
             }
 
-            // Run per-user cron jobs every minute
+            // Per-user cron jobs + workout check-in every minute
             self.run_user_cron().await;
+            self.workout_checkin(&today, &hm).await;
 
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
