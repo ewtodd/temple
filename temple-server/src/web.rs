@@ -11,8 +11,8 @@ pub async fn serve(
     _agent: Arc<Agent>,
     _config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-    tracing::info!("Web client available at http://127.0.0.1:8080");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    tracing::info!("Web client available at http://0.0.0.0:8080");
 
     loop {
         let (mut stream, _peer) = listener.accept().await?;
