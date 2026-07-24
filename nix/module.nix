@@ -214,7 +214,28 @@ in
 
   config = mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
-    environment.etc."temple/config.toml".source = configFile;
+    environment.etc = {
+      "temple/config.toml".source = configFile;
+    }
+    // builtins.listToAttrs (
+      mapAttrsToList (
+        username: keys: {
+          name = "temple/authorized_keys/${username}";
+          value = {
+            text = concatStringsSep "\n" keys + "\n";
+            mode = "0400";
+            user = "temple";
+            group = "temple";
+          };
+        }
+      ) cfg.daemonAuthorizedKeys
+    )
+    // (lib.optionalAttrs (cfg.gitSafeDirectories != [ ]) {
+      "temple/gitconfig".text = ''
+        [safe]
+        ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
+      '';
+    });
 
     users.users.temple = {
       isSystemUser = true;
@@ -225,31 +246,7 @@ in
     };
     users.groups.temple = { };
 
-    # Authorized daemon keys — stored in /etc/temple/authorized_keys/
-    # and symlinked into /var/lib/temple/authorized_keys/ for temple user access.
-    # Using environment.etc ensures files update on every deploy.
-    environment.etc =
-      builtins.listToAttrs (
-        mapAttrsToList (
-          username: keys: {
-            name = "temple/authorized_keys/${username}";
-            value = {
-              text = concatStringsSep "\n" keys + "\n";
-              mode = "0400";
-              user = "temple";
-              group = "temple";
-            };
-          }
-        ) cfg.daemonAuthorizedKeys
-      )
-      // (lib.optionalAttrs (cfg.gitSafeDirectories != [ ]) {
-        "temple/gitconfig".text = ''
-          [safe]
-          ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
-        '';
-      });
-
-    # Data dir + symlinks to the etc files
+    # Data dir + symlinks from /var/lib/temple to /etc/temple
     systemd.tmpfiles.rules =
       [
         "d ${cfg.dataDir} 0750 temple temple - -"
