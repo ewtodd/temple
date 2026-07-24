@@ -31,29 +31,16 @@ in
       description = "Temple server WebSocket URL.";
     };
 
-    daemons = mkOption {
-      type = types.attrsOf (types.submodule {
-        options = {
-          user = mkOption {
-            type = types.str;
-            example = "e-play";
-            description = "System user to run this daemon as.";
-          };
-        };
-      });
-      default = { };
-      example = lib.literalExpression ''
-        {
-          "e-play" = { };
-          "e-work" = { };
-        }
-      '';
-      description = "Per-user daemon configurations, keyed by username.";
+    userDaemons = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "e-play" "e-work" ];
+      description = "System usernames to run daemons for.";
     };
   };
 
   config = mkIf cfg.enable (
-    mapAttrs' (name: daemonCfg:
+    map (name:
       nameValuePair "temple-daemon-${name}" {
         description = "temple headless daemon — ${name}";
         wantedBy = [ "multi-user.target" ];
@@ -65,7 +52,7 @@ in
 
         serviceConfig = {
           Type = "simple";
-          User = daemonCfg.user;
+          User = name;
           Group = "users";
           ExecStart = escapeShellArgs [
             "${cfg.package}/bin/temple"
@@ -100,6 +87,6 @@ in
           RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
         };
       }
-    ) cfg.daemons
+    ) cfg.userDaemons
   );
 }
