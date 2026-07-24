@@ -18,8 +18,7 @@ agent — a persistent coding assistant that lives on oracle (M2 Mac mini,
 aarch64) and talks to GPU-hosted models via LiteLLM. Tools execute on
 your local machine through a headless daemon or the TUI client.
 
-The names `renco` and `temple` are a reference to the character Renco
-and the lost temple from the novel *Temple* by Matthew Reilly.
+The names `renco` and `temple` are a reference to the character Renco from the novel *Temple* by Matthew Reilly.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
