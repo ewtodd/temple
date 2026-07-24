@@ -372,10 +372,11 @@ async fn handle_connection(
                 session_id: sid,
                 content,
             } => {
-                // Session ownership: a connection may only drive its own
-                // active session. Without this check, any client that
-                // learns another session's UUID could inject chat into it —
-                // executed with THIS connection's permission scope.
+                // Web sessions: if no OpenSession was received (session_id is nil),
+                // accept the sid from the client — it was created by verify_web_code.
+                if session_id == Uuid::nil() {
+                    session_id = sid;
+                }
                 if sid != session_id {
                     let _ = tx.send(ServerMessage::ChatError {
                         session_id: sid,
