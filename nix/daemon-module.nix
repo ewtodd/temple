@@ -6,7 +6,6 @@
 {
   config,
   lib,
-  pkgs,
   templePackage,
   ...
 }:
@@ -50,14 +49,7 @@ in
           Type = "simple";
           User = name;
           Group = "users";
-          ExecStart = escapeShellArgs [
-            "${cfg.package}/bin/temple"
-            "--server"
-            cfg.server
-            "--daemon"
-            "--identity"
-            "%h/.ssh/id_ed25519"
-          ];
+          ExecStart = "${cfg.package}/bin/temple --server ${cfg.server} --daemon --identity %h/.ssh/id_ed25519";
           Restart = "always";
           RestartSec = "10s";
           StandardOutput = "journal";
