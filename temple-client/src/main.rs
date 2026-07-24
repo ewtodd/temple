@@ -89,9 +89,15 @@ fn main() {
             } else {
                 format!("{path}.pub")
             };
-            std::fs::read_to_string(&pub_path)
-                .ok()
-                .map(|s| s.trim().to_string())
+            std::fs::read_to_string(&pub_path).ok().map(|s| {
+                // Strip the comment from "type key comment" format
+                let parts: Vec<&str> = s.trim().splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    format!("{} {}", parts[0], parts[1])
+                } else {
+                    s.trim().to_string()
+                }
+            })
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

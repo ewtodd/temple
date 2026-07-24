@@ -25,10 +25,18 @@ fn discover_pubkey() -> Option<String> {
     ];
     for path in &candidates {
         if let Ok(key) = std::fs::read_to_string(path) {
-            let trimmed = key.trim().to_string();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
+            let trimmed = key.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            // Strip comment: "type key comment" → "type key"
+            let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+            let bare = if parts.len() >= 2 {
+                format!("{} {}", parts[0], parts[1])
+            } else {
+                trimmed.to_string()
+            };
+            return Some(bare);
         }
     }
     None
