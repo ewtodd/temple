@@ -9,17 +9,13 @@ use crate::tools::execute_local_tool;
 /// opens a session, and executes tool requests locally. Reconnects on
 /// disconnect with exponential backoff.
 ///
-/// `pubkey` is an optional SSH ed25519 public key string, used for
-/// daemon authentication. When set, the server verifies it is authorized
-/// for the claimed username.
+/// `pubkey` is an SSH ed25519 public key string (required). The server
+/// verifies it is authorized for the claimed owner.
 pub async fn run(
     server: String,
     cwd: PathBuf,
     client_id: String,
-    token: Option<String>,
-    force_tls: bool,
-    mode: PermissionMode,
-    pubkey: Option<String>,
+    pubkey: String,
 ) -> Result<(), String> {
     let cwd_str = cwd.to_string_lossy().to_string();
     let hostname = whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into());
@@ -37,10 +33,10 @@ pub async fn run(
                 .into(),
             hostname: hostname.clone(),
             username: username.clone(),
-            daemon_pubkey: pubkey.clone(),
+            daemon_pubkey: Some(pubkey.clone()),
         };
 
-        let (conn, _) = match client::connect(&server, &token, sess, force_tls).await {
+        let (conn, _) = match client::connect(&server, &None, sess, false).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("temple-daemon: connect failed: {e}");
@@ -50,20 +46,12 @@ pub async fn run(
             }
         };
 
-        // Successfully connected — reset backoff
         backoff = Duration::from_secs(1);
 
         let tx = conn.write;
         let mut incoming = conn.incoming;
 
-        eprintln!(
-            "temple-daemon: connected to {server}, cwd={cwd_str}, mode={mode:?}{}",
-            if pubkey.is_some() {
-                ""
-            } else {
-                " (no identity — running without daemon auth)"
-            }
-        );
+        eprintln!("temple-daemon: connected to {server}, cwd={cwd_str}",);
 
         // Main message loop
         while let Some(msg) = incoming.recv().await {
@@ -74,43 +62,13 @@ pub async fn run(
                 args_json,
             } = msg
             else {
-                // Non-tool messages are ignored in daemon mode
                 continue;
             };
 
-            // In YOLO mode, execute immediately. In other modes, apply
-            // client-side consent: allow only tools within the daemon's cwd.
-            let rid = request_id;
-            let sid = session_id;
-            let result = if mode == PermissionMode::Yolo {
-                execute_local_tool(&name, &args_json, &cwd_str, None, rid, sid).await
-            } else {
-                // Client-side consent for non-YOLO daemon
-                let needs_consent = match name.as_str() {
-                    "write_file" | "edit_file" => {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&args_json).unwrap_or_default();
-                        let path = args["path"].as_str().unwrap_or("");
-                        match crate::tools::resolve_tool_path(path, &cwd_str) {
-                            Ok(resolved) => !resolved.starts_with(&cwd_str),
-                            Err(_) => true,
-                        }
-                    }
-                    "execute_command" => {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&args_json).unwrap_or_default();
-                        let cmd = args["command"].as_str().unwrap_or("");
-                        !temple_protocol::command::is_safe_command(cmd)
-                    }
-                    _ => false,
-                };
-
-                if needs_consent {
-                    format!("Error: {name} denied — daemon is not in YOLO mode")
-                } else {
-                    execute_local_tool(&name, &args_json, &cwd_str, None, rid, sid).await
-                }
-            };
+            // Execute every tool immediately — permission decisions come
+            // from the session, not the daemon.
+            let result =
+                execute_local_tool(&name, &args_json, &cwd_str, None, request_id, session_id).await;
 
             let _ = tx.send(ClientMessage::ToolResult {
                 request_id,

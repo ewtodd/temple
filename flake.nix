@@ -70,6 +70,11 @@
         templePackage = self.packages.${pkgs.system}.temple-server;
       });
 
+    nixosModules.temple-daemon = { pkgs, ... }@args:
+      import ./nix/daemon-module.nix (args // {
+        templePackage = self.packages.${pkgs.system}.temple;
+      });
+
     nixosModules.default = self.nixosModules.temple-server;
   };
 }

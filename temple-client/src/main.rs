@@ -7,9 +7,8 @@ mod state;
 mod tools;
 mod ui;
 
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use temple_protocol::PermissionMode;
 
 #[derive(Parser)]
 #[command(name = "temple", about = "renco TUI client")]
@@ -31,34 +30,14 @@ struct Cli {
     tls: bool,
     #[arg(long, value_enum)]
     generate_completions: Option<Shell>,
-    /// Run as a headless daemon — executes tool requests locally, no UI
+    /// Run as a headless daemon — executes tool requests locally, no UI.
+    /// Requires --identity. Permission mode comes from the session, not the daemon.
     #[arg(long)]
     daemon: bool,
-    /// Permission mode for daemon mode (yolo/ask/lockdown). Default: yolo
-    #[arg(long, default_value = "yolo")]
-    mode: DaemonMode,
-    /// Path to SSH private key for daemon authentication (e.g. ~/.ssh/id_ed25519)
-    #[arg(long)]
+    /// Path to SSH private key for daemon authentication (e.g. ~/.ssh/id_ed25519).
+    /// Required when --daemon.
+    #[arg(long, required_if_eq("daemon", "true"))]
     identity: Option<String>,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum DaemonMode {
-    Default,
-    Ask,
-    Lockdown,
-    Yolo,
-}
-
-impl From<DaemonMode> for PermissionMode {
-    fn from(m: DaemonMode) -> Self {
-        match m {
-            DaemonMode::Default => PermissionMode::Default,
-            DaemonMode::Ask => PermissionMode::Ask,
-            DaemonMode::Lockdown => PermissionMode::Lockdown,
-            DaemonMode::Yolo => PermissionMode::Yolo,
-        }
-    }
 }
 
 impl Cli {
@@ -83,14 +62,13 @@ fn main() {
         .unwrap_or_else(|| whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()));
 
     if cli.daemon {
-        let pubkey = cli.identity.as_ref().and_then(|path| {
+        let pubkey = cli.identity.and_then(|path| {
             let pub_path = if path.ends_with(".pub") {
                 path.clone()
             } else {
                 format!("{path}.pub")
             };
             std::fs::read_to_string(&pub_path).ok().map(|s| {
-                // Strip the comment from "type key comment" format
                 let parts: Vec<&str> = s.trim().splitn(3, ' ').collect();
                 if parts.len() >= 2 {
                     format!("{} {}", parts[0], parts[1])
@@ -99,19 +77,13 @@ fn main() {
                 }
             })
         });
+        if pubkey.is_none() {
+            eprintln!("temple-daemon: --identity is required in daemon mode");
+            std::process::exit(1);
+        }
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = daemon::run(
-                cli.server,
-                cwd,
-                client_id,
-                cli.token,
-                cli.tls,
-                cli.mode.into(),
-                pubkey,
-            )
-            .await
-            {
+            if let Err(e) = daemon::run(cli.server, cwd, client_id, pubkey.unwrap()).await {
                 eprintln!("temple-daemon: fatal: {e}");
                 std::process::exit(1);
             }

@@ -691,6 +691,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if trimmed == "/sessions" {
+                            if !agent.has_daemon(&username).await {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "no daemon connected — start your machine's daemon first",
+                                )
+                                .await;
+                                return;
+                            }
                             // In groups, only list the group's SHARED sessions —
                             // a member's personal session titles must never leak
                             // into the group chat.
@@ -867,14 +877,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 rest.splitn(3, ' ').filter(|p| !p.is_empty()).collect();
                             let target = parts.first().copied();
                             let subdir = parts.get(1).copied();
-                            // Groups create shared "group"-owned sessions so the
-                            // conversation context belongs to the group, not to
-                            // whoever happened to create it.
                             let session_owner = if group_id.is_some() {
                                 "group"
                             } else {
                                 &username
                             };
+                            if !agent.has_daemon(&username).await {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "no daemon connected — start your machine's daemon first",
+                                )
+                                .await;
+                                return;
+                            }
                             match agent
                                 .new_persisted_session(session_owner, subdir, None, None)
                                 .await
@@ -1179,8 +1196,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let text = resp.lock().unwrap().clone();
                         if !text.trim().is_empty() {
-                            // Preamble for non-quick sessions
-                            let full = {
+                            // Preamble only for persisted sessions — ephemeral
+                            // Signal chats get the response plain.
+                            let is_persisted = agent.is_session_persisted(target_session).await;
+                            let full = if is_persisted {
                                 let target: Option<String> = None;
                                 let (title, mode) = agent
                                     .session_display(target_session)
@@ -1200,6 +1219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     mode_tag(mode),
                                     text
                                 )
+                            } else {
+                                text
                             };
                             send_conv(&signal, &sender, &group_id, &full).await;
                         }

@@ -829,6 +829,16 @@ impl Agent {
         }
     }
 
+    /// Whether a session is persisted (durable) vs ephemeral (daily swept).
+    pub async fn is_session_persisted(&self, session_id: Uuid) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|s| s.persist)
+            .unwrap_or(false)
+    }
+
     /// Cancel an in-progress agent loop for this session.
     pub async fn cancel_chat(&self, session_id: Uuid) {
         if let Some((_, token)) = self.cancel_tokens.lock().await.remove(&session_id) {

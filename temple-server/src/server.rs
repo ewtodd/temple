@@ -182,6 +182,13 @@ async fn handle_connection(
 
             ClientMessage::ListSessions => {
                 let owner = auth_owner.clone().unwrap_or_default();
+                if !agent.has_daemon(&owner).await {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: "no daemon connected — start your machine's daemon first".into(),
+                    });
+                    continue;
+                }
                 match memory.list_sessions(&owner, 10).await {
                     Ok(rows) => {
                         let sessions = rows
@@ -250,6 +257,13 @@ async fn handle_connection(
                 start_dir,
             } => {
                 let owner = auth_owner.clone().unwrap_or_default();
+                if !agent.has_daemon(&owner).await {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: "no daemon connected — start your machine's daemon first".into(),
+                    });
+                    continue;
+                }
                 match agent
                     .new_persisted_session(
                         &owner,
