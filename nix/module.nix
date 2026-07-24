@@ -225,26 +225,41 @@ in
     };
     users.groups.temple = { };
 
-    # Authorized daemon keys
+    # Authorized daemon keys — stored in /etc/temple/authorized_keys/
+    # and symlinked into /var/lib/temple/authorized_keys/ for temple user access.
+    # Using environment.etc ensures files update on every deploy.
+    environment.etc =
+      builtins.listToAttrs (
+        mapAttrsToList (
+          username: keys: {
+            name = "temple/authorized_keys/${username}";
+            value = {
+              text = concatStringsSep "\n" keys + "\n";
+              mode = "0400";
+              user = "temple";
+              group = "temple";
+            };
+          }
+        ) cfg.daemonAuthorizedKeys
+      )
+      // (lib.optionalAttrs (cfg.gitSafeDirectories != [ ]) {
+        "temple/gitconfig".text = ''
+          [safe]
+          ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
+        '';
+      });
+
+    # Data dir + symlinks to the etc files
     systemd.tmpfiles.rules =
       [
         "d ${cfg.dataDir} 0750 temple temple - -"
-        "d ${cfg.dataDir}/authorized_keys 0700 temple temple - -"
+        "d ${cfg.dataDir}/authorized_keys 0750 temple temple - -"
       ]
-      ++ mapAttrsToList (
-        username: keys:
-        "f ${cfg.dataDir}/authorized_keys/${username} 0400 temple temple - ${concatStringsSep "\n" keys}\n"
+      ++ mapAttrsToList (username: _keys:
+        "L+ ${cfg.dataDir}/authorized_keys/${username} - - - - /etc/temple/authorized_keys/${username}"
       ) cfg.daemonAuthorizedKeys
       ++ lib.optional (cfg.gitSafeDirectories != [ ])
         "L+ ${cfg.dataDir}/.gitconfig - - - - /etc/temple/gitconfig";
-
-    # gitconfig marking configured repos as safe for the temple user
-    environment.etc."temple/gitconfig" = mkIf (cfg.gitSafeDirectories != [ ]) {
-      text = ''
-        [safe]
-        ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
-      '';
-    };
 
     systemd.services.temple-server = {
       description = "temple agent harness server — renco";
