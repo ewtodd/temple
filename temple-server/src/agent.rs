@@ -188,6 +188,18 @@ pub struct Agent {
     /// Active daemon connections: username → count (multiple sessions per user).
     /// Used for Signal sandboxing — users without a daemon get restricted tools.
     daemon_connections: Mutex<HashMap<String, u32>>,
+    /// Pending web authentication: code → (tx_channel, expiry).
+    /// The tx channel is used to notify the WebSocket connection when
+    /// verification succeeds via Signal.
+    pub pending_web_auth: tokio::sync::Mutex<
+        HashMap<
+            String,
+            (
+                tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+                std::time::Instant,
+            ),
+        >,
+    >,
 }
 
 impl Agent {
@@ -209,6 +221,7 @@ impl Agent {
             ),
             tools: Mutex::new(Vec::new()),
             daemon_connections: Mutex::new(HashMap::new()),
+            pending_web_auth: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -235,6 +248,50 @@ impl Agent {
     /// Check if a user has at least one active daemon connection.
     pub async fn has_daemon(&self, username: &str) -> bool {
         self.daemon_connections.lock().await.contains_key(username)
+    }
+
+    /// Generate a web auth code and store it with the notification channel.
+    pub async fn generate_web_code(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+    ) -> String {
+        use rand::Rng;
+        let code: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(6)
+            .map(|c| c.to_ascii_uppercase() as char)
+            .collect();
+        self.pending_web_auth
+            .lock()
+            .await
+            .insert(code.clone(), (tx, std::time::Instant::now()));
+        code
+    }
+
+    /// Verify a web auth code (called from Signal handler). If valid,
+    /// sends WebAuthDone through the stored channel, creates a session,
+    /// and returns Some(session_id). Returns None if invalid or expired.
+    pub async fn verify_web_code(&self, code: &str, username: &str) -> Option<Uuid> {
+        let mut map = self.pending_web_auth.lock().await;
+        map.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
+        if let Some((tx, _)) = map.remove(code) {
+            let session_id = uuid::Uuid::new_v4();
+            use crate::router::SessionKind;
+            self.open_session(
+                session_id,
+                username,
+                "/var/lib/temple",
+                crate::router::SessionKind::Interactive,
+            )
+            .await;
+            let _ = tx.send(ServerMessage::WebAuthDone {
+                username: username.to_string(),
+                session_id,
+            });
+            Some(session_id)
+        } else {
+            None
+        }
     }
 
     /// Sandboxed tool set — memories and tasks only, no filesystem or shell.

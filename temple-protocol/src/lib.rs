@@ -130,6 +130,8 @@ pub enum ClientMessage {
         account: String,
     },
     Ping,
+    /// Web client requests a verification code (displayed to user).
+    WebAuth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +234,15 @@ pub enum ServerMessage {
         prefill_tps: f64,
         /// generation speed (approx: first token → stream end)
         decode_tps: f64,
+    },
+    /// Web auth: verification code to display to the user.
+    WebAuthCode {
+        code: String,
+    },
+    /// Web auth: authentication successful.
+    WebAuthDone {
+        username: String,
+        session_id: Uuid,
     },
 }
 

@@ -554,6 +554,11 @@ async fn handle_connection(
             ClientMessage::Ping => {
                 let _ = tx.send(ServerMessage::Pong);
             }
+
+            ClientMessage::WebAuth => {
+                let code = agent.generate_web_code(tx.clone()).await;
+                let _ = tx.send(ServerMessage::WebAuthCode { code });
+            }
         }
     }
 

@@ -11,6 +11,7 @@ mod queue;
 mod router;
 mod server;
 mod signal;
+mod web;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
@@ -853,6 +854,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // canned reply. (Skipped in groups: acks would spam
                         // everyone.)
                         if group_id.is_none() {
+                            // Check if this is a web verification code (6 uppercase alphanumeric)
+                            let upper = trimmed.to_uppercase();
+                            if upper.len() == 6 && upper.chars().all(|c| c.is_ascii_alphanumeric())
+                            {
+                                let username = username.clone();
+                                let code = upper.clone();
+                                let agent_c = agent.clone();
+                                let signal_c = signal.clone();
+                                let sender_c = sender.clone();
+                                let group_id_c = group_id.clone();
+                                tokio::spawn(async move {
+                                    if let Some(_sid) =
+                                        agent_c.verify_web_code(&code, &username).await
+                                    {
+                                        send_conv(&signal_c, &sender_c, &group_id_c, "renco web login successful — your session is now active").await;
+                                        tracing::info!("web auth: {username} verified via Signal");
+                                    } else {
+                                        send_conv(&signal_c, &sender_c, &group_id_c, "code expired or invalid — refresh the web page for a new one").await;
+                                    }
+                                });
+                                return;
+                            }
+
                             let norm = trimmed.trim_end_matches(['.', '!']).to_lowercase();
                             const ACKS: &[&str] = &[
                                 "ok",
@@ -1208,6 +1232,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cfg.signal.enabled {
         notify_admins(&signal, &memory, "Temple server started, renco is online.").await;
     }
+
+    // Spawn HTTP server for the web client (serves static HTML).
+    let web_agent = agent.clone();
+    let web_cfg = cfg.clone();
+    tokio::spawn(async move {
+        if let Err(e) = web::serve(web_agent, web_cfg).await {
+            tracing::error!("web server failed: {e}");
+        }
+    });
 
     // Run the WebSocket server, with graceful shutdown on SIGTERM/SIGINT:
     // cancel in-flight loops and persist sessions before exiting, so no

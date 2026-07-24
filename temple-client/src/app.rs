@@ -545,6 +545,8 @@ impl App {
                             }
                             ServerMessage::Pong
                             | ServerMessage::SessionClosed { .. }
+                            | ServerMessage::WebAuthCode { .. }
+                            | ServerMessage::WebAuthDone { .. }
                             | ServerMessage::ToolResult { .. }
                             | ServerMessage::ToolRequest { .. } => {}
                         }

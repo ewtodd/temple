@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>renco — temple web</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --dim: #8b949e;
+  --cyan: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d2991d;
+  --magenta: #bc8cff;
+  --blue: #58a6ff;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+}
+header h1 { font-size: 14px; font-weight: 600; color: var(--cyan); }
+header .status { font-size: 12px; color: var(--dim); }
+#chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#chat::-webkit-scrollbar { width: 6px; }
+#chat::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.msg { max-width: 85%; line-height: 1.5; font-size: 13px; padding: 8px 12px; border-radius: 8px; }
+.msg.user { background: var(--blue); color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
+.msg.agent { background: var(--surface); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 2px; }
+.msg.system { color: var(--dim); font-style: italic; font-size: 12px; align-self: center; padding: 2px 8px; background: none; }
+.msg.error { color: var(--red); align-self: center; font-size: 12px; }
+.msg pre { background: #0d1117; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+.msg code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
+.msg p { margin: 4px 0; }
+.msg p:first-child { margin-top: 0; }
+.msg p:last-child { margin-bottom: 0; }
+footer {
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  padding: 8px 16px;
+  flex-shrink: 0;
+}
+#input-row { display: flex; gap: 8px; }
+#input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+#input:focus { border-color: var(--cyan); }
+#send {
+  background: var(--cyan);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#send:disabled { opacity: 0.4; cursor: default; }
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.auth-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px;
+  text-align: center;
+  max-width: 360px;
+  width: 90%;
+}
+.auth-box h2 { font-size: 18px; margin-bottom: 8px; }
+.auth-box p { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+.code-display {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 36px;
+  letter-spacing: 8px;
+  color: var(--cyan);
+  margin: 16px 0;
+  user-select: all;
+  cursor: pointer;
+}
+.code-display:hover { background: var(--border); border-radius: 6px; }
+.spinner { animation: spin 1s linear infinite; font-size: 24px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚛ renco</h1>
+  <span class="status" id="status">connecting…</span>
+</header>
+<div id="chat"></div>
+<footer>
+  <form id="input-row" autocomplete="off">
+    <input id="input" placeholder="message renco…" disabled autofocus>
+    <button id="send" disabled>send</button>
+  </form>
+</footer>
+<div class="auth-overlay" id="auth">
+  <div class="auth-box">
+    <h2>verify with Signal</h2>
+    <p id="auth-msg">opening connection…</p>
+    <div class="code-display" id="auth-code" style="display:none"></div>
+    <p style="font-size:11px;color:var(--dim);margin-top:12px">
+      text this code to renco on Signal to log in
+    </p>
+  </div>
+</div>
+<script>
+const WS_URL = `wss://${location.host}`;
+let ws, sessionId, username;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    document.getElementById('status').textContent = 'requesting code…';
+    ws.send(JSON.stringify({ type: 'WebAuth' }));
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handle(msg);
+  };
+  ws.onclose = () => {
+    document.getElementById('status').textContent = 'disconnected';
+    document.getElementById('input').disabled = true;
+    document.getElementById('send').disabled = true;
+    setTimeout(connect, 2000);
+  };
+}
+
+function handle(msg) {
+  switch (msg.type) {
+    case 'WebAuthCode':
+      document.getElementById('auth-code').textContent = msg.code;
+      document.getElementById('auth-code').style.display = 'block';
+      document.getElementById('auth-msg').textContent = 'text this code to renco on Signal';
+      break;
+    case 'WebAuthDone':
+      username = msg.username;
+      sessionId = msg.session_id;
+      document.getElementById('auth').style.display = 'none';
+      document.getElementById('status').textContent = `ready — ${username}`;
+      document.getElementById('input').disabled = false;
+      document.getElementById('send').disabled = false;
+      document.getElementById('input').focus();
+      addMsg('system', `connected as ${username}`);
+      break;
+    case 'ChatDelta':
+      if (msg.done) break;
+      appendOrCreate(msg.delta);
+      break;
+    case 'ToolEvent':
+      if (msg.status === 'Started') addMsg('system', `⟳ ${msg.name}`);
+      else if (msg.status === 'Finished') addMsg('system', `✓ ${msg.name}${msg.detail ? ': ' + msg.detail.split('\n')[0] : ''}`);
+      else if (msg.status === 'Failed') addMsg('error', `✗ ${msg.name}`);
+      break;
+    case 'ChatError':
+      document.getElementById('status').textContent = msg.error;
+      break;
+    case 'ChatStats':
+      document.getElementById('status').textContent = `ready — ${username}`;
+      break;
+  }
+}
+
+let currentAgent;
+function appendOrCreate(delta) {
+  if (!currentAgent) {
+    currentAgent = document.createElement('div');
+    currentAgent.className = 'msg agent';
+    document.getElementById('chat').appendChild(currentAgent);
+  }
+  currentAgent.innerHTML += delta.replace(/\n/g, '<br>');
+  document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+}
+function addMsg(cls, text) {
+  currentAgent = null;
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.innerHTML = text.replace(/\n/g, '<br>');
+  document.getElementById('chat').appendChild(d);
+  document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+}
+document.getElementById('input-row').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text || !sessionId) return;
+  addMsg('user', text);
+  input.value = '';
+  ws.send(JSON.stringify({ type: 'ChatInput', session_id: sessionId, content: text }));
+  document.getElementById('status').textContent = 'thinking…';
+});
+connect();
+</script>
+</body>
+</html>
