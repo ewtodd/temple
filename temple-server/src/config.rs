@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub listen: String,
-    pub model_endpoints: HashMap<String, String>,
-    pub model_api_keys: HashMap<String, String>,
+    pub litellm_url: String,
+    pub litellm_api_key: Option<String>,
     pub db_path: PathBuf,
     pub signal: SignalConfig,
     pub nextcloud: NextcloudConfig,
@@ -137,16 +136,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:42123".into(),
-            model_endpoints: HashMap::from([
-                (
-                    "deepseek-v4-flash-high".into(),
-                    "http://son-of-anton:8080/v1".into(),
-                ),
-                ("qwen3-4b-instruct".into(), "http://anton:8080/v1".into()),
-                ("qwen3.6-27b-coding".into(), "http://anton:8080/v1".into()),
-                ("gemma-4-31b".into(), "http://anton:8080/v1".into()),
-            ]),
-            model_api_keys: HashMap::new(),
+            litellm_url: "https://llm.ethanwtodd.com".into(),
+            litellm_api_key: None,
             db_path: PathBuf::from("./temple-memory.db"),
             signal: SignalConfig::default(),
             nextcloud: NextcloudConfig::default(),

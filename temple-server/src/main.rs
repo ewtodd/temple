@@ -14,7 +14,6 @@ mod signal;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
-use std::collections::HashMap;
 use std::sync::Arc;
 use temple_protocol::PermissionMode;
 use tokio::sync::Mutex;
@@ -84,16 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load config
     let cfg = config::Config::load(cli.config.as_deref());
-    // --litellm-url overrides all model endpoints (backward compat)
     let cfg = if let Some(url) = cli.litellm_url {
-        let mut c = cfg;
-        let single: HashMap<String, String> = c
-            .model_endpoints
-            .keys()
-            .map(|k| (k.clone(), url.clone()))
-            .collect();
-        c.model_endpoints = single;
-        c
+        config::Config {
+            litellm_url: url,
+            ..cfg
+        }
     } else {
         cfg
     };
@@ -120,12 +114,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
 
     tracing::info!("Starting temple server...");
-    tracing::info!(
-        "Model endpoints: {:?}",
-        cfg.model_endpoints.keys().collect::<Vec<_>>()
-    );
+    tracing::info!("Litellm endpoint: {}", cfg.litellm_url);
     tracing::info!("Database: {}", cfg.db_path.display());
     tracing::info!("Listening on: {}", cfg.listen);
+
+    let api_key = cfg
+        .litellm_api_key
+        .clone()
+        .or_else(|| std::env::var("LITELLM_API_KEY").ok())
+        // Reuse the fleet's existing litellm-master-key agenix secret directly
+        .or_else(|| std::env::var("LITELLM_MASTER_KEY").ok())
+        .unwrap_or_else(|| {
+            tracing::warn!("No litellm API key set — using 'empty'");
+            "empty".into()
+        });
 
     let memory = Arc::new(
         memory::Memory::open(&cfg.db_path)
@@ -133,21 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Failed to open database"),
     );
 
-    // Initialize inference client + MCP
-    let api_keys: HashMap<String, Option<String>> = cfg
-        .model_api_keys
-        .iter()
-        .map(|(k, v)| (k.clone(), Some(v.clone())))
-        .collect();
-    let litellm = crate::litellm::LlamaSwapClient::new(cfg.model_endpoints.clone(), api_keys);
-    let mcp = mcp::McpClient::new(
-        &cfg.model_endpoints
-            .values()
-            .next()
-            .cloned()
-            .unwrap_or_default(),
-        "none",
-    );
+    // Initialize litellm + MCP clients
+    let litellm = litellm::LiteLLM::new(&cfg.litellm_url, &api_key);
+    let mcp = mcp::McpClient::new(&cfg.litellm_url, &api_key);
 
     // Initialize agent
     let agent = agent::Agent::new(litellm, mcp, memory.clone(), cfg.models.clone());
@@ -1387,7 +1377,7 @@ async fn notify_admins(
 /// Describe an image via a vision-capable model. Takes a pre-encoded
 /// data:image/...;base64,... URL and returns the model's text response.
 async fn litellm_describe_image(
-    litellm: &crate::litellm::LlamaSwapClient,
+    litellm: &crate::litellm::LiteLLM,
     model: &str,
     image_url: &str,
 ) -> Result<String, String> {
