@@ -69,7 +69,7 @@ fn resolve_tool_path_for(path: &str, cwd: &str, for_write: bool) -> Result<PathB
     }
 
     let canonical_base = std::fs::canonicalize(&candidate)
-        .map_err(|e| format!("cannot resolve {:?}: {}", abs, e))?;
+        .map_err(|e| format!("cannot resolve {:?}: {}", candidate, e))?;
     let resolved = canonical_base.join(&suffix);
     let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
 
@@ -99,7 +99,7 @@ pub async fn execute_local_tool(
 
     match name {
         "read_file" => {
-            let path = args["path"].as_str().unwrap_or("");
+            let path = args["path"].as_str().unwrap_or(".");
             match resolve_tool_path(path, cwd) {
                 Err(e) => format!("Error: {e}"),
                 Ok(resolved) => match tokio::fs::File::open(&resolved).await {

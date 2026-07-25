@@ -137,12 +137,12 @@ impl App {
                             session_id,
                             ref name,
                             ref args_json,
-                            ..
+                            session_cwd,
                         } = msg
                         {
                             let (cwd_str, active_sid, mode) = {
                                 let g = s_clone.lock().unwrap();
-                                (g.cwd.clone(), g.session_id, g.mode)
+                                (session_cwd, g.session_id, g.mode)
                             };
                             if session_id != active_sid {
                                 let _ = tx_task.send(ClientMessage::ToolResult {
@@ -569,6 +569,9 @@ impl App {
                                 transcript,
                             } => {
                                 s.session_id = session_id;
+                                if !meta.cwd.is_empty() {
+                                    s.cwd = meta.cwd.clone();
+                                }
                                 s.working = false;
                                 s.work_started = None;
                                 s.mode = match meta.mode.as_str() {
