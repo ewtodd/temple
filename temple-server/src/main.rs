@@ -451,19 +451,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &sender,
                                 &group_id,
                                 "commands:\n\
-                             /sessions — list your recent sessions\n\
-                             /session <id-prefix> — resume a session\n\
-                             /delete <id-prefix> — delete a session\n\
-                             /new <target> [dir] — new coding session\n\
-                             /new — new session\n\
-                             /quick — back to the default session\n\
-                             /mode [default|ask|lockdown|yolo] — show/set permission mode\n\
-                             /stop — interrupt the running request\n\
-                             /reset — cancel ALL in-flight requests (admin)\n\
-                             /clear <user|account> \u{2014} delete sessions for a user (admin)\n\
+                              /clear <user|account> \u{2014} delete sessions for a user (admin)\n\
+                              /delete <id-prefix> — delete a session\n\
+                              /help — this\n\
+                              /mode [default|ask|lockdown|yolo] — show/set permission mode\n\
+                              /model [auto|<name>] — show/set model for active session\n\
+                              /models — list available models\n\
+                              /new — new session\n\
+                              /new <target> [dir] — new coding session\n\
                               /nuke \u{2014} delete ALL sessions (admin, confirm with /nuke confirm)\n\
-                              /targets \u{2014} list ssh targets\n\
-                             /help — this",
+                              /quick — back to the default session\n\
+                              /reset — cancel ALL in-flight requests (admin)\n\
+                              /session <id-prefix> — resume a session\n\
+                              /sessions — list your recent sessions\n\
+                              /stop — interrupt the running request\n\
+                              /targets \u{2014} list ssh targets",
                             )
                             .await;
                             return;
@@ -868,6 +870,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &format!("mode → [{}]", mode_tag(mode)),
                             )
                             .await;
+                            return;
+                        }
+
+                        if trimmed == "/model" || trimmed.starts_with("/model ") {
+                            let arg = trimmed.strip_prefix("/model").unwrap().trim();
+                            let target_session = active.lock().await.get(&conv_key).copied();
+                            let Some(sid) = target_session else {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "no active session — /new one first",
+                                )
+                                .await;
+                                return;
+                            };
+                            if arg.is_empty() {
+                                let current = agent.session_model(sid).await;
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    &format!("current model: {current}"),
+                                )
+                                .await;
+                            } else if arg == "auto" {
+                                agent.reset_session_model(sid).await;
+                                let current = agent.session_model(sid).await;
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    &format!("model → {current} (auto-routing)"),
+                                )
+                                .await;
+                            } else {
+                                agent.set_session_model(sid, arg).await;
+                                send_conv(&signal, &sender, &group_id, &format!("model → {arg}"))
+                                    .await;
+                            }
+                            return;
+                        }
+
+                        if trimmed == "/models" {
+                            match agent.litellm.list_models().await {
+                                Ok(models) => {
+                                    let body = if models.is_empty() {
+                                        "no models available".to_string()
+                                    } else {
+                                        models.join("\n")
+                                    };
+                                    send_conv(&signal, &sender, &group_id, &body).await;
+                                }
+                                Err(e) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("error listing models: {e}"),
+                                    )
+                                    .await;
+                                }
+                            }
                             return;
                         }
 

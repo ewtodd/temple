@@ -498,6 +498,8 @@ fn handle_key_event(
                     "/delete ",
                     "/help",
                     "/mode ",
+                    "/model ",
+                    "/models",
                     "/new ",
                     "/q",
                     "/quit",
@@ -505,10 +507,18 @@ fn handle_key_event(
                     "/sessions",
                 ];
                 let prefix = s.prompt.as_str();
-                let current = commands.iter().position(|c| c == &prefix);
-                let next = current.map(|i| (i + 1) % commands.len()).unwrap_or(0);
-                s.prompt = commands[next].to_string();
-                s.prompt_cursor = s.prompt.chars().count();
+                if let Some(current) = commands.iter().position(|c| c == &prefix) {
+                    let next = (current + 1) % commands.len();
+                    s.prompt = commands[next].to_string();
+                    s.prompt_cursor = s.prompt.chars().count();
+                } else {
+                    let start = commands
+                        .iter()
+                        .position(|c| c.starts_with(prefix))
+                        .unwrap_or(0);
+                    s.prompt = commands[start].to_string();
+                    s.prompt_cursor = s.prompt.chars().count();
+                }
             }
         }
         _ => {}
@@ -533,22 +543,39 @@ fn handle_slash_command(
     }
     if content == "/help" || content == "/?" {
         let help_text = "\
-Commands:                     Keys:
-  /clear           clear chat    Ctrl+G   edit in $EDITOR
-  /delete <n>      permanently   Ctrl+L   clear (same)
-  /help            this help     Ctrl+C   cancel agent
-  /mode <m>        permission    Ctrl+U   clear prompt
-  /model <id>      switch model  Ctrl+J/K scroll by 10
-  /new [target]    start new     PgUp/Dn  scroll by 10
-  /q, /quit        exit          Shift+Tab cycle mode
-  /session <n>     resume        Esc      clear prompt
-  /sessions        list          Tab      cycle commands";
+Commands:
+  /clear          clear chat
+  /delete <n>     permanently delete session
+  /help           this help
+  /mode <m>       set permission mode
+  /model <name>   set model (bare to show current)
+  /models         list available models
+  /new [target]   start new session
+  /q              exit
+  /quit           exit
+  /session <n>    resume session
+  /sessions       list sessions
+
+Keys:
+  Ctrl+C      cancel agent
+  Ctrl+G      edit in $EDITOR
+  Ctrl+J/K    scroll by 10
+  Ctrl+L      clear chat
+  Ctrl+U      clear prompt
+  Esc         clear prompt
+  PgUp/Dn     scroll by 10
+  Shift+Tab   cycle permission mode
+  Tab         cycle commands";
         s.entries
             .push(crate::state::ChatEntry::System(help_text.into()));
         return true;
     }
     if content == "/sessions" {
         cmd_tx.send(ClientMessage::ListSessions).ok();
+        return true;
+    }
+    if content == "/models" {
+        cmd_tx.send(ClientMessage::ListModels).ok();
         return true;
     }
     if let Some(n_str) = content.strip_prefix("/session ") {
@@ -625,10 +652,20 @@ Commands:                     Keys:
             .ok();
         return true;
     }
+    if content == "/model" {
+        s.entries.push(crate::state::ChatEntry::System(format!(
+            "current model: {}",
+            s.model
+        )));
+        return true;
+    }
     if let Some(model) = content.strip_prefix("/model ") {
         let m = model.trim();
         if m.is_empty() {
-            cmd_tx.send(ClientMessage::ListModels).ok();
+            s.entries.push(crate::state::ChatEntry::System(format!(
+                "current model: {}",
+                s.model
+            )));
         } else {
             cmd_tx
                 .send(ClientMessage::SetModel {
