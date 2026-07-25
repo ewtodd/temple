@@ -516,6 +516,8 @@ async fn handle_connection(
                                     context_length: stats.context_length,
                                     prefill_tps: stats.prefill_tps,
                                     decode_tps: stats.decode_tps,
+                                    cache_hit_tokens: stats.cache_hit_tokens,
+                                    cache_miss_tokens: stats.cache_miss_tokens,
                                 }
                             }
                             AgentEvent::Error(e) => ServerMessage::ChatError {

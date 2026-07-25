@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Timeout for draining error response bodies from a hung upstream.
+const ERROR_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct LiteLLM {
     client: HttpClient,
@@ -136,7 +139,7 @@ pub struct ToolFunctionDef {
     pub parameters: Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -150,6 +153,18 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub type_field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -172,11 +187,70 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Tokens served from the provider's prefix cache.
+    /// Normalised during deserialization from DeepSeek (top-level
+    /// `prompt_cache_hit_tokens`) and OpenAI (nested
+    /// `prompt_tokens_details.cached_tokens`).
+    #[serde(default)]
+    pub cache_hit_tokens: u32,
+    /// Tokens NOT in cache — full-recompute prompt tokens.
+    #[serde(default)]
+    pub cache_miss_tokens: u32,
+}
+
+/// Provider-specific usage details that live inside `usage.prompt_tokens_details`.
+#[derive(Debug, Clone, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+/// Raw deserialization target — captures every cache-related field from
+/// every provider format so `Usage` can normalise them.
+#[derive(Debug, Clone, Deserialize)]
+struct RawUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+    #[serde(default)]
+    prompt_cache_hit_tokens: u32,
+    #[serde(default)]
+    prompt_cache_miss_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawUsage::deserialize(deserializer)?;
+        // DeepSeek puts cache hit/miss at top level; OpenAI/MiMo nest them.
+        // Prefer the DeepSeek fields when present; otherwise fall back to
+        // the nested cached_tokens (which represents cache hits).
+        let has_top_level = raw.prompt_cache_hit_tokens > 0 || raw.prompt_cache_miss_tokens > 0;
+        let (hit, miss) = if has_top_level {
+            (raw.prompt_cache_hit_tokens, raw.prompt_cache_miss_tokens)
+        } else if let Some(details) = &raw.prompt_tokens_details {
+            let cached = details.cached_tokens;
+            (cached, raw.prompt_tokens.saturating_sub(cached))
+        } else {
+            (0, 0)
+        };
+        Ok(Usage {
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            total_tokens: raw.total_tokens,
+            cache_hit_tokens: hit,
+            cache_miss_tokens: miss,
+        })
+    }
 }
 
 // ── Streaming types ──
@@ -260,6 +334,15 @@ impl LiteLLM {
         }
     }
 
+    /// Drain an error response body with a deadline, so a hung upstream
+    /// doesn't wedge the retry loop. Returns the (possibly truncated) body.
+    async fn drain_error_body(resp: reqwest::Response) -> String {
+        match tokio::time::timeout(ERROR_BODY_DRAIN_TIMEOUT, resp.text()).await {
+            Ok(Ok(body)) => body,
+            _ => "(error body unavailable)".to_string(),
+        }
+    }
+
     fn headers(&self) -> reqwest::header::HeaderMap {
         use reqwest::header;
         let mut h = header::HeaderMap::new();
@@ -284,15 +367,17 @@ impl LiteLLM {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::drain_error_body(resp).await;
             return Err(format!(
                 "litellm {status}: {}",
                 body.chars().take(500).collect::<String>()
             ));
         }
-        resp.json::<ChatResponse>()
+        let parsed = resp
+            .json::<ChatResponse>()
             .await
-            .map_err(|e| format!("parse error: {e}"))
+            .map_err(|e| format!("parse error: {e}"))?;
+        Ok(parsed)
     }
 
     /// Streaming completion. Sends events through the channel as they arrive.
@@ -331,7 +416,7 @@ impl LiteLLM {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::drain_error_body(resp).await;
             return Err(format!(
                 "litellm {status}: {}",
                 body.chars().take(500).collect::<String>()
@@ -597,6 +682,7 @@ impl LiteLLM {
             stream_options: None,
             max_tokens: Some(10),
             temperature: Some(0.0),
+            ..Default::default()
         };
 
         let resp = self.chat(req).await.ok()?;

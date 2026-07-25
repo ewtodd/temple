@@ -172,6 +172,7 @@ impl CronScheduler {
             stream_options: None,
             max_tokens: Some(2048),
             temperature: Some(0.3),
+            ..Default::default()
         };
 
         match self.agent.litellm.chat(req).await {
@@ -420,6 +421,7 @@ impl CronScheduler {
                     stream_options: None,
                     max_tokens: Some(1024),
                     temperature: Some(0.2),
+                    ..Default::default()
                 };
 
                 match self.agent.litellm.chat(req).await {
@@ -502,6 +504,7 @@ impl CronScheduler {
                 stream_options: None,
                 max_tokens: Some(256),
                 temperature: Some(0.7),
+                ..Default::default()
             };
             if let Ok(resp) = self.agent.litellm.chat(req).await {
                 if let Some(choice) = resp.choices.first() {

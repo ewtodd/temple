@@ -7,7 +7,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::ModelConfig;
-use crate::litellm::{ChatMessage, ChatRequest, LiteLLM, StreamEvent, ToolDefinition};
+use crate::litellm::{
+    ChatMessage, ChatRequest, LiteLLM, MessageContent, StreamEvent, ToolDefinition,
+};
 use crate::mcp::McpClient;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
@@ -25,6 +27,109 @@ const MAX_STREAM_RETRIES: usize = 3;
 const STUCK_THRESHOLD: usize = 3;
 /// Max planner→executor→reviewer revision rounds
 const MAX_REVISION_ROUNDS: usize = 3;
+/// Approximate context window in tokens. Used for snip/prune thresholds.
+const CONTEXT_WINDOW_TOKENS: usize = 64_000;
+/// Fraction of context window at which we start snipping stale tool results
+/// (keep head+tail, elide middle). Zero-cost; no summarizer API call.
+const SNIP_RATIO: f64 = 0.5;
+/// Fraction of context window at which we prune stale tool results entirely
+/// (replace with one-liner archival markers). Still zero-cost.
+const PRUNE_RATIO: f64 = 0.7;
+/// Fraction of context window at which we trigger summary compaction.
+/// After snip+prune, if still above this ratio, the oldest portion of the
+/// conversation is folded into a structured summary by a small model.
+const COMPACT_RATIO: f64 = 0.8;
+/// Token budget for the tail that stays verbatim after compaction.
+const TAIL_TOKENS: usize = 16_000;
+/// How many chars to keep from the start of a snipped tool result.
+const SNIP_HEAD_CHARS: usize = 600;
+/// How many chars to keep from the end of a snipped tool result.
+const SNIP_TAIL_CHARS: usize = 300;
+
+/// Rough token count estimator: ~4 bytes per token for English text.
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+/// Estimate tokens for a ChatMessage based on its text content.
+fn message_tokens(msg: &ChatMessage) -> usize {
+    msg.content_text().map(estimate_tokens).unwrap_or(0)
+}
+
+/// Shorten a tool result by keeping head+tail and inserting a snip marker.
+fn snip_tool_result(content: &str) -> String {
+    let len = content.len();
+    if len <= SNIP_HEAD_CHARS + SNIP_TAIL_CHARS + 50 {
+        return content.to_string();
+    }
+    let head = content.chars().take(SNIP_HEAD_CHARS).collect::<String>();
+    let tail: String = content
+        .chars()
+        .rev()
+        .take(SNIP_TAIL_CHARS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n…[snip {} chars]…\n{tail}",
+        len.saturating_sub(SNIP_HEAD_CHARS + SNIP_TAIL_CHARS)
+    )
+}
+
+/// Walk history from oldest to newest and apply snip/prune to stale tool
+/// results when the estimated token count exceeds the configured ratios.
+/// Modifies messages in-place. Returns the total estimated tokens after
+/// processing.
+fn compact_context(messages: &mut [ChatMessage], system_prompt: &str) -> usize {
+    let system_tokens = estimate_tokens(system_prompt);
+    let total: usize = system_tokens + messages.iter().map(message_tokens).sum::<usize>();
+
+    let snip_threshold = (CONTEXT_WINDOW_TOKENS as f64 * SNIP_RATIO) as usize;
+    let prune_threshold = (CONTEXT_WINDOW_TOKENS as f64 * PRUNE_RATIO) as usize;
+
+    if total <= snip_threshold {
+        return total;
+    }
+
+    let mut current = total;
+    // Walk forward (oldest first) and apply progressively more aggressive
+    // compaction to tool results that are far from the working tail.
+    for msg in messages.iter_mut() {
+        if current <= snip_threshold {
+            break;
+        }
+        // Only compact tool-result messages — never touch user/assistant/system.
+        if msg.role != "tool" || msg.tool_call_id.is_none() {
+            continue;
+        }
+        let Some(text) = msg.content_text_owned() else {
+            continue;
+        };
+        let old_tokens = estimate_tokens(&text);
+
+        if current >= prune_threshold {
+            // Prune: replace entirely with a one-liner archive marker
+            let name = msg.name.as_deref().unwrap_or("unknown");
+            let marker = format!(
+                "[stale tool result elided: {name} — re-run the tool if you need fresh output]"
+            );
+            let new_tokens = estimate_tokens(&marker);
+            msg.content = Some(MessageContent::Text(marker));
+            current = current.saturating_sub(old_tokens.saturating_sub(new_tokens));
+        } else if current >= snip_threshold {
+            // Snip: keep head + tail
+            let snipped = snip_tool_result(&text);
+            if snipped.len() < text.len() {
+                let new_tokens = estimate_tokens(&snipped);
+                msg.content = Some(MessageContent::Text(snipped));
+                current = current.saturating_sub(old_tokens.saturating_sub(new_tokens));
+            }
+        }
+    }
+
+    current
+}
 
 /// Resolves permission requests from the agent loop via the client.
 pub struct PermissionResolver {
@@ -100,6 +205,8 @@ pub struct ChatStatsData {
     pub context_length: u32,
     pub prefill_tps: f64,
     pub decode_tps: f64,
+    pub cache_hit_tokens: u32,
+    pub cache_miss_tokens: u32,
 }
 
 /// Accumulates token/timing stats across multiple tool-loop rounds
@@ -110,6 +217,8 @@ struct StatsAccum {
     total_prefill_ms: u64,
     total_decode_ms: u64,
     total_prefill_tokens: u32,
+    cache_hit_tokens: u32,
+    cache_miss_tokens: u32,
 }
 
 impl StatsAccum {
@@ -120,6 +229,8 @@ impl StatsAccum {
             total_prefill_ms: 0,
             total_decode_ms: 0,
             total_prefill_tokens: 0,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         }
     }
 
@@ -172,6 +283,12 @@ struct SessionCtx {
     last_routed_model: Option<String>,
     /// Coding-session task list, persisted with the session.
     todos: Vec<temple_protocol::TodoItem>,
+    /// Stable system prompt — built once on first use and reused for the
+    /// session lifetime so the provider's prefix cache stays hot.
+    cached_system_prompt: Option<String>,
+    /// Tool list pinned for this session — stable schemas keep the prefix
+    /// cache key identical across turns.
+    cached_tools: Option<Vec<ToolDefinition>>,
 }
 
 pub struct Agent {
@@ -245,6 +362,137 @@ impl Agent {
             daemon_connections: Mutex::new(HashMap::new()),
             nextcloud,
             pending_web_auth: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Summarise the oldest portion of a session's conversation into a
+    /// structured summary block, keeping a fixed tail verbatim. Called
+    /// when snip+prune isn't enough to keep the context within the model's
+    /// window. Uses the router model (or default) for the summary call.
+    async fn compact_summary(&self, session_id: Uuid, _system_prompt: &str) {
+        let history_len;
+        let username;
+        let mut foldable_end;
+        {
+            let sessions = self.sessions.lock().await;
+            let Some(s) = sessions.get(&session_id) else {
+                return;
+            };
+            history_len = s.history.len();
+            if history_len < 4 {
+                return;
+            }
+            username = s.username.clone();
+            // Calculate how many messages from the tail to keep verbatim
+            let mut tail_tokens = 0usize;
+            let mut tail_start = history_len;
+            for msg in s.history.iter().rev() {
+                let t = message_tokens(msg);
+                if tail_tokens + t > TAIL_TOKENS && tail_start < history_len {
+                    break;
+                }
+                tail_tokens += t;
+                tail_start -= 1;
+            }
+            // Ensure we have something to fold — at least 2 user-assistant
+            // exchanges before the tail.
+            if tail_start < 4 {
+                return;
+            }
+            foldable_end = tail_start;
+        }
+
+        // Build a summarization prompt from the foldable messages
+        let foldable_messages: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            let Some(s) = sessions.get(&session_id) else {
+                return;
+            };
+            s.history[..foldable_end]
+                .iter()
+                .filter_map(|m| {
+                    let role = &m.role;
+                    if role == "tool" || role == "system" {
+                        return None;
+                    }
+                    let content = m.content_text()?;
+                    if content.is_empty() {
+                        return None;
+                    }
+                    Some(format!("[{role}]: {content}"))
+                })
+                .collect()
+        };
+
+        if foldable_messages.is_empty() {
+            return;
+        }
+
+        let summary_prompt = format!(
+            "Summarize this conversation segment concisely. Keep key facts, decisions, \
+             files modified, bugs found, and any incomplete work. Use bullet points. \
+             Be technical and brief.\n\n{}",
+            foldable_messages.join("\n\n")
+        );
+
+        // Use a lightweight model for the summary — prefer the router model
+        // if configured, otherwise fall back to the default model.
+        let summarizer_model = self
+            .models
+            .router_model
+            .as_deref()
+            .unwrap_or(&self.models.default_model);
+
+        let req = ChatRequest {
+            model: summarizer_model.to_string(),
+            messages: vec![ChatMessage::user(&summary_prompt)],
+            tools: None,
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(1024),
+            temperature: Some(0.1),
+            ..Default::default()
+        };
+
+        let summary = match self.litellm.chat(req).await {
+            Ok(resp) => resp
+                .choices
+                .first()
+                .and_then(|c| c.message.content_text())
+                .unwrap_or("(summary unavailable)")
+                .to_string(),
+            Err(e) => {
+                tracing::warn!("compaction summary failed: {e}");
+                format!("(compaction summary failed: {e})")
+            }
+        };
+
+        // Insert the summary and trim the foldable region
+        {
+            let mut sessions = self.sessions.lock().await;
+            let Some(s) = sessions.get_mut(&session_id) else {
+                return;
+            };
+            if s.history.len() < foldable_end + 1 {
+                return;
+            }
+            // Ensure we don't cut mid-tool-exchange: advance foldable_end
+            // past any orphaned tool results whose assistant/tool_calls parent
+            // was cut.
+            while foldable_end < s.history.len() && s.history[foldable_end].tool_call_id.is_some() {
+                foldable_end += 1;
+            }
+            let compact_header = format!(
+                "<compaction-summary>\nPrevious conversation summary (session for {username}):\n{summary}\n</compaction-summary>"
+            );
+            // Replace the foldable region with the summary marker and trim
+            s.history
+                .splice(..foldable_end, [ChatMessage::user(&compact_header)]);
+            tracing::info!(
+                "session {session_id}: compacted {} messages into summary ({:.0} chars)",
+                foldable_end,
+                summary.len()
+            );
         }
     }
 
@@ -462,6 +710,7 @@ impl Agent {
             stream_options: None,
             max_tokens: Some(1),
             temperature: Some(0.0),
+            ..Default::default()
         };
         let _ = self.litellm.chat(req).await;
     }
@@ -498,6 +747,8 @@ impl Agent {
                 model_override: false,
                 last_routed_model: None,
                 todos: Vec::new(),
+                cached_system_prompt: None,
+                cached_tools: None,
             },
         );
     }
@@ -534,6 +785,8 @@ impl Agent {
                 model_override: false,
                 last_routed_model: None,
                 todos: Vec::new(),
+                cached_system_prompt: None,
+                cached_tools: None,
             },
         );
         drop(sessions);
@@ -629,6 +882,8 @@ impl Agent {
                 model_override: false,
                 last_routed_model: None,
                 todos,
+                cached_system_prompt: None,
+                cached_tools: None,
             },
         );
 
@@ -727,6 +982,7 @@ impl Agent {
             stream_options: None,
             max_tokens: Some(24),
             temperature: Some(0.2),
+            ..Default::default()
         };
 
         let model_title = match self.litellm.chat(req).await {
@@ -947,7 +1203,15 @@ impl Agent {
                 self.remove_token_if_current(session_id, generation).await;
                 return;
             };
-            s.history.push(ChatMessage::user(content));
+            // Build dynamic preamble (date, memories, skills) and prepend to
+            // the user turn so the system prompt stays byte-stable.
+            let preamble = self.build_dynamic_preamble(&s.username).await;
+            let content_with_ctx = if preamble.is_empty() {
+                content.to_string()
+            } else {
+                format!("{preamble}\n\n---\n\n{content}")
+            };
+            s.history.push(ChatMessage::user(&content_with_ctx));
             // Set a fallback title from the first user message immediately
             // so sessions don't stay untitled forever if the model doesn't
             // respond or title generation fails.
@@ -1113,29 +1377,47 @@ impl Agent {
         *self.last_request.lock().unwrap() = Instant::now();
 
         // Get or lazily detect project context (cached per-session)
-        let project_context = {
-            let sessions = self.sessions.lock().await;
-            let needs_detect = sessions
-                .get(&session_id)
-                .and_then(|s| s.project_context.clone())
-                .unwrap_or_else(String::new);
-            // If cached, return it
-            if !needs_detect.is_empty() || session_kind == SessionKind::Headless {
-                needs_detect
-            } else {
+        let (_project_context, base_system_prompt, cached_tools) = {
+            let mut sessions = self.sessions.lock().await;
+            let s = sessions.get_mut(&session_id).expect("session must exist");
+
+            // Detect project context on first use
+            let needs_detect = s.project_context.clone().unwrap_or_else(String::new);
+            if needs_detect.is_empty() && session_kind != SessionKind::Headless {
                 drop(sessions);
-                // Detect project type from CWD (only once per session)
                 let ctx = detect_project_context(&cwd).await;
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.project_context = Some(ctx.clone());
                 }
-                ctx
+                let ctx_for_build = ctx;
+                // Build and cache the stable system prompt
+                let prompt = self
+                    .build_system_prompt(&username, &cwd, session_kind, &ctx_for_build)
+                    .await;
+                let tools = self.tools.lock().await.clone();
+                let s = sessions.get_mut(&session_id).expect("session must exist");
+                s.cached_system_prompt = Some(prompt.clone());
+                s.cached_tools = Some(tools.clone());
+                (ctx_for_build, prompt, tools)
+            } else {
+                // Use cached or build new
+                let ctx = needs_detect;
+                let (prompt, tools) = match (&s.cached_system_prompt, &s.cached_tools) {
+                    (Some(p), Some(t)) => (p.clone(), t.clone()),
+                    _ => {
+                        let p = self
+                            .build_system_prompt(&username, &cwd, session_kind, &ctx)
+                            .await;
+                        let t = self.tools.lock().await.clone();
+                        s.cached_system_prompt = Some(p.clone());
+                        s.cached_tools = Some(t.clone());
+                        (p, t)
+                    }
+                };
+                (ctx, prompt, tools)
             }
         };
-        let base_system_prompt = self
-            .build_system_prompt(&username, &cwd, session_kind, &project_context)
-            .await;
 
         // Stats accumulators across all rounds
         let mut stats = StatsAccum::new();
@@ -1148,6 +1430,7 @@ impl Agent {
                         session_id,
                         model,
                         &base_system_prompt,
+                        &cached_tools,
                         &cancel_token,
                         &scope,
                         emit,
@@ -1166,6 +1449,7 @@ impl Agent {
                     session_id,
                     content,
                     &base_system_prompt,
+                    &cached_tools,
                     planner,
                     executor,
                     reviewer,
@@ -1229,6 +1513,8 @@ impl Agent {
             context_length: stats.last_prompt_tokens,
             prefill_tps: stats.prefill_tps(),
             decode_tps: stats.decode_tps(),
+            cache_hit_tokens: stats.cache_hit_tokens,
+            cache_miss_tokens: stats.cache_miss_tokens,
         }));
 
         // Title + persist happen after the user sees the response.
@@ -1325,7 +1611,8 @@ impl Agent {
                     stream_options: None,
                     max_tokens: Some(1024),
                     temperature: Some(0.2),
-                };
+                    ..Default::default()
+        };
                 if let Ok(resp) = self.litellm.chat(req).await {
                     if let Some(choice) = resp.choices.first() {
                         if let Some(content) = choice.message.content_text() {
@@ -1378,6 +1665,7 @@ impl Agent {
         session_id: Uuid,
         user_prompt: &str,
         base_system_prompt: &str,
+        pinned_tools: &[ToolDefinition],
         planner: &str,
         executor: &str,
         reviewer: &str,
@@ -1421,6 +1709,7 @@ impl Agent {
                 session_id,
                 executor,
                 &executor_prompt,
+                pinned_tools,
                 cancel_token,
                 scope,
                 emit,
@@ -1485,6 +1774,7 @@ impl Agent {
                     session_id,
                     executor,
                     &executor_prompt,
+                    pinned_tools,
                     cancel_token,
                     scope,
                     emit,
@@ -1524,6 +1814,7 @@ impl Agent {
             stream_options: None,
             max_tokens: Some(2048),
             temperature: Some(0.3),
+            ..Default::default()
         };
 
         tokio::select! {
@@ -1577,6 +1868,7 @@ impl Agent {
             stream_options: None,
             max_tokens: Some(1024),
             temperature: Some(0.2),
+            ..Default::default()
         };
 
         tokio::select! {
@@ -1617,6 +1909,7 @@ impl Agent {
         session_id: Uuid,
         model: &str,
         system_prompt: &str,
+        pinned_tools: &[ToolDefinition],
         cancel_token: &CancellationToken,
         scope: &Arc<Mutex<PermissionScope>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
@@ -1633,7 +1926,20 @@ impl Agent {
 
             let mut messages = vec![ChatMessage::system(system_prompt.to_string())];
             {
-                let sessions = self.sessions.lock().await;
+                let compact_threshold = (CONTEXT_WINDOW_TOKENS as f64 * COMPACT_RATIO) as usize;
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    // Compact stale tool results before the prompt overflows
+                    // the context window. Snip then prune — both free.
+                    let estimated = compact_context(&mut s.history, system_prompt);
+                    // If still over the compaction threshold after
+                    // snip+prune, fold older conversation into a summary.
+                    if estimated > compact_threshold {
+                        drop(sessions);
+                        self.compact_summary(session_id, system_prompt).await;
+                        sessions = self.sessions.lock().await;
+                    }
+                }
                 if let Some(s) = sessions.get(&session_id) {
                     let mut start = s.history.len().saturating_sub(MAX_HISTORY);
                     // Never start mid-tool-exchange: a leading tool result
@@ -1657,10 +1963,10 @@ impl Agent {
                     None => false,
                 }
             };
-            let tools = if sandboxed {
+            let tools: Vec<ToolDefinition> = if sandboxed {
                 Self::sandboxed_tools()
             } else {
-                self.tools.lock().await.clone()
+                pinned_tools.to_vec()
             };
             let req = ChatRequest {
                 model: model.to_string(),
@@ -1670,6 +1976,7 @@ impl Agent {
                 stream_options: None,
                 max_tokens: Some(16384),
                 temperature: None,
+                ..Default::default()
             };
 
             // ── Stream with retry (self-healing) ──
@@ -1752,6 +2059,7 @@ impl Agent {
                     }
 
                     last_err = attempt_error.unwrap_or("stream ended without result".into());
+
                     if attempt < MAX_STREAM_RETRIES - 1 {
                         let delay = std::time::Duration::from_millis(500 * (1 << attempt));
                         tracing::warn!(
@@ -1823,6 +2131,8 @@ impl Agent {
                 stats.total_completion += u.completion_tokens;
                 stats.total_prefill_tokens += u.prompt_tokens;
                 stats.last_prompt_tokens = u.prompt_tokens;
+                stats.cache_hit_tokens += u.cache_hit_tokens;
+                stats.cache_miss_tokens += u.cache_miss_tokens;
             }
 
             if result.tool_calls.is_empty() {
@@ -1994,6 +2304,7 @@ impl Agent {
                     stream_options: None,
                     max_tokens: Some(4096),
                     temperature: None,
+                    ..Default::default()
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
                 let litellm = self.litellm.clone();
@@ -2037,7 +2348,10 @@ impl Agent {
         final_content
     }
 
-    /// Build system prompt with personality, user memories, code rules, and CWD detection.
+    /// Build system prompt with personality, code rules, and CWD detection.
+    /// Volatile content (date, memories, skills) is excluded so the prompt
+    /// can be cached for the session lifetime — those are injected into the
+    /// user turn via `dynamic_preamble`.
     async fn build_system_prompt(
         &self,
         username: &str,
@@ -2045,52 +2359,18 @@ impl Agent {
         kind: SessionKind,
         project_context: &str,
     ) -> String {
-        // Mask the server's internal base path — the model should never see
-        // /var/lib/temple in the system prompt (it's a server implementation
-        // detail, not the user's filesystem).
         let display_cwd = if cwd == "/var/lib/temple" {
             ".".to_string()
         } else {
             cwd.to_string()
         };
         let personality = self.memory.get_personality().await.unwrap_or_default();
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
-
-        let user_memories = self
-            .memory
-            .get_all_memory(username)
-            .await
-            .unwrap_or_default();
-        let user_section = if user_memories.is_empty() {
-            String::new()
-        } else {
-            let mut s = format!("\n\n## What you know about {username}\n");
-            for m in user_memories.iter().take(20) {
-                s.push_str(&format!("- **{}**: {}\n", m.key, m.value));
-            }
-            s
-        };
-
-        let skills = self.memory.get_all_skills().await.unwrap_or_default();
-        let skills_section = if skills.is_empty() {
-            String::new()
-        } else {
-            let mut s = "\n\n## Skills you've learned\n".to_string();
-            for skill in skills.iter().take(10) {
-                s.push_str(&format!(
-                    "- **{}**: {} (used {}×)\n",
-                    skill.name, skill.description, skill.frequency
-                ));
-            }
-            s
-        };
 
         match kind {
             SessionKind::Interactive => {
                 let project_section = project_context.to_string();
                 let has_code = !project_section.is_empty();
                 let code_rules = if has_code {
-                    // Include rules matching detected project types only
                     format!(
                         "\n## Code rules (hardcoded — always follow)\n\
                          - Prefer slightly verbose, self-explanatory code over terse code that needs comments.\n\
@@ -2108,12 +2388,10 @@ impl Agent {
 
 You are renco, an agentic coding assistant running on temple harness.
 You are talking to {username} right now.
-Current date: {now}
 Working directory: {display_cwd}
 
 When working with files, use paths relative to the working directory.
-Do not prepend the server's base path — use relative paths only.{user_section}
-{skills_section}
+Do not prepend the server's base path — use relative paths only.
 
 ## Available tools
 You have filesystem access, shell commands, persistent memory, web
@@ -2145,7 +2423,7 @@ session resume.
                 format!(
                     "{personality}
 You are renco, running a scheduled maintenance task on temple harness.
-Current date: {now}. Working directory: {display_cwd}
+Working directory: {display_cwd}
 Filesystem access and shell commands are available.
 
 Git conventions:
@@ -2161,6 +2439,40 @@ Git conventions:
                 )
             }
         }
+    }
+
+    /// Build a dynamic preamble with the current date, fresh user memories,
+    /// and learned skills. This content changes frequently, so it is
+    /// prepended to the user turn rather than baked into the system prompt,
+    /// keeping the prefix cache warm across the session.
+    async fn build_dynamic_preamble(&self, username: &str) -> String {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+        let mut parts = vec![format!("[Current date: {now}]")];
+
+        if let Ok(memories) = self.memory.get_all_memory(username).await {
+            if !memories.is_empty() {
+                let mut s = format!("\n\nWhat you know about {username}:\n");
+                for m in memories.iter().take(20) {
+                    s.push_str(&format!("- **{}**: {}\n", m.key, m.value));
+                }
+                parts.push(s);
+            }
+        }
+
+        if let Ok(skills) = self.memory.get_all_skills().await {
+            if !skills.is_empty() {
+                let mut s = "\n\nSkills you've learned:\n".to_string();
+                for skill in skills.iter().take(10) {
+                    s.push_str(&format!(
+                        "- **{}**: {} (used {}×)\n",
+                        skill.name, skill.description, skill.frequency
+                    ));
+                }
+                parts.push(s);
+            }
+        }
+
+        parts.join("")
     }
     #[allow(clippy::too_many_arguments)] // Tool dispatch needs every piece of context.
     async fn execute_tool(
@@ -2773,6 +3085,7 @@ Git conventions:
             stream_options: None,
             max_tokens: Some(500),
             temperature: Some(0.4),
+            ..Default::default()
         };
 
         match self.litellm.chat(req).await {

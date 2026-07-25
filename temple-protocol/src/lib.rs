@@ -265,6 +265,12 @@ pub enum ServerMessage {
         prefill_tps: f64,
         /// generation speed (approx: first token → stream end)
         decode_tps: f64,
+        /// Tokens served from the provider's prefix cache
+        #[serde(default)]
+        cache_hit_tokens: u32,
+        /// Tokens NOT in cache (full-recompute)
+        #[serde(default)]
+        cache_miss_tokens: u32,
     },
     /// Web auth: verification code to display to the user.
     WebAuthCode {

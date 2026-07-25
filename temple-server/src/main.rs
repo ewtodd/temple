@@ -1589,6 +1589,7 @@ async fn litellm_describe_image(
         stream_options: None,
         max_tokens: Some(512),
         temperature: Some(0.3),
+        ..Default::default()
     };
 
     let resp = litellm
