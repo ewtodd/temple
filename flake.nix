@@ -95,7 +95,7 @@
         import ./nix/module.nix (
           args
           // {
-            templePackage = self.packages.${pkgs.system}.temple-server;
+            templePackage = self.packages.${pkgs.system}.temple;
           }
         );
 
