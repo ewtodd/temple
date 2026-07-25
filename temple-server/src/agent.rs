@@ -2218,6 +2218,10 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let mut resolved_args = args.clone();
+                resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
+                let resolved_args_json =
+                    serde_json::to_string(&resolved_args).unwrap_or_else(|_| args_json.to_string());
                 let session_cwd = self
                     .sessions
                     .lock()
@@ -2228,7 +2232,7 @@ Git conventions:
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "read_file".to_string(),
-                    args_json: args_json.to_string(),
+                    args_json: resolved_args_json,
                     session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
@@ -2259,6 +2263,10 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let mut resolved_args = args.clone();
+                resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
+                let resolved_args_json =
+                    serde_json::to_string(&resolved_args).unwrap_or_else(|_| args_json.to_string());
                 let session_cwd = self
                     .sessions
                     .lock()
@@ -2269,7 +2277,7 @@ Git conventions:
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "write_file".to_string(),
-                    args_json: args_json.to_string(),
+                    args_json: resolved_args_json,
                     session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
@@ -2299,6 +2307,10 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let mut resolved_args = args.clone();
+                resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
+                let resolved_args_json =
+                    serde_json::to_string(&resolved_args).unwrap_or_else(|_| args_json.to_string());
                 let session_cwd = self
                     .sessions
                     .lock()
@@ -2309,7 +2321,7 @@ Git conventions:
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "list_dir".to_string(),
-                    args_json: args_json.to_string(),
+                    args_json: resolved_args_json,
                     session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
@@ -2402,6 +2414,10 @@ Git conventions:
                 .await?;
                 let request_id = Uuid::new_v4();
                 let rx = self.ask_tool(request_id).await;
+                let mut resolved_args = args.clone();
+                resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
+                let resolved_args_json =
+                    serde_json::to_string(&resolved_args).unwrap_or_else(|_| args_json.to_string());
                 let session_cwd = self
                     .sessions
                     .lock()
@@ -2412,7 +2428,7 @@ Git conventions:
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "edit_file".to_string(),
-                    args_json: args_json.to_string(),
+                    args_json: resolved_args_json,
                     session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
