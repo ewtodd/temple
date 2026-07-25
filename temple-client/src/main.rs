@@ -34,6 +34,9 @@ struct Cli {
     /// Requires --identity. Permission mode comes from the session, not the daemon.
     #[arg(long)]
     daemon: bool,
+    /// Log the full session conversation to .temple-session.log in CWD
+    #[arg(long)]
+    log_session: bool,
     /// Path to SSH private key for daemon authentication (e.g. ~/.ssh/id_ed25519).
     /// Required when --daemon.
     #[arg(long, required_if_eq("daemon", "true"))]
@@ -99,6 +102,7 @@ fn main() {
         cli.r#continue,
         cli.tls,
         cli.server,
+        cli.log_session,
     );
 
     if let Err(e) = app.run() {

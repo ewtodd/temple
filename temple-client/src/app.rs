@@ -66,16 +66,37 @@ impl App {
         do_continue: bool,
         force_tls: bool,
         server: String,
+        log_session: bool,
     ) -> Self {
+        let log_path = if log_session {
+            Some(format!("{cwd}/.temple-session.log"))
+        } else {
+            None
+        };
         let state = Arc::new(Mutex::new(AppState::new(cwd.clone())));
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel::<InternalCmd>(32);
 
         // Spawn the WebSocket background thread
         let s = state.clone();
+        let log_path_thread = log_path.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
+                let write_log = move |line: &str| {
+                    if let Some(ref path) = log_path_thread {
+                        use std::io::Write;
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        let entry = format!("[{ts}] {line}\n");
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let _ = f.write_all(entry.as_bytes());
+                        }
+                    }
+                };
                 let pubkey = discover_pubkey();
                 let sess = SessionOpen {
                     client_id: client_id.clone(),
@@ -245,6 +266,10 @@ impl App {
                                 }
                                 if done {
                                 } else {
+                                    if let Some(ref r) = reasoning {
+                                        write_log(&format!("REASONING: {r}"));
+                                    }
+                                    write_log(&format!("DELTA: {delta}"));
                                     let r_clone = reasoning.clone();
                                     if let Some(ChatEntry::Assistant {
                                         content: ref mut c,
@@ -325,6 +350,10 @@ impl App {
                                 detail,
                                 ..
                             } => {
+                                write_log(&format!(
+                                    "TOOL {:?}: {name} — {detail}",
+                                    status
+                                ));
                                 s.entries.push(ChatEntry::Tool {
                                     name,
                                     status,

@@ -34,19 +34,22 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
 
         match entry {
             ChatEntry::User(text) => {
-                lines.push(Line::from(vec![Span::styled(
-                    "you",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                )]));
+                lines.push(
+                    Line::from(vec![Span::styled(
+                        "you",
+                        Style::default()
+                            .fg(Color::LightMagenta)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )])
+                    .centered(),
+                );
                 for l in render_markdown_lite(text, content_width.saturating_sub(2)) {
                     let color = match l.kind {
-                        LineKind::Code => Color::Gray,
+                        LineKind::Code => Color::White,
                         _ => Color::Reset,
                     };
                     lines.push(Line::from(Span::styled(
-                        format!(" {}", l.text),
+                        l.text.to_string(),
                         Style::default().fg(color),
                     )));
                 }
@@ -62,17 +65,20 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                 } else {
                     format!("renco \u{b7} {model_tag}")
                 };
-                lines.push(Line::from(vec![Span::styled(
-                    header,
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                )]));
+                lines.push(
+                    Line::from(vec![Span::styled(
+                        header,
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )])
+                    .centered(),
+                );
                 // Reasoning/thinking content rendered dimmed and italic
                 if let Some(ref r) = reasoning {
                     if !r.trim().is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!(" \u{2026}{r}"),
+                            format!("\u{2026}{r}"),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(ratatui::style::Modifier::ITALIC),
@@ -86,13 +92,13 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                         _ => Color::Reset,
                     };
                     lines.push(Line::from(Span::styled(
-                        format!(" {}", l.text),
+                        l.text.to_string(),
                         Style::default().fg(color),
                     )));
                 }
                 if let Some(st) = stats {
                     lines.push(Line::from(Span::styled(
-                        format!(" \u{23F1} {st}"),
+                        format!("\u{23F1} {st}"),
                         Style::default().fg(Color::Magenta),
                     )));
                 }
@@ -100,7 +106,7 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
             ChatEntry::System(text) => {
                 for l in wrap_text(text, content_width.saturating_sub(2)) {
                     lines.push(Line::from(Span::styled(
-                        format!(" {l}"),
+                        l.to_string(),
                         Style::default().fg(Color::Cyan),
                     )));
                 }
@@ -108,7 +114,7 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
             ChatEntry::Error(text) => {
                 for l in wrap_text(text, content_width.saturating_sub(2)) {
                     lines.push(Line::from(Span::styled(
-                        format!(" {l}"),
+                        l.to_string(),
                         Style::default().fg(Color::Red),
                     )));
                 }
@@ -344,29 +350,49 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
     // Art
     if art_extra > 0 {
         let art_area = layout[0];
-        let art_text: Vec<Line> = TEMPLE_ART
-            .lines()
+
+        // Compute the max displayed width of all banner lines, then create
+        // a centered sub-Rect so the whole block is centered as one unit.
+        let raw_lines: Vec<&str> = TEMPLE_ART.trim_end_matches('\n').lines().collect();
+        let banner_art_lines = raw_lines.len();
+        let max_banner_width = raw_lines.iter().map(|l| l.width()).max().unwrap_or(0);
+        let banner_width = (max_banner_width as u16).min(art_area.width);
+        let banner_left_pad = (art_area.width.saturating_sub(banner_width)) / 2;
+        let banner_rect = Rect {
+            x: art_area.x + banner_left_pad,
+            y: art_area.y,
+            width: banner_width,
+            height: (banner_art_lines + 1) as u16, // +1 for hint line
+        };
+
+        // Render banner lines left-aligned inside the centered rect
+        let art_text: Vec<Line> = raw_lines
+            .iter()
             .map(|l| {
                 Line::from(Span::styled(
                     l.to_string(),
-                    Style::default().fg(Color::Cyan),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 ))
             })
             .collect();
-        f.render_widget(Paragraph::new(art_text), art_area);
+        f.render_widget(Paragraph::new(art_text), banner_rect);
+
+        // Hint line centered across the full art area
         let hint_area = Rect {
             x: art_area.x,
-            y: art_area.y + art_lines as u16,
+            y: art_area.y + banner_art_lines as u16,
             width: art_area.width,
             height: 1,
         };
         let hint = Line::from(Span::styled(
-            "  /help \u{b7} Shift+Tab mode \u{b7} Ctrl+G editor \u{b7} Ctrl+L clear".to_string(),
+            "/help \u{b7} Shift+Tab mode \u{b7} Ctrl+G editor \u{b7} Ctrl+L clear".to_string(),
             Style::default().fg(Color::DarkGray),
-        ));
+        ))
+        .centered();
         f.render_widget(Paragraph::new(hint), hint_area);
     }
-
     // Chat
     let chat_para = Paragraph::new(visible_chat).wrap(Wrap { trim: false });
     f.render_widget(chat_para, chat_area);
