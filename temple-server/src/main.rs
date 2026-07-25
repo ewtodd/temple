@@ -12,7 +12,6 @@ mod queue;
 mod router;
 mod server;
 mod signal;
-mod web;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
@@ -845,32 +844,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                                 return;
                             }
-                            let mode = match arg.to_lowercase().as_str() {
-                                "default" => temple_protocol::PermissionMode::Default,
-                                "ask" => temple_protocol::PermissionMode::Ask,
-                                "lockdown" => temple_protocol::PermissionMode::Lockdown,
-                                "yolo" => temple_protocol::PermissionMode::Yolo,
-                                _ => {
+                            match temple_protocol::commands::parse_mode(arg) {
+                                Ok(mode) => {
+                                    agent.set_session_mode(sid, mode).await;
                                     send_conv(
                                         &signal,
                                         &sender,
                                         &group_id,
-                                        &format!(
-                                            "unknown mode: {arg} (default · ask · lockdown · yolo)"
-                                        ),
+                                        &format!("mode → [{}]", mode_tag(mode)),
                                     )
                                     .await;
-                                    return;
                                 }
-                            };
-                            agent.set_session_mode(sid, mode).await;
-                            send_conv(
-                                &signal,
-                                &sender,
-                                &group_id,
-                                &format!("mode → [{}]", mode_tag(mode)),
-                            )
-                            .await;
+                                Err(hint) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("unknown mode — {hint}"),
+                                    )
+                                    .await;
+                                }
+                            }
                             return;
                         }
 
@@ -887,29 +881,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                                 return;
                             };
-                            if arg.is_empty() {
-                                let current = agent.session_model(sid).await;
-                                send_conv(
-                                    &signal,
-                                    &sender,
-                                    &group_id,
-                                    &format!("current model: {current}"),
-                                )
-                                .await;
-                            } else if arg == "auto" {
-                                agent.reset_session_model(sid).await;
-                                let current = agent.session_model(sid).await;
-                                send_conv(
-                                    &signal,
-                                    &sender,
-                                    &group_id,
-                                    &format!("model → {current} (auto-routing)"),
-                                )
-                                .await;
-                            } else {
-                                agent.set_session_model(sid, arg).await;
-                                send_conv(&signal, &sender, &group_id, &format!("model → {arg}"))
+                            match temple_protocol::commands::parse_model(arg) {
+                                temple_protocol::commands::ModelAction::Show => {
+                                    let current = agent.session_model(sid).await;
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("current model: {current}"),
+                                    )
                                     .await;
+                                }
+                                temple_protocol::commands::ModelAction::Auto => {
+                                    agent.reset_session_model(sid).await;
+                                    let current = agent.session_model(sid).await;
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("model → {current} (auto-routing)"),
+                                    )
+                                    .await;
+                                }
+                                temple_protocol::commands::ModelAction::Set(m) => {
+                                    agent.set_session_model(sid, m).await;
+                                    send_conv(&signal, &sender, &group_id, &format!("model → {m}"))
+                                        .await;
+                                }
                             }
                             return;
                         }
@@ -950,53 +948,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                                 return;
                             };
-                            if arg.is_empty() {
-                                let current = agent
-                                    .reasoning_effort(sid)
-                                    .await
-                                    .unwrap_or_else(|| "unset".to_string());
-                                send_conv(
-                                    &signal,
-                                    &sender,
-                                    &group_id,
-                                    &format!(
-                                        "reasoning effort: {current} (low · medium · high · max · off)"
-                                    ),
-                                )
-                                .await;
-                                return;
+                            match temple_protocol::commands::parse_effort(arg) {
+                                Ok("") => {
+                                    let current = agent
+                                        .reasoning_effort(sid)
+                                        .await
+                                        .unwrap_or_else(|| "unset".to_string());
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!(
+                                            "reasoning effort: {current} ({})",
+                                            temple_protocol::commands::EFFORT_HINT
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Ok(effort) => {
+                                    agent.set_reasoning_effort(sid, effort).await;
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("reasoning effort → {effort}"),
+                                    )
+                                    .await;
+                                }
+                                Err(hint) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("unknown effort — {hint}"),
+                                    )
+                                    .await;
+                                }
                             }
-                            let cleaned = arg.to_lowercase();
-                            if !matches!(
-                                cleaned.as_str(),
-                                "low" | "medium" | "high" | "max" | "none" | "off"
-                            ) {
-                                send_conv(
-                                    &signal,
-                                    &sender,
-                                    &group_id,
-                                    "unknown effort: {arg} (low · medium · high · max · off)",
-                                )
-                                .await;
-                                return;
-                            }
-                            agent.set_reasoning_effort(sid, &cleaned).await;
-                            send_conv(
-                                &signal,
-                                &sender,
-                                &group_id,
-                                &format!("reasoning effort → {cleaned}"),
-                            )
-                            .await;
                             return;
                         }
 
                         if trimmed == "/new" || trimmed.starts_with("/new ") {
                             let rest = trimmed.strip_prefix("/new").unwrap().trim();
-                            let parts: Vec<&str> =
-                                rest.splitn(3, ' ').filter(|p| !p.is_empty()).collect();
-                            let target = parts.first().copied();
-                            let subdir = parts.get(1).copied();
+                            let args = temple_protocol::commands::parse_new(rest);
+                            let target = args.ssh_target.as_deref();
+                            let subdir = args.start_dir.as_deref();
                             let session_owner = if group_id.is_some() {
                                 "group"
                             } else {
@@ -1046,29 +1042,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // canned reply. (Skipped in groups: acks would spam
                         // everyone.)
                         if group_id.is_none() {
-                            // Check if this is a web verification code (6 uppercase alphanumeric)
-                            let upper = trimmed.to_uppercase();
-                            if upper.len() == 6 && upper.chars().all(|c| c.is_ascii_alphanumeric())
-                            {
-                                let username = username.clone();
-                                let code = upper.clone();
-                                let agent_c = agent.clone();
-                                let signal_c = signal.clone();
-                                let sender_c = sender.clone();
-                                let group_id_c = group_id.clone();
-                                tokio::spawn(async move {
-                                    if let Some(_sid) =
-                                        agent_c.verify_web_code(&code, &username).await
-                                    {
-                                        send_conv(&signal_c, &sender_c, &group_id_c, "renco web login successful — your session is now active").await;
-                                        tracing::info!("web auth: {username} verified via Signal");
-                                    } else {
-                                        send_conv(&signal_c, &sender_c, &group_id_c, "code expired or invalid — refresh the web page for a new one").await;
-                                    }
-                                });
-                                return;
-                            }
-
                             let norm = trimmed.trim_end_matches(['.', '!']).to_lowercase();
                             const ACKS: &[&str] = &[
                                 "ok",
@@ -1437,15 +1410,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cfg.signal.enabled {
         notify_admins(&signal, &memory, "Temple server started, renco is online.").await;
     }
-
-    // Spawn HTTP server for the web client (serves static HTML).
-    let web_agent = agent.clone();
-    let web_cfg = cfg.clone();
-    tokio::spawn(async move {
-        if let Err(e) = web::serve(web_agent, web_cfg).await {
-            tracing::error!("web server failed: {e}");
-        }
-    });
 
     // Run the WebSocket server, with graceful shutdown on SIGTERM/SIGINT:
     // cancel in-flight loops and persist sessions before exiting, so no

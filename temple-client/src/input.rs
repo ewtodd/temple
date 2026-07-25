@@ -496,6 +496,7 @@ fn handle_key_event(
                 let commands = [
                     "/clear",
                     "/delete ",
+                    "/effort ",
                     "/help",
                     "/mode ",
                     "/model ",
@@ -542,32 +543,9 @@ fn handle_slash_command(
         return true;
     }
     if content == "/help" || content == "/?" {
-        let help_text = "\
-Commands:
-  /clear          clear chat
-  /delete <n>     permanently delete session
-  /help           this help
-  /mode <m>       set permission mode
-  /model <name>   set model (bare to show current)
-  /models         list available models
-  /new [target]   start new session
-  /q              exit
-  /quit           exit
-  /session <n>    resume session
-  /sessions       list sessions
-
-Keys:
-  Ctrl+C      cancel agent
-  Ctrl+G      edit in $EDITOR
-  Ctrl+J/K    scroll by 10
-  Ctrl+L      clear chat
-  Ctrl+U      clear prompt
-  Esc         clear prompt
-  PgUp/Dn     scroll by 10
-  Shift+Tab   cycle permission mode
-  Tab         cycle commands";
-        s.entries
-            .push(crate::state::ChatEntry::System(help_text.into()));
+        s.entries.push(crate::state::ChatEntry::System(
+            temple_protocol::commands::HELP_TUI.into(),
+        ));
         return true;
     }
     if content == "/sessions" {
@@ -613,43 +591,63 @@ Keys:
         return true;
     }
     if let Some(target) = content.strip_prefix("/new ") {
-        let mut parts = target.splitn(2, ' ');
-        let ssh_target = parts
-            .next()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string);
-        let dir = parts
-            .next()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-            .map(str::to_string);
+        let args = temple_protocol::commands::parse_new(target);
         cmd_tx
             .send(ClientMessage::NewSession {
-                ssh_target,
-                start_dir: dir,
+                ssh_target: args.ssh_target,
+                start_dir: args.start_dir,
             })
             .ok();
         return true;
     }
     if let Some(m) = content.strip_prefix("/mode ") {
-        let mode = match m.trim() {
-            "default" => PermissionMode::Default,
-            "ask" => PermissionMode::Ask,
-            "lockdown" => PermissionMode::Lockdown,
-            "yolo" => PermissionMode::Yolo,
-            _ => {
-                s.entries
-                    .push(crate::state::ChatEntry::System(format!("bad mode: {m}")));
-                return true;
+        match temple_protocol::commands::parse_mode(m) {
+            Ok(mode) => {
+                cmd_tx
+                    .send(ClientMessage::SetPermissionMode {
+                        session_id: s.session_id,
+                        mode,
+                    })
+                    .ok();
             }
-        };
-        cmd_tx
-            .send(ClientMessage::SetPermissionMode {
-                session_id: s.session_id,
-                mode,
-            })
-            .ok();
+            Err(hint) => {
+                s.entries.push(crate::state::ChatEntry::System(format!(
+                    "bad mode — {hint}"
+                )));
+            }
+        }
+        return true;
+    }
+    if content == "/effort" {
+        s.entries.push(crate::state::ChatEntry::System(format!(
+            "reasoning effort: {} ({} )",
+            if s.effort.is_empty() {
+                "unset"
+            } else {
+                &s.effort
+            },
+            temple_protocol::commands::EFFORT_HINT
+        )));
+        return true;
+    }
+    if let Some(raw) = content.strip_prefix("/effort ") {
+        match temple_protocol::commands::parse_effort(raw) {
+            Ok(effort) => {
+                if !effort.is_empty() {
+                    cmd_tx
+                        .send(ClientMessage::SetReasoningEffort {
+                            session_id: s.session_id,
+                            effort: effort.to_string(),
+                        })
+                        .ok();
+                }
+            }
+            Err(hint) => {
+                s.entries.push(crate::state::ChatEntry::System(format!(
+                    "bad effort — {hint}"
+                )));
+            }
+        }
         return true;
     }
     if content == "/model" {
@@ -660,19 +658,29 @@ Keys:
         return true;
     }
     if let Some(model) = content.strip_prefix("/model ") {
-        let m = model.trim();
-        if m.is_empty() {
-            s.entries.push(crate::state::ChatEntry::System(format!(
-                "current model: {}",
-                s.model
-            )));
-        } else {
-            cmd_tx
-                .send(ClientMessage::SetModel {
-                    session_id: s.session_id,
-                    model: m.into(),
-                })
-                .ok();
+        match temple_protocol::commands::parse_model(model) {
+            temple_protocol::commands::ModelAction::Show => {
+                s.entries.push(crate::state::ChatEntry::System(format!(
+                    "current model: {}",
+                    s.model
+                )));
+            }
+            temple_protocol::commands::ModelAction::Auto => {
+                cmd_tx
+                    .send(ClientMessage::SetModel {
+                        session_id: s.session_id,
+                        model: "auto".to_string(),
+                    })
+                    .ok();
+            }
+            temple_protocol::commands::ModelAction::Set(m) => {
+                cmd_tx
+                    .send(ClientMessage::SetModel {
+                        session_id: s.session_id,
+                        model: m.to_string(),
+                    })
+                    .ok();
+            }
         }
         return true;
     }

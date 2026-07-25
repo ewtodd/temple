@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod command;
+pub mod commands;
 
 // ── Session & Connection ─────────────────────────────────────────────
 

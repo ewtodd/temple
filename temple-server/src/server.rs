@@ -642,11 +642,6 @@ async fn handle_connection(
                 let _ = tx.send(ServerMessage::Pong);
             }
 
-            ClientMessage::WebAuth => {
-                let code = agent.generate_web_code(tx.clone()).await;
-                let _ = tx.send(ServerMessage::WebAuthCode { code });
-            }
-
             ClientMessage::NukeSessions => {
                 let owner = auth_owner.clone().unwrap_or_default();
                 let is_admin = memory.is_admin_username(&owner).await.unwrap_or(false);
@@ -738,6 +733,8 @@ async fn handle_connection(
                     }
                 }
             }
+
+            ClientMessage::WebAuth => {} // web UI removed, no-op
 
             ClientMessage::SetReasoningEffort {
                 session_id: sid,

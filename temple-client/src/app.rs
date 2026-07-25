@@ -648,8 +648,10 @@ impl App {
                             | ServerMessage::ToolResult { .. }
                             | ServerMessage::ToolRequest { .. }
                             | ServerMessage::DocumentList { .. }
-                            | ServerMessage::DocumentDeleted { .. }
-                            | ServerMessage::ReasoningEffortChanged { .. } => {}
+                            | ServerMessage::DocumentDeleted { .. } => {}
+                            ServerMessage::ReasoningEffortChanged { effort, .. } => {
+                                s.effort = effort;
+                            }
                         }
                     }
                 });
