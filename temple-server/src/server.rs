@@ -738,6 +738,24 @@ async fn handle_connection(
                     }
                 }
             }
+
+            ClientMessage::SetReasoningEffort {
+                session_id: sid,
+                effort,
+            } => {
+                if sid != session_id {
+                    continue;
+                }
+                agent.set_reasoning_effort(sid, &effort).await;
+                let label = agent
+                    .reasoning_effort(sid)
+                    .await
+                    .unwrap_or_else(|| "unset".to_string());
+                let _ = tx.send(ServerMessage::ReasoningEffortChanged {
+                    session_id: sid,
+                    effort: label,
+                });
+            }
         }
     }
 

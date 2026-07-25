@@ -289,6 +289,9 @@ struct SessionCtx {
     /// Tool list pinned for this session — stable schemas keep the prefix
     /// cache key identical across turns.
     cached_tools: Option<Vec<ToolDefinition>>,
+    /// Reasoning effort for DeepSeek / reasoning-capable models.
+    /// "low", "medium", "high", "max", or "none"/"off".
+    reasoning_effort: Option<String>,
 }
 
 pub struct Agent {
@@ -749,6 +752,7 @@ impl Agent {
                 todos: Vec::new(),
                 cached_system_prompt: None,
                 cached_tools: None,
+                reasoning_effort: None,
             },
         );
     }
@@ -787,6 +791,7 @@ impl Agent {
                 todos: Vec::new(),
                 cached_system_prompt: None,
                 cached_tools: None,
+                reasoning_effort: None,
             },
         );
         drop(sessions);
@@ -884,6 +889,7 @@ impl Agent {
                 todos,
                 cached_system_prompt: None,
                 cached_tools: None,
+                reasoning_effort: None,
             },
         );
 
@@ -1150,6 +1156,27 @@ impl Agent {
             .get(&session_id)
             .map(|s| s.model.clone())
             .unwrap_or_else(|| self.models.default_model.clone())
+    }
+
+    /// Set the reasoning effort for a session. Supported values:
+    /// "low", "medium", "high", "max", "none", "off". Empty string unsets.
+    pub async fn set_reasoning_effort(&self, session_id: Uuid, effort: &str) {
+        if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
+            let cleaned = effort.trim();
+            if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("off") {
+                s.reasoning_effort = None;
+            } else {
+                s.reasoning_effort = Some(cleaned.to_string());
+            }
+        }
+    }
+
+    pub async fn reasoning_effort(&self, session_id: Uuid) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|s| s.reasoning_effort.clone())
     }
 
     /// The full agent loop for one user message. Routes the query, then
@@ -1422,6 +1449,15 @@ impl Agent {
         // Stats accumulators across all rounds
         let mut stats = StatsAccum::new();
 
+        let effort = {
+            self.sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .and_then(|s| s.reasoning_effort.clone())
+        };
+        let effort_ref = effort.as_deref();
+
         let (final_content, model_for_stats) = match &route {
             Route::Direct { model } => {
                 let mut tool_history = Vec::new();
@@ -1431,6 +1467,7 @@ impl Agent {
                         model,
                         &base_system_prompt,
                         &cached_tools,
+                        effort_ref,
                         &cancel_token,
                         &scope,
                         emit,
@@ -1450,6 +1487,7 @@ impl Agent {
                     content,
                     &base_system_prompt,
                     &cached_tools,
+                    effort_ref,
                     planner,
                     executor,
                     reviewer,
@@ -1666,6 +1704,7 @@ impl Agent {
         user_prompt: &str,
         base_system_prompt: &str,
         pinned_tools: &[ToolDefinition],
+        reasoning_effort: Option<&str>,
         planner: &str,
         executor: &str,
         reviewer: &str,
@@ -1710,6 +1749,7 @@ impl Agent {
                 executor,
                 &executor_prompt,
                 pinned_tools,
+                reasoning_effort,
                 cancel_token,
                 scope,
                 emit,
@@ -1775,6 +1815,7 @@ impl Agent {
                     executor,
                     &executor_prompt,
                     pinned_tools,
+                    reasoning_effort,
                     cancel_token,
                     scope,
                     emit,
@@ -1910,6 +1951,7 @@ impl Agent {
         model: &str,
         system_prompt: &str,
         pinned_tools: &[ToolDefinition],
+        reasoning_effort: Option<&str>,
         cancel_token: &CancellationToken,
         scope: &Arc<Mutex<PermissionScope>>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
@@ -1976,6 +2018,7 @@ impl Agent {
                 stream_options: None,
                 max_tokens: Some(16384),
                 temperature: None,
+                reasoning_effort: reasoning_effort.map(|s| s.to_string()),
                 ..Default::default()
             };
 

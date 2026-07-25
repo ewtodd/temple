@@ -451,9 +451,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &sender,
                                 &group_id,
                                 "commands:\n\
-                              /clear <user|account> \u{2014} delete sessions for a user (admin)\n\
-                              /delete <id-prefix> — delete a session\n\
-                              /help — this\n\
+                               /clear <user|account> \u{2014} delete sessions for a user (admin)\n\
+                               /delete <id-prefix> — delete a session\n\
+                               /effort [low|medium|high|max|off] — show/set reasoning effort\n\
+                               /help — this\n\
                               /mode [default|ask|lockdown|yolo] — show/set permission mode\n\
                               /model [auto|<name>] — show/set model for active session\n\
                               /models — list available models\n\
@@ -933,6 +934,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .await;
                                 }
                             }
+                            return;
+                        }
+
+                        if trimmed == "/effort" || trimmed.starts_with("/effort ") {
+                            let arg = trimmed.strip_prefix("/effort").unwrap().trim();
+                            let target_session = active.lock().await.get(&conv_key).copied();
+                            let Some(sid) = target_session else {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "no active session — /new one first",
+                                )
+                                .await;
+                                return;
+                            };
+                            if arg.is_empty() {
+                                let current = agent
+                                    .reasoning_effort(sid)
+                                    .await
+                                    .unwrap_or_else(|| "unset".to_string());
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    &format!(
+                                        "reasoning effort: {current} (low · medium · high · max · off)"
+                                    ),
+                                )
+                                .await;
+                                return;
+                            }
+                            let cleaned = arg.to_lowercase();
+                            if !matches!(
+                                cleaned.as_str(),
+                                "low" | "medium" | "high" | "max" | "none" | "off"
+                            ) {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "unknown effort: {arg} (low · medium · high · max · off)",
+                                )
+                                .await;
+                                return;
+                            }
+                            agent.set_reasoning_effort(sid, &cleaned).await;
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                &format!("reasoning effort → {cleaned}"),
+                            )
+                            .await;
                             return;
                         }
 

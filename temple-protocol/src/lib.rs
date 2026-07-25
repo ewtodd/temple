@@ -94,6 +94,10 @@ pub enum ClientMessage {
         session_id: Uuid,
         model: String,
     },
+    SetReasoningEffort {
+        session_id: Uuid,
+        effort: String,
+    },
     SetPermissionMode {
         session_id: Uuid,
         mode: PermissionMode,
@@ -196,6 +200,10 @@ pub enum ServerMessage {
     ModelChanged {
         session_id: Uuid,
         model: String,
+    },
+    ReasoningEffortChanged {
+        session_id: Uuid,
+        effort: String,
     },
     PermissionRequired(PermissionRequest),
     PermissionResult(PermissionResponse),
