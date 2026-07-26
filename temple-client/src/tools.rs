@@ -33,6 +33,26 @@ fn resolve_tool_path_for(path: &str, cwd: &str, for_write: bool) -> Result<PathB
         Path::new(cwd).join(p)
     };
 
+    // Fast path: if the full path already exists, canonicalize it directly.
+    // This avoids the walk-up logic which can misidentify directory components
+    // as files under systemd sandbox restrictions (ProtectSystem="strict").
+    if abs.exists() {
+        let canonical =
+            std::fs::canonicalize(&abs).map_err(|e| format!("cannot resolve {:?}: {}", abs, e))?;
+        let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+        if canonical.starts_with(&cwd_canon) || (!for_write && canonical.starts_with("/tmp")) {
+            return Ok(canonical);
+        } else {
+            return Err(format!(
+                "{:?} escapes working directory ({})",
+                path,
+                cwd_canon.display()
+            ));
+        }
+    }
+
+    // Path doesn't exist (new file for write, or stale path). Walk up to
+    // find the first existing ancestor, then reconstruct the full path.
     let mut candidate = abs.clone();
     let mut suffix = PathBuf::new();
     loop {
@@ -166,7 +186,13 @@ pub async fn execute_local_tool(
             if let Some(ref tx) = progress_tx {
                 // Streaming mode: spawn, read stdout line-by-line, send
                 // ToolDelta updates as output arrives.
-                let mut child = match tokio::process::Command::new("sh")
+                // Use absolute path to shell — daemon runs in a systemd
+                // sandbox (ProtectSystem="strict") where PATH may be minimal.
+                let shell = std::env::var("SHELL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("/bin/sh".to_string());
+                let mut child = match tokio::process::Command::new(&shell)
                     .arg("-c")
                     .arg(command)
                     .current_dir(cwd)
@@ -223,7 +249,11 @@ pub async fn execute_local_tool(
                     out
                 }
             } else {
-                let child = tokio::process::Command::new("sh")
+                let shell = std::env::var("SHELL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("/bin/sh".to_string());
+                let child = tokio::process::Command::new(&shell)
                     .arg("-c")
                     .arg(command)
                     .current_dir(cwd)

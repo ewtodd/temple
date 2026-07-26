@@ -6,6 +6,7 @@
 {
   config,
   lib,
+  pkgs,
   templePackage,
   ...
 }:
@@ -44,6 +45,16 @@ in
 
         environment.HOME = "/home/${name}";
         environment.RUST_LOG = "temple_client=info";
+
+        path = with pkgs; [
+          bash
+          coreutils
+          gnugrep
+          gnused
+          findutils
+          git
+          ripgrep
+        ];
 
         serviceConfig = {
           Type = "simple";
