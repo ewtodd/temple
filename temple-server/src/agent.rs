@@ -1080,17 +1080,6 @@ impl Agent {
         self.sessions.lock().await.remove(&session_id);
     }
 
-    /// Make a session persist to the DB, with an optional account tag.
-    pub async fn set_session_persisted(&self, session_id: Uuid, account: Option<String>) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.get_mut(&session_id) {
-            s.persist = true;
-            if let Some(acct) = account {
-                s.account = Some(acct);
-            }
-        }
-    }
-
     /// Whether a session is persisted (durable) vs ephemeral (daily swept).
     pub async fn is_session_persisted(&self, session_id: Uuid) -> bool {
         self.sessions

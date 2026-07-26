@@ -1121,14 +1121,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                        // Mark non-group sessions as persisted so conversations
-                        // survive restarts and are resumable via /sessions.
-                        if group_id.is_none() {
-                            agent
-                                .set_session_persisted(target_session, Some(username.clone()))
-                                .await;
-                        }
-
                         // Send typing indicator
                         let typing_result = match &group_id {
                             Some(g) => signal.send_typing_group(g).await,
