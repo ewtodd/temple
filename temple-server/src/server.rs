@@ -116,7 +116,7 @@ async fn handle_connection(
                         Some(owner) => {
                             auth_owner = Some(owner.clone());
                             daemon_owner = Some(owner.clone());
-                            agent.register_daemon(&owner).await;
+                            agent.register_daemon(&owner, tx.clone()).await;
                         }
                         None => {
                             let _ = tx.send(ServerMessage::ChatError {
@@ -549,7 +549,9 @@ async fn handle_connection(
                 session_id: sid,
                 result,
             } => {
-                if sid == session_id {
+                // Allow the session's own client and daemon-authenticated
+                // connections (that execute on behalf of Signal sessions).
+                if sid == session_id || daemon_owner.is_some() {
                     agent.resolve_tool(request_id, result).await;
                 }
             }

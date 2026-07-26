@@ -322,6 +322,10 @@ pub struct Agent {
     /// Active daemon connections: username → count (multiple sessions per user).
     /// Used for Signal sandboxing — users without a daemon get restricted tools.
     daemon_connections: Mutex<HashMap<String, u32>>,
+    /// Write channels for each daemon's WebSocket connection, keyed by owner.
+    /// When a Signal session needs a tool executed, ToolRequest messages are
+    /// forwarded through these channels to the daemon for local execution.
+    daemon_channels: Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<ServerMessage>>>>,
     pub nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
 }
 
@@ -351,6 +355,7 @@ impl Agent {
             ),
             tools: Mutex::new(Vec::new()),
             daemon_connections: Mutex::new(HashMap::new()),
+            daemon_channels: Mutex::new(HashMap::new()),
             nextcloud,
         }
     }
@@ -487,20 +492,43 @@ impl Agent {
     }
 
     /// Register a daemon connection for a user. Called when a client
-    /// authenticates via pubkey on OpenSession.
-    pub async fn register_daemon(&self, username: &str) {
+    /// authenticates via pubkey on OpenSession.  Stores the WebSocket write
+    /// channel so that non-WebSocket sessions (Signal) can route ToolRequests
+    /// through this daemon for local execution.
+    pub async fn register_daemon(
+        &self,
+        username: &str,
+        tx: tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+    ) {
         let mut map = self.daemon_connections.lock().await;
+        let was_zero = map.get(username).copied().unwrap_or(0) == 0;
         *map.entry(username.to_string()).or_insert(0) += 1;
-        tracing::info!("daemon connected: {username} (total: {})", map[username]);
+        let total = map[username];
+        drop(map);
+
+        // Prune stale channels when the first daemon arrives, then push.
+        let mut chans = self.daemon_channels.lock().await;
+        if was_zero {
+            chans.remove(username);
+        }
+        chans.entry(username.to_string()).or_default().push(tx);
+
+        tracing::info!("daemon connected: {username} (total: {total})");
     }
 
     /// Unregister a daemon connection. Called when the WS connection closes.
+    /// When the ref count drops to zero, all stored channels for that user
+    /// are cleared.
     pub async fn unregister_daemon(&self, username: &str) {
         let mut map = self.daemon_connections.lock().await;
         if let Some(count) = map.get_mut(username) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 map.remove(username);
+                drop(map);
+                self.daemon_channels.lock().await.remove(username);
+                tracing::info!("daemon disconnected: {username} (cleared)");
+                return;
             }
         }
         tracing::info!("daemon disconnected: {username}");
@@ -509,6 +537,34 @@ impl Agent {
     /// Check if a user has at least one active daemon connection.
     pub async fn has_daemon(&self, username: &str) -> bool {
         self.daemon_connections.lock().await.contains_key(username)
+    }
+
+    /// Forward a tool request to all daemon WebSocket channels belonging to
+    /// `username`.  Returns true if at least one channel was found.
+    pub async fn send_tool_to_daemon(
+        &self,
+        username: &str,
+        request_id: Uuid,
+        session_id: Uuid,
+        name: String,
+        args_json: String,
+        session_cwd: String,
+    ) -> bool {
+        let chans = self.daemon_channels.lock().await;
+        if let Some(senders) = chans.get(username) {
+            for tx in senders {
+                let _ = tx.send(ServerMessage::ToolRequest {
+                    request_id,
+                    session_id,
+                    name: name.clone(),
+                    args_json: args_json.clone(),
+                    session_cwd: session_cwd.clone(),
+                });
+            }
+            !senders.is_empty()
+        } else {
+            false
+        }
     }
 
     /// Sandboxed tool set — memories and tasks only, no filesystem or shell.

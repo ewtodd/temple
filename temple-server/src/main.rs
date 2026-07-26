@@ -1173,6 +1173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let perms_for_emit = perms.clone();
                         let group_for_emit = group_id.clone();
                         let agent_for_emit = agent.clone();
+                        let session_id = target_session;
                         let response = Arc::new(std::sync::Mutex::new(String::new()));
                         let resp = response.clone();
                         let emit = move |ev: agent::AgentEvent| {
@@ -1213,16 +1214,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                 }
                                 agent::AgentEvent::ToolRequestNeeded {
-                                    request_id, name, ..
+                                    request_id,
+                                    name,
+                                    args_json,
+                                    session_cwd,
                                 } => {
-                                    // Signal sessions have no local tool executor
-                                    // — fail fast instead of stalling the
-                                    // request queue for the 300s timeout.
+                                    // If a daemon is registered for this
+                                    // session's owner, route the request
+                                    // to its WebSocket channel so the
+                                    // daemon executes the tool locally.
+                                    // Otherwise fail fast.
                                     let agent = agent_for_emit.clone();
+                                    let sid = session_id;
                                     tokio::spawn(async move {
-                                        agent.resolve_tool(request_id, format!(
-                                        "Error: tool {name} needs a TUI client — none attached to this session"
-                                    )).await;
+                                        let owner = agent.session_owner(sid).await;
+                                        let routed = match &owner {
+                                            Some(o) if agent.has_daemon(o).await => {
+                                                agent
+                                                    .send_tool_to_daemon(
+                                                        o,
+                                                        request_id,
+                                                        sid,
+                                                        name.clone(),
+                                                        args_json,
+                                                        session_cwd,
+                                                    )
+                                                    .await
+                                            }
+                                            _ => false,
+                                        };
+                                        if !routed {
+                                            agent
+                                                .resolve_tool(
+                                                    request_id,
+                                                    format!(
+                                                        "Error: tool {name} needs a TUI client or daemon — none attached to this session"
+                                                    ),
+                                                )
+                                                .await;
+                                        }
                                     });
                                 }
                                 agent::AgentEvent::Delta(d) => {
