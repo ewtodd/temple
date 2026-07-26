@@ -960,16 +960,24 @@ impl Agent {
                     .find(|m| m.role == "user")
                     .and_then(|m| m.content_text_owned())
                     .map(|content| {
+                        // The process_chat loop prepends a dynamic preamble
+                        // (date, memories, skills) separated by "\n\n---\n\n".
+                        // Strip it so the title model sees only the actual
+                        // user request, not a wall of personality context.
+                        let clean = content
+                            .split_once("\n\n---\n\n")
+                            .map(|(_, after)| after)
+                            .unwrap_or(&content);
                         // Group messages are stored as "sender: text" —
                         // don't let the sender prefix leak into titles.
                         if s.username == "group" {
-                            content
+                            clean
                                 .split_once(": ")
                                 .map(|x| x.1)
-                                .unwrap_or(&content)
+                                .unwrap_or(clean)
                                 .to_string()
                         } else {
-                            content
+                            clean.to_string()
                         }
                     })
             })
