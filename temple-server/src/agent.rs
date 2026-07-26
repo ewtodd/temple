@@ -292,6 +292,9 @@ struct SessionCtx {
     /// Reasoning effort for DeepSeek / reasoning-capable models.
     /// "low", "medium", "high", "max", or "none"/"off".
     reasoning_effort: Option<String>,
+    /// SSH target machine for sessions created via /new (e.g. "e-play").
+    /// Determines where tools execute via the daemon on that machine.
+    ssh_target: Option<String>,
 }
 
 pub struct Agent {
@@ -752,21 +755,33 @@ impl Agent {
                 cached_system_prompt: None,
                 cached_tools: None,
                 reasoning_effort: None,
+                ssh_target: None,
             },
         );
     }
 
     /// Create a new persisted session for `owner`, with an optional
-    /// start directory. The client handles tool execution via ToolRequest.
+    /// start directory and SSH target machine. The client handles tool
+    /// execution via ToolRequest. When `client_cwd` is None (Signal),
+    /// `start_dir` is resolved relative to `/home/{ssh_target}`.
     pub async fn new_persisted_session(
         &self,
         owner: &str,
-        _start_dir: Option<&str>,
+        start_dir: Option<&str>,
         account: Option<&str>,
         client_cwd: Option<&str>,
+        ssh_target: Option<&str>,
     ) -> Result<Uuid, String> {
         let session_id = Uuid::new_v4();
-        let cwd = client_cwd.unwrap_or("/var/lib/temple").to_string();
+        let cwd = if let Some(c) = client_cwd {
+            c.to_string()
+        } else if let (Some(t), Some(d)) = (ssh_target, start_dir) {
+            format!("/home/{t}/{d}")
+        } else if let Some(t) = ssh_target {
+            format!("/home/{t}")
+        } else {
+            "/var/lib/temple".to_string()
+        };
         let account_name = account.map(|a| a.to_string());
 
         let mut sessions = self.sessions.lock().await;
@@ -791,6 +806,7 @@ impl Agent {
                 cached_system_prompt: None,
                 cached_tools: None,
                 reasoning_effort: None,
+                ssh_target: ssh_target.map(|s| s.to_string()),
             },
         );
         drop(sessions);
@@ -889,6 +905,7 @@ impl Agent {
                 cached_system_prompt: None,
                 cached_tools: None,
                 reasoning_effort: None,
+                ssh_target: row.ssh_target.clone(),
             },
         );
 
@@ -909,7 +926,7 @@ impl Agent {
             crate::memory::PersistedSession {
                 id: session_id,
                 username: s.owner.clone(),
-                ssh_target: None,
+                ssh_target: s.ssh_target.clone(),
                 account: s.account.clone(),
                 cwd: s.cwd.clone(),
                 mode: format!("{:?}", s.permission_mode).to_lowercase(),
@@ -1032,11 +1049,11 @@ impl Agent {
     pub async fn session_display(
         &self,
         session_id: Uuid,
-    ) -> Option<(Option<String>, PermissionMode)> {
+    ) -> Option<(Option<String>, PermissionMode, Option<String>)> {
         let sessions = self.sessions.lock().await;
         sessions
             .get(&session_id)
-            .map(|s| (s.title.clone(), s.permission_mode))
+            .map(|s| (s.title.clone(), s.permission_mode, s.ssh_target.clone()))
     }
 
     /// Check whether a session is currently loaded in memory.

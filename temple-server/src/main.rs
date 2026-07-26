@@ -720,7 +720,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let title = r.title.as_deref().unwrap_or("(untitled)");
                                         body.push_str(&format!(
                                             "• {id8} · {} · {title} · {}\n",
-                                            r.username, r.cwd
+                                            r.ssh_target.as_deref().unwrap_or("quick"),
+                                            r.cwd
                                         ));
                                     }
                                     body.push_str("\nresume with /session <id-prefix>");
@@ -828,10 +829,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             };
                             if arg.is_empty() {
-                                let (_, mode) = agent
-                                    .session_display(sid)
-                                    .await
-                                    .unwrap_or((None, temple_protocol::PermissionMode::Default));
+                                let (_, mode, _) = agent.session_display(sid).await.unwrap_or((
+                                    None,
+                                    temple_protocol::PermissionMode::Default,
+                                    None,
+                                ));
                                 send_conv(
                                     &signal,
                                     &sender,
@@ -1009,7 +1011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             }
                             match agent
-                                .new_persisted_session(session_owner, subdir, None, None)
+                                .new_persisted_session(session_owner, subdir, None, None, target)
                                 .await
                             {
                                 Ok(sid) => {
@@ -1315,11 +1317,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Signal chats get the response plain.
                             let is_persisted = agent.is_session_persisted(target_session).await;
                             let full = if is_persisted {
-                                let target: Option<String> = None;
-                                let (title, mode) = agent
-                                    .session_display(target_session)
-                                    .await
-                                    .unwrap_or((None, temple_protocol::PermissionMode::Default));
+                                let (title, mode, target) =
+                                    agent.session_display(target_session).await.unwrap_or((
+                                        None,
+                                        temple_protocol::PermissionMode::Default,
+                                        None,
+                                    ));
                                 let id8: String = target_session
                                     .simple()
                                     .to_string()

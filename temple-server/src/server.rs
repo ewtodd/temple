@@ -142,6 +142,7 @@ async fn handle_connection(
                         None,
                         Some(&open.username),
                         Some(&open.cwd),
+                        None,
                     )
                     .await
                 {
@@ -253,7 +254,7 @@ async fn handle_connection(
             }
 
             ClientMessage::NewSession {
-                ssh_target: _ssh_target,
+                ssh_target,
                 start_dir,
             } => {
                 let owner = auth_owner.clone().unwrap_or_default();
@@ -270,6 +271,7 @@ async fn handle_connection(
                         start_dir.as_deref(),
                         None,
                         client_cwd.as_deref(),
+                        ssh_target.as_deref(),
                     )
                     .await
                 {
@@ -297,7 +299,7 @@ async fn handle_connection(
                         let meta = SessionMeta {
                             id: sid,
                             title: None,
-                            ssh_target: None,
+                            ssh_target: ssh_target.clone(),
                             username: String::new(),
                             cwd: String::new(),
                             mode: "default".into(),
