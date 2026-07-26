@@ -151,14 +151,20 @@ pub async fn execute_local_tool(
             match resolve_tool_path_for(path, cwd, true) {
                 Err(e) => format!("Error: {e}"),
                 Ok(resolved) => {
-                    if let Some(parent) = resolved.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
-                    }
-                    match tokio::fs::write(&resolved, content).await {
-                        Ok(()) => {
-                            format!("wrote {} ({} bytes)", resolved.display(), content.len())
+                    // The LLM sometimes passes a directory path — give a
+                    // clear message instead of EISDIR.
+                    if resolved.is_dir() {
+                        format!("Error: {:?} is a directory, not a file", resolved.display())
+                    } else {
+                        if let Some(parent) = resolved.parent() {
+                            tokio::fs::create_dir_all(parent).await.ok();
                         }
-                        Err(e) => format!("Error: {e}"),
+                        match tokio::fs::write(&resolved, content).await {
+                            Ok(()) => {
+                                format!("wrote {} ({} bytes)", resolved.display(), content.len())
+                            }
+                            Err(e) => format!("Error: {e}"),
+                        }
                     }
                 }
             }
@@ -305,32 +311,41 @@ pub async fn execute_local_tool(
             match resolve_tool_path_for(path, cwd, true) {
                 Err(e) => format!("Error: {e}"),
                 Ok(resolved) => {
-                    if let Some(parent) = resolved.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
-                    }
-                    match tokio::fs::read_to_string(&resolved).await {
-                        Err(e) => format!("Error: {e}"),
-                        Ok(content) => {
-                            if !content.contains(old_str) {
-                                format!("Error: old_str not found in {}", resolved.display())
-                            } else {
-                                let count = content.matches(old_str).count();
-                                if count > 1 {
-                                    format!("Error: old_str found {count} times — must be unique")
+                    if !resolved.exists() {
+                        format!(
+                            "Error: {:?} does not exist — use write_file to create it",
+                            resolved.display()
+                        )
+                    } else {
+                        if let Some(parent) = resolved.parent() {
+                            tokio::fs::create_dir_all(parent).await.ok();
+                        }
+                        match tokio::fs::read_to_string(&resolved).await {
+                            Err(e) => format!("Error: {e}"),
+                            Ok(content) => {
+                                if !content.contains(old_str) {
+                                    format!("Error: old_str not found in {}", resolved.display())
                                 } else {
-                                    let mut n = content.replacen(old_str, new_str, 1);
-                                    if content.ends_with('\n') && !n.ends_with('\n') {
-                                        n.push('\n');
-                                    }
-                                    // Atomic write via temp-file + rename:
-                                    // prevents partial writes and TOCTOU races
-                                    // with concurrent readers/writers.
-                                    match tokio::fs::write(&resolved, &n).await {
-                                        Err(e) => format!("Error: {e}"),
-                                        Ok(()) => format!(
-                                            "edited {} (replaced 1 occurrence)",
-                                            resolved.display()
-                                        ),
+                                    let count = content.matches(old_str).count();
+                                    if count > 1 {
+                                        format!(
+                                            "Error: old_str found {count} times — must be unique"
+                                        )
+                                    } else {
+                                        let mut n = content.replacen(old_str, new_str, 1);
+                                        if content.ends_with('\n') && !n.ends_with('\n') {
+                                            n.push('\n');
+                                        }
+                                        // Atomic write via temp-file + rename:
+                                        // prevents partial writes and TOCTOU races
+                                        // with concurrent readers/writers.
+                                        match tokio::fs::write(&resolved, &n).await {
+                                            Err(e) => format!("Error: {e}"),
+                                            Ok(()) => format!(
+                                                "edited {} (replaced 1 occurrence)",
+                                                resolved.display()
+                                            ),
+                                        }
                                     }
                                 }
                             }

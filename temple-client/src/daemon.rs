@@ -58,9 +58,12 @@ pub async fn run(server: String, client_id: String, pubkey: String) -> Result<()
 
             // Execute every tool immediately — permission decisions come
             // from the session, not the daemon. Use the session's CWD.
+            // Log the tool name and args for debugging — goes to journal via stderr
+            let args_preview = args_json.chars().take(300).collect::<String>();
             eprintln!(
-                "temple-daemon: executing tool {} (request {}, session {}, cwd {})",
-                name, request_id, session_id, session_cwd
+                "temple-daemon: executing tool {} (request {}, session {}, cwd {})\n\
+                 \targs: {}",
+                name, request_id, session_id, session_cwd, args_preview
             );
             let result = execute_local_tool(
                 &name,
