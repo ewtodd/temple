@@ -706,9 +706,6 @@ impl Memory {
         let count = tx.execute("DELETE FROM sessions", [])?;
         tx.execute("DELETE FROM conversations", [])?;
         tx.commit()?;
-        if count == 0 {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
-        }
         Ok(count)
     }
 

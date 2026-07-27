@@ -137,14 +137,28 @@ fn handle_key_event(
                         let tool_name = name.clone();
                         let (responder_tx, responder_rx) =
                             std::sync::mpsc::sync_channel::<String>(1);
-                        let _ = internal_tx.try_send(InternalCmd::ExecuteLocalTool {
+                        match internal_tx.try_send(InternalCmd::ExecuteLocalTool {
                             name,
                             args_json,
                             cwd,
                             responder: responder_tx,
                             request_id,
                             session_id,
-                        });
+                        }) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                                eprintln!(
+                                    "ERROR: internal channel full, dropping tool {}",
+                                    cmd.name()
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(cmd)) => {
+                                eprintln!(
+                                    "ERROR: internal channel closed, dropping tool {}",
+                                    cmd.name()
+                                );
+                            }
+                        }
                         // Drop the lock before blocking on tool completion
                         // so the render loop can refresh the UI.
                         drop(s);

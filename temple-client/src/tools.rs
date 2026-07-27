@@ -115,7 +115,10 @@ pub async fn execute_local_tool(
     request_id: uuid::Uuid,
     session_id: uuid::Uuid,
 ) -> String {
-    let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(e) => return format!("Error: invalid tool arguments JSON: {e}"),
+    };
 
     match name {
         "read_file" => {

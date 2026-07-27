@@ -361,6 +361,7 @@ pub struct Agent {
     /// forwarded through these channels to the daemon for local execution.
     daemon_channels: Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<ServerMessage>>>>,
     pub nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
+    pub default_permission: PermissionMode,
 }
 
 impl Agent {
@@ -369,6 +370,7 @@ impl Agent {
         memory: Arc<Memory>,
         models: ModelConfig,
         nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
+        default_permission: PermissionMode,
     ) -> Self {
         Self {
             backend,
@@ -389,6 +391,7 @@ impl Agent {
             daemon_connections: Mutex::new(HashMap::new()),
             daemon_channels: Mutex::new(HashMap::new()),
             nextcloud,
+            default_permission,
         }
     }
 
@@ -738,6 +741,7 @@ impl Agent {
             stream_options: None,
             max_tokens: Some(1),
             temperature: Some(0.0),
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
             ..Default::default()
         };
         let _ = self.backend.chat(req).await;
@@ -770,7 +774,7 @@ impl Agent {
                 // into memory first). Only new_persisted_session (TUI and
                 // Signal /new) creates resumable cross-surface sessions.
                 persist: false,
-                permission_mode: PermissionMode::Default,
+                permission_mode: self.default_permission,
                 project_context: None,
                 model_override: false,
                 last_routed_model: None,
@@ -783,12 +787,10 @@ impl Agent {
                 last_prompt_tokens: None,
             },
         );
+        drop(sessions);
+        // Quick sessions are ephemeral — don't persist
     }
 
-    /// Create a new persisted session for `owner`, with an optional
-    /// start directory and SSH target machine. The client handles tool
-    /// execution via ToolRequest. When `client_cwd` is None (Signal),
-    /// `start_dir` is resolved relative to `/home/{ssh_target}`.
     pub async fn new_persisted_session(
         &self,
         owner: &str,
@@ -823,7 +825,7 @@ impl Agent {
                 title: None,
                 title_from_model: false,
                 persist: true,
-                permission_mode: PermissionMode::Default,
+                permission_mode: self.default_permission,
                 project_context: None,
                 model_override: false,
                 last_routed_model: None,

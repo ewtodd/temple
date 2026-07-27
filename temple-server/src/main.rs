@@ -120,12 +120,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal = Arc::new(signal::Signal::new(&cfg.signal));
     let nextcloud = Arc::new(Mutex::new(nextcloud::Nextcloud::new(&cfg.nextcloud)));
 
+    let default_perm = match cfg.default_permission.as_str() {
+        "ask" => PermissionMode::Ask,
+        "lockdown" => PermissionMode::Lockdown,
+        "yolo" => PermissionMode::Yolo,
+        _ => PermissionMode::Default,
+    };
+
     // Initialize agent
     let agent = agent::Agent::new(
         backend,
         memory.clone(),
         cfg.models.clone(),
         nextcloud.clone(),
+        default_perm,
     );
     let agent = Arc::new(agent);
 
@@ -440,8 +448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                               /reset — cancel ALL in-flight requests (admin)\n\
                               /session <id-prefix> — resume a session\n\
                               /sessions — list your recent sessions\n\
-                              /stop — interrupt the running request\n\
-                              /targets \u{2014} list ssh targets",
+                               /stop — interrupt the running request",
                             )
                             .await;
                             return;
@@ -539,11 +546,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
-                            return;
-                        }
-
-                        if trimmed == "/targets" {
-                            send_conv(&signal, &sender, &group_id, "no targets configured").await;
                             return;
                         }
 

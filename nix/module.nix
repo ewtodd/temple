@@ -18,11 +18,12 @@ let
     backends = cfg.modelEndpoints;
     db_path = "${cfg.dataDir}/memory.db";
     allowed_dirs = cfg.allowedDirs;
+    default_permission = cfg.defaultPermission;
     signal = {
       enabled = cfg.signal.enable;
       socket_addr = cfg.signal.socketAddr;
-      default_recipient = "";
-      allowed_senders = [ ];
+      default_recipient = cfg.signal.defaultRecipient;
+      allowed_senders = cfg.signal.allowedSenders;
     };
     nextcloud = {
       enabled = cfg.nextcloud.enable;
@@ -41,7 +42,10 @@ let
     };
   });
 
-  port = toString (lib.last (lib.splitString ":" cfg.listen));
+  portStr = if lib.hasPrefix "[" cfg.listen
+    then lib.last (lib.splitString "]:" cfg.listen)
+    else lib.last (lib.splitString ":" cfg.listen);
+  port = lib.toIntBase10 portStr;
 in
 {
   options.services.temple-server = {
@@ -165,6 +169,24 @@ in
         type = types.str;
         default = "127.0.0.1:7583";
         description = "signal-cli daemon TCP socket address.";
+      };
+
+      allowedSenders = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "+15551234567" "+15559876543" ];
+        description = ''
+          Phone numbers (E.164 format, "+" prefix) allowed to send inbound
+          Signal commands. When empty, senders are gated by the token-auth
+          flow (signal_users table + /verify) instead.
+        '';
+      };
+
+      defaultRecipient = mkOption {
+        type = types.str;
+        default = "";
+        example = "+15551234567";
+        description = "Default Signal recipient for outbound notifications.";
       };
     };
 
@@ -296,6 +318,7 @@ in
 
         StateDirectory = "temple";
         StateDirectoryMode = "0750";
+        ReadWritePaths = lib.optional (cfg.dataDir != "/var/lib/temple") cfg.dataDir;
         UMask = "0077";
 
         NoNewPrivileges = true;
@@ -324,7 +347,7 @@ in
     };
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
-      (lib.toIntBase10 port)
+      port
     ];
   };
 }

@@ -45,6 +45,14 @@ pub enum InternalCmd {
     },
 }
 
+impl InternalCmd {
+    pub fn name(&self) -> &str {
+        match self {
+            InternalCmd::ExecuteLocalTool { name, .. } => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     /// User message

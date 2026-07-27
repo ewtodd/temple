@@ -168,7 +168,16 @@ impl App {
                             }
 
                             let args: serde_json::Value =
-                                serde_json::from_str(args_json).unwrap_or_default();
+                                match serde_json::from_str(args_json) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        let _ = tx_task.send(ClientMessage::ToolResult {
+                                            request_id, session_id,
+                                            result: format!("Error: invalid tool arguments JSON for {name}"),
+                                        });
+                                        continue;
+                                    }
+                                };
                             let needs_consent = match name.as_str() {
                                 "write_file" | "edit_file" => {
                                     let path =

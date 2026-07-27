@@ -67,8 +67,7 @@ in
           StandardError = "journal";
 
           NoNewPrivileges = true;
-          ProtectSystem = "strict";
-          ProtectHome = "read-only";
+          ProtectSystem = "full";
           PrivateTmp = true;
           PrivateDevices = true;
           ProtectKernelTunables = true;

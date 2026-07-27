@@ -2389,10 +2389,8 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
- "dirs",
  "futures-util",
  "native-tls",
- "rand",
  "ratatui",
  "serde_json",
  "tempfile",
@@ -2400,7 +2398,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "unicode-width",
- "url",
  "uuid",
  "whoami",
 ]
