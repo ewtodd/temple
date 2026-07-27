@@ -40,6 +40,7 @@ let
       router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
       title_model = if cfg.titleModel != null then cfg.titleModel else cfg.researcherModel;
     };
+  } // optionalAttrs (cfg.tlsCertFile != null && cfg.tlsKeyFile != null) {
     tls = {
       cert = cfg.tlsCertFile;
       key = cfg.tlsKeyFile;
