@@ -38,6 +38,7 @@ let
       critical_model = cfg.criticalModel;
       researcher_model = cfg.researcherModel;
       router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
+      title_model = if cfg.titleModel != null then cfg.titleModel else cfg.researcherModel;
     };
   });
 
@@ -115,11 +116,20 @@ in
     routerModel = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = "gemma-4-12b-router";
+      example = "supra-router";
       description = ''
         Model for complexity classification. Falls back to researcherModel
-        when unset. Point this at a small fast model co-resident with the
-        executor model on the same GPU host.
+        when unset. Use a small fast model for this role.
+      '';
+    };
+
+    titleModel = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "gemma-4-12b-it-qat";
+      description = ''
+        Model for session titles and conversation summaries. Falls back to
+        researcherModel when unset.
       '';
     };
 

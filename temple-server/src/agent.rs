@@ -436,7 +436,7 @@ impl Agent {
         // if configured, otherwise fall back to the default model.
         let summarizer_model = self
             .models
-            .router_model
+            .title_model
             .as_deref()
             .unwrap_or(&self.models.default_model);
 
@@ -447,7 +447,9 @@ impl Agent {
             stream: Some(false),
             stream_options: None,
             max_tokens: Some(1024),
-            temperature: Some(0.1),
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            top_k: Some(1),
             ..Default::default()
         };
 
@@ -987,7 +989,7 @@ impl Agent {
         // son-of-anton), falling back to researcher if unconfigured.
         let title_model = self
             .models
-            .router_model
+            .title_model
             .as_deref()
             .unwrap_or(&self.models.researcher_model);
         let req = ChatRequest {
@@ -1004,7 +1006,9 @@ impl Agent {
             stream: Some(false),
             stream_options: None,
             max_tokens: Some(24),
-            temperature: Some(0.2),
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            top_k: Some(1),
             ..Default::default()
         };
 

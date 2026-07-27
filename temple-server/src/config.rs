@@ -79,11 +79,14 @@ pub struct ModelConfig {
     pub critical_model: String,
     /// Model for research/lookups (gemma on anton)
     pub researcher_model: String,
-    /// Model for complexity classification — a small fast model co-resident
-    /// with the default/executor model on the same GPU host. Falls back to
+    /// Model for complexity classification. Falls back to
     /// researcher_model when unset.
     #[serde(default)]
     pub router_model: Option<String>,
+    /// Model for session titles and conversation summaries. Falls back to
+    /// researcher_model when unset.
+    #[serde(default)]
+    pub title_model: Option<String>,
 }
 
 impl Default for ModelConfig {
@@ -97,6 +100,7 @@ impl Default for ModelConfig {
             critical_model: "deepseek-v4-flash-high".into(),
             researcher_model: "gemma-4-31b".into(),
             router_model: None,
+            title_model: None,
         }
     }
 }
