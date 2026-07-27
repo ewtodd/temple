@@ -2558,6 +2558,7 @@ Working directory: {display_cwd}
 
 When working with files, use paths relative to the working directory.
 Do not prepend the server's base path — use relative paths only.
+Shell commands already run in the working directory — never use `cd`.
 
 ## Available tools
 You have filesystem access, shell commands, persistent memory, web
@@ -2591,6 +2592,7 @@ session resume.
 You are renco, running a scheduled maintenance task on temple harness.
 Working directory: {display_cwd}
 Filesystem access and shell commands are available.
+Shell commands already run in the working directory — never use `cd`.
 
 Git conventions:
 - In the temple repo renco-bot is the SOLE author of all commits —
@@ -3241,14 +3243,23 @@ Git conventions:
         // Get current personality
         let current = self.memory.get_personality().await.unwrap_or_default();
 
-        // Get recent conversations (last 50)
-        let recent = match self.memory.get_recent_conversations(50).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Failed to get recent conversations: {e}");
-                return;
+        // Get recent conversations from ALL registered users. We
+        // deliberately build a global personality from every user's
+        // perspective — renco is shared across accounts. Each user's
+        // conversations are fetched with a properly JOINed query that
+        // only covers persisted sessions.
+        let mut recent = Vec::new();
+        if let Ok(users) = self.memory.get_signal_users().await {
+            for (username, ..) in &users {
+                if let Ok(user_convos) = self
+                    .memory
+                    .get_recent_conversations_for_user(username, 10)
+                    .await
+                {
+                    recent.extend(user_convos);
+                }
             }
-        };
+        }
 
         if recent.is_empty() {
             tracing::info!("No conversations to analyze");

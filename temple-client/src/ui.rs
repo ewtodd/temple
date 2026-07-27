@@ -298,8 +298,8 @@ pub fn draw(f: &mut Frame, s: &mut AppState, tick_count: u64) -> (Rect, Vec<Stri
 
     // Scroll handling
     let max_scroll = total.saturating_sub(chat_avail);
-    let scroll = s.scroll.min(max_scroll);
-    let start = max_scroll.saturating_sub(scroll);
+    s.scroll = s.scroll.min(max_scroll);
+    let start = max_scroll.saturating_sub(s.scroll);
     let visible_chat: Vec<Line> = all_chat_lines
         .into_iter()
         .skip(start)

@@ -175,6 +175,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pending_perms: PendingPerms =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
             let perms_for_handler = pending_perms.clone();
+            // Per-sender concurrency limit: max 2 agent loops per sender at once.
+            // Messages beyond the limit get a "busy" reply instead of spawning
+            // unbounded tasks that flood the model queue and consume memory.
+            type SenderLimits =
+                Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>>;
+            let sender_limits: SenderLimits =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let limits_for_handler = sender_limits.clone();
             let handler = Arc::new(
                 move |sender: String,
                       mut message: String,
@@ -189,7 +197,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let workspace = data_dir_workspace.clone();
                     let active = active_for_handler.clone();
                     let perms = perms_for_handler.clone();
+                    let limits = limits_for_handler.clone();
                     tokio::spawn(async move {
+                        // Per-sender concurrency limit: at most 2 agent loops
+                        // per sender. Messages beyond the limit get a "busy"
+                        // reply so the sender knows we received but are not
+                        // processing yet.
+                        let limit_sem = {
+                            let mut map = limits.lock().await;
+                            map.entry(sender.clone())
+                                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2)))
+                                .clone()
+                        };
+                        let Ok(_permit) = limit_sem.try_acquire() else {
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                "busy — still working on your earlier request",
+                            )
+                            .await;
+                            return;
+                        };
+
                         tracing::info!("signal inbound from {sender}: {message:.60}");
 
                         // Send read receipt immediately
@@ -1505,6 +1535,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cancel in-flight loops and persist sessions before exiting, so no
     // history or cron work is lost mid-write.
     let shutdown_agent = agent.clone();
+
+    // Health check listener — minimal HTTP responder on a separate port
+    // for load balancer / systemd health probes.
+    {
+        let health_listen = cfg.listen_health.clone();
+        tokio::spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::bind(&health_listen).await else {
+                tracing::warn!("Failed to bind health listener on {health_listen}");
+                return;
+            };
+            tracing::info!("Health endpoint listening on {health_listen}");
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                    )
+                    .await;
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp).await;
+                });
+            }
+        });
+    }
+
     tokio::select! {
         res = server::run_server(agent, memory, cfg) => res,
         _ = shutdown_signal() => {

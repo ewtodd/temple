@@ -15,6 +15,11 @@ pub struct Config {
     pub allowed_dirs: Vec<String>,
     /// Path to the auth tokens file. Each line: `token:username:phone`.
     pub auth_token_file: Option<PathBuf>,
+    /// TLS configuration for secure WebSocket connections.
+    pub tls: TlsConfig,
+    /// Health check listen address (host:port). When set, responds with 200 OK on HTTP GET.
+    #[serde(default = "default_health_listen")]
+    pub listen_health: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -129,6 +134,10 @@ impl Default for CronConfig {
     }
 }
 
+fn default_health_listen() -> String {
+    "127.0.0.1:42124".into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -142,6 +151,8 @@ impl Default for Config {
             default_permission: "default".into(),
             allowed_dirs: vec!["/etc/nixos".into(), "/home".into()],
             auth_token_file: None,
+            tls: TlsConfig::default(),
+            listen_health: default_health_listen(),
         }
     }
 }
@@ -177,6 +188,31 @@ impl Config {
                 }
             }
             Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct TlsConfig {
+    pub cert: Option<PathBuf>,
+    pub key: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    pub fn acceptor(
+        &self,
+    ) -> Result<Option<tokio_native_tls::TlsAcceptor>, Box<dyn std::error::Error>> {
+        match (&self.cert, &self.key) {
+            (Some(cert), Some(key)) => {
+                let cert_bytes = std::fs::read(cert)?;
+                let key_bytes = std::fs::read(key)?;
+                let identity = native_tls::Identity::from_pkcs8(&cert_bytes, &key_bytes)?;
+                let acceptor =
+                    tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity)?);
+                Ok(Some(acceptor))
+            }
+            _ => Ok(None),
         }
     }
 }
