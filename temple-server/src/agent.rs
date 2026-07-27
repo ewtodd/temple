@@ -3126,13 +3126,22 @@ Git conventions:
                 self.check_perm(
                     session_id,
                     std::path::Path::new(&cwd),
-                    AccessKind::Read,
+                    AccessKind::ReadDir,
                     scope.clone(),
                     cancel_token,
                     emit,
                 )
                 .await?;
-                crate::direct_tools::DirectTools::grep_code(&cwd, pattern, 50)
+                let command = format!("rg --json --no-heading -n {pattern}");
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "execute_command".to_string(),
+                    args_json: serde_json::json!({ "command": command }).to_string(),
+                    session_cwd: cwd,
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
             "fetch" | "fetch-fetch" => {
                 let url = args["url"].as_str().ok_or("fetch: missing url")?;
@@ -3169,26 +3178,31 @@ Git conventions:
                         .map(|s| s.cwd.clone())
                         .unwrap_or_else(|| ".".into())
                 };
-                let full = if std::path::Path::new(path).is_absolute() {
+                let resolved = if std::path::Path::new(path).is_absolute() {
                     std::path::PathBuf::from(path)
                 } else {
                     std::path::Path::new(&cwd).join(path)
                 };
                 self.check_perm(
                     session_id,
-                    &full,
+                    &resolved,
                     AccessKind::Read,
                     scope.clone(),
                     cancel_token,
                     emit,
                 )
                 .await?;
-                let data_url =
-                    crate::direct_tools::DirectTools::read_image_base64(&full.to_string_lossy())?;
-                Ok(format!(
-                    "Image loaded: {path}\nData URL ({})",
-                    data_url.len()
-                ))
+                let escaped_path = resolved.to_string_lossy().replace('\'', "'\\''");
+                let command = format!("base64 -w0 '{escaped_path}'");
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "execute_command".to_string(),
+                    args_json: serde_json::json!({ "command": command }).to_string(),
+                    session_cwd: cwd,
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
             "export_session" => {
                 let format = args["format"].as_str().unwrap_or("markdown");
@@ -3245,13 +3259,22 @@ Git conventions:
                 self.check_perm(
                     session_id,
                     std::path::Path::new(&cwd),
-                    AccessKind::Read,
+                    AccessKind::ReadDir,
                     scope.clone(),
                     cancel_token,
                     emit,
                 )
                 .await?;
-                crate::direct_tools::DirectTools::ast_grep(&cwd, pattern, lang, 50)
+                let command = format!("sg --pattern {pattern:?} --lang {lang}");
+                let request_id = Uuid::new_v4();
+                let rx = self.ask_tool(request_id).await;
+                emit(AgentEvent::ToolRequestNeeded {
+                    request_id,
+                    name: "execute_command".to_string(),
+                    args_json: serde_json::json!({ "command": command }).to_string(),
+                    session_cwd: cwd,
+                });
+                self.wait_tool_result(request_id, rx, cancel_token).await
             }
             "calendar_events" => {
                 let nc = self.nextcloud.lock().await;

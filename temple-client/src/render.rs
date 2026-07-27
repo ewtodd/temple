@@ -184,7 +184,7 @@ pub fn render_markdown(content: &str, width: usize) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(text) => {
-                let code_style = Style::default().fg(Color::Cyan).bg(Color::DarkGray);
+                let code_style = Style::default().fg(Color::Yellow);
                 for ch in text.chars() {
                     if ch == '\n' {
                         flush_line(&mut current, &mut out, w);
