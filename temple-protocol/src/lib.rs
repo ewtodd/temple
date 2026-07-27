@@ -295,6 +295,11 @@ pub enum ServerMessage {
     DocumentDeleted {
         id: Uuid,
     },
+    /// Confirmation that a document was uploaded
+    DocumentUploaded {
+        id: Uuid,
+        filename: String,
+    },
 }
 
 /// Summary of a persisted session (for listing and resuming).

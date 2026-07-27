@@ -134,6 +134,7 @@ fn handle_key_event(
                         args_json,
                     } => {
                         let cwd = s.cwd.clone();
+                        let tool_name = name.clone();
                         let (responder_tx, responder_rx) =
                             std::sync::mpsc::sync_channel::<String>(1);
                         let _ = internal_tx.try_send(InternalCmd::ExecuteLocalTool {
@@ -144,6 +145,9 @@ fn handle_key_event(
                             request_id,
                             session_id,
                         });
+                        // Drop the lock before blocking on tool completion
+                        // so the render loop can refresh the UI.
+                        drop(s);
                         let result = responder_rx
                             .recv()
                             .unwrap_or_else(|_| "Error: tool execution failed".into());
@@ -152,6 +156,13 @@ fn handle_key_event(
                             session_id,
                             result,
                         });
+                        // Re-acquire the lock to push a completion entry
+                        // so the UI shows the tool finished promptly.
+                        if let Ok(mut g) = state.lock() {
+                            g.entries.push(crate::state::ChatEntry::System(format!(
+                                "tool {tool_name} completed"
+                            )));
+                        }
                     }
                 }
                 return true;
@@ -504,6 +515,7 @@ fn handle_key_event(
                     "/new ",
                     "/q",
                     "/quit",
+                    "/sampling ",
                     "/session ",
                     "/sessions",
                 ];
@@ -620,7 +632,7 @@ fn handle_slash_command(
     }
     if content == "/effort" {
         s.entries.push(crate::state::ChatEntry::System(format!(
-            "reasoning effort: {} ({} )",
+            "reasoning effort: {} ({})",
             if s.effort.is_empty() {
                 "unset"
             } else {
@@ -645,6 +657,38 @@ fn handle_slash_command(
             Err(hint) => {
                 s.entries.push(crate::state::ChatEntry::System(format!(
                     "bad effort — {hint}"
+                )));
+            }
+        }
+        return true;
+    }
+    if content == "/sampling" {
+        s.entries.push(crate::state::ChatEntry::System(format!(
+            "sampling preset: {} ({})",
+            if s.sampling_preset.is_empty() {
+                "unset"
+            } else {
+                &s.sampling_preset
+            },
+            temple_protocol::commands::SAMPLING_HINT
+        )));
+        return true;
+    }
+    if let Some(raw) = content.strip_prefix("/sampling ") {
+        match temple_protocol::commands::parse_sampling(raw) {
+            Ok(preset) => {
+                if !preset.is_empty() {
+                    cmd_tx
+                        .send(ClientMessage::SetSamplingPreset {
+                            session_id: s.session_id,
+                            preset: preset.to_string(),
+                        })
+                        .ok();
+                }
+            }
+            Err(hint) => {
+                s.entries.push(crate::state::ChatEntry::System(format!(
+                    "bad preset — {hint}"
                 )));
             }
         }

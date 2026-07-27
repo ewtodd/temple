@@ -556,16 +556,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 send_conv(&signal, &sender, &group_id, "admin only").await;
                                 return;
                             }
+                            let dropped = agent.drop_all_sessions().await;
                             match memory.nuke_sessions().await {
                                 Ok(count) => {
                                     send_conv(
                                         &signal,
                                         &sender,
                                         &group_id,
-                                        &format!("nuked all {count} sessions"),
+                                        &format!("nuked all {count} sessions ({dropped} unloaded from memory)"),
                                     )
                                     .await;
-                                    // Unload in-memory sessions for any account we found
                                     let _ = agent.cancel_all().await;
                                 }
                                 Err(e) => {
@@ -620,6 +620,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .find(|r| r.id.simple().to_string().starts_with(&prefix));
                                     match found {
                                         Some(r) => {
+                                            // Ownership check: only admins may
+                                            // delete sessions that don't match
+                                            // the caller's identity exactly.
+                                            let admins =
+                                                memory.get_admins().await.unwrap_or_default();
+                                            let is_admin = admins.iter().any(|(phone, uuid)| {
+                                                phone == &sender || uuid.as_deref() == Some(&sender)
+                                            });
+                                            let session_owner = agent.session_owner(r.id).await;
+                                            if !is_admin
+                                                && session_owner.as_deref() != Some(list_owner)
+                                            {
+                                                send_conv(
+                                                    &signal,
+                                                    &sender,
+                                                    &group_id,
+                                                    "session belongs to another user",
+                                                )
+                                                .await;
+                                                return;
+                                            }
                                             agent.close_session(r.id).await;
                                             match memory.delete_session(r.id).await {
                                                 Ok(_) => {
@@ -893,10 +914,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if trimmed == "/models" {
                             match agent.backend.list_models() {
                                 Ok(models) => {
-                                    let body = if models.is_empty() {
+                                    let router = agent.models.router_model.as_deref();
+                                    let title = agent.models.title_model.as_deref();
+                                    let filtered: Vec<&String> = models
+                                        .iter()
+                                        .filter(|id| {
+                                            Some(id.as_str()) != router
+                                                && Some(id.as_str()) != title
+                                        })
+                                        .collect();
+                                    let body = if filtered.is_empty() {
                                         "no models available".to_string()
                                     } else {
-                                        models.join("\n")
+                                        filtered
+                                            .iter()
+                                            .map(|s| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
                                     };
                                     send_conv(&signal, &sender, &group_id, &body).await;
                                 }

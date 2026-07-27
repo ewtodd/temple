@@ -602,20 +602,22 @@ impl Memory {
     }
 
     /// Delete a single session by id. Also removes its conversation history.
+    /// Returns an error if no session with that id existed in the DB.
     pub async fn delete_session(&self, id: Uuid) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
-        // Transactional — a crash between the two DELETEs must not orphan
-        // history rows.
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM conversations WHERE session_id = ?1",
             params![id.to_string()],
         )?;
-        tx.execute(
+        let session_rows = tx.execute(
             "DELETE FROM sessions WHERE id = ?1",
             params![id.to_string()],
         )?;
         tx.commit()?;
+        if session_rows == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -626,6 +628,9 @@ impl Memory {
         let count = tx.execute("DELETE FROM sessions", [])?;
         tx.execute("DELETE FROM conversations", [])?;
         tx.commit()?;
+        if count == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(count)
     }
 

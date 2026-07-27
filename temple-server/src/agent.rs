@@ -46,14 +46,39 @@ const SNIP_HEAD_CHARS: usize = 600;
 /// How many chars to keep from the end of a snipped tool result.
 const SNIP_TAIL_CHARS: usize = 300;
 
-/// Rough token count estimator: ~4 bytes per token for English text.
+/// Rough token count estimator: ~3 chars per token for English text.
+/// Most tokenizers (GPT-4, DeepSeek, Gemma) average 0.30-0.38 tokens/char
+/// for English; 3 chars/token is a safe conservative bound that avoids
+/// the API hitting a context-overflow before our compaction thresholds fire.
 fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
+    text.len() / 3
 }
 
-/// Estimate tokens for a ChatMessage based on its text content.
+/// Estimate tokens for a ChatMessage based on its text content and any
+/// tool-call JSON overhead. Assistant messages with tool_calls carry
+/// embedded function definitions that consume real tokens in the API
+/// even when the content field is empty.
 fn message_tokens(msg: &ChatMessage) -> usize {
-    msg.content_text().map(estimate_tokens).unwrap_or(0)
+    let text = msg.content_text().map(estimate_tokens).unwrap_or(0);
+    let tool_overhead = msg
+        .tool_calls
+        .as_ref()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|tc| {
+                    let args = tc.function.arguments.len();
+                    let name = tc.function.name.len();
+                    let id = tc.id.len();
+                    estimate_tokens(&format!(
+                        "\"id\":\"{id}\",\"type\":\"function\",\"function\":{{\"name\":\"\",\"arguments\":\"\"}}"
+                    )) + args / 3
+                        + name / 3
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    text + tool_overhead
 }
 
 /// Shorten a tool result by keeping head+tail and inserting a snip marker.
@@ -297,6 +322,11 @@ struct SessionCtx {
     /// SSH target machine for sessions created via /new (e.g. "e-play").
     /// Determines where tools execute via the daemon on that machine.
     ssh_target: Option<String>,
+    /// Prompt token count from the most recent API call, as reported by
+    /// the provider. Used as the primary signal for triggering compaction
+    /// since it is the ground-truth context size. Falls back to the
+    /// coarse estimator when None (e.g. before the first call).
+    last_prompt_tokens: Option<u32>,
 }
 
 pub struct Agent {
@@ -366,18 +396,18 @@ impl Agent {
     /// structured summary block, keeping a fixed tail verbatim. Called
     /// when snip+prune isn't enough to keep the context within the model's
     /// window. Uses the router model (or default) for the summary call.
-    async fn compact_summary(&self, session_id: Uuid, _system_prompt: &str) {
+    async fn compact_summary(&self, session_id: Uuid) -> bool {
         let history_len;
         let username;
         let mut foldable_end;
         {
             let sessions = self.sessions.lock().await;
             let Some(s) = sessions.get(&session_id) else {
-                return;
+                return false;
             };
             history_len = s.history.len();
             if history_len < 4 {
-                return;
+                return false;
             }
             username = s.username.clone();
             // Calculate how many messages from the tail to keep verbatim
@@ -394,7 +424,7 @@ impl Agent {
             // Ensure we have something to fold — at least 2 user-assistant
             // exchanges before the tail.
             if tail_start < 4 {
-                return;
+                return false;
             }
             foldable_end = tail_start;
         }
@@ -403,7 +433,7 @@ impl Agent {
         let foldable_messages: Vec<String> = {
             let sessions = self.sessions.lock().await;
             let Some(s) = sessions.get(&session_id) else {
-                return;
+                return false;
             };
             s.history[..foldable_end]
                 .iter()
@@ -422,7 +452,7 @@ impl Agent {
         };
 
         if foldable_messages.is_empty() {
-            return;
+            return false;
         }
 
         let summary_prompt = format!(
@@ -432,11 +462,10 @@ impl Agent {
             foldable_messages.join("\n\n")
         );
 
-        // Use a lightweight model for the summary — prefer the router model
-        // if configured, otherwise fall back to the default model.
+        // Use a compact model if configured, otherwise fall back to default.
         let summarizer_model = self
             .models
-            .title_model
+            .compact_model
             .as_deref()
             .unwrap_or(&self.models.default_model);
 
@@ -471,10 +500,10 @@ impl Agent {
         {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
-                return;
+                return false;
             };
             if s.history.len() < foldable_end + 1 {
-                return;
+                return false;
             }
             // Ensure we don't cut mid-tool-exchange: advance foldable_end
             // past any orphaned tool results whose assistant/tool_calls parent
@@ -494,6 +523,7 @@ impl Agent {
                 summary.len()
             );
         }
+        true
     }
 
     /// Register a daemon connection for a user. Called when a client
@@ -750,6 +780,7 @@ impl Agent {
                 reasoning_effort: None,
                 sampling_preset: None,
                 ssh_target: None,
+                last_prompt_tokens: None,
             },
         );
     }
@@ -802,6 +833,7 @@ impl Agent {
                 reasoning_effort: None,
                 sampling_preset: None,
                 ssh_target: ssh_target.map(|s| s.to_string()),
+                last_prompt_tokens: None,
             },
         );
         drop(sessions);
@@ -902,6 +934,7 @@ impl Agent {
                 reasoning_effort: None,
                 sampling_preset: None,
                 ssh_target: row.ssh_target.clone(),
+                last_prompt_tokens: None,
             },
         );
 
@@ -1078,7 +1111,8 @@ impl Agent {
     }
 
     /// The session's owner (token username), if loaded. Falls back to the
-    /// DB for sessions not currently in memory.
+    /// DB for sessions not currently in memory. Returns None when the
+    /// session is not in memory AND does not exist in the DB.
     pub async fn session_owner(&self, session_id: Uuid) -> Option<String> {
         if let Some(o) = self
             .sessions
@@ -1089,12 +1123,14 @@ impl Agent {
         {
             return Some(o);
         }
-        self.memory
-            .load_session(session_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|row| row.username)
+        match self.memory.load_session(session_id).await {
+            Ok(Some(row)) => Some(row.username),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("session_owner({session_id}): DB load failed: {e}");
+                None
+            }
+        }
     }
 
     pub async fn close_session(&self, session_id: Uuid) {
@@ -1634,6 +1670,21 @@ impl Agent {
         n
     }
 
+    /// Unload ALL in-memory sessions WITHOUT persisting them first.
+    /// Must be called before nuke_sessions so in-memory state can't
+    /// re-persist and resurrect rows the DB just deleted.
+    pub async fn drop_all_sessions(&self) -> usize {
+        self.cancel_all().await;
+        let count = {
+            let mut sessions = self.sessions.lock().await;
+            let n = sessions.len();
+            sessions.clear();
+            n
+        };
+        self.loop_locks.lock().await.clear();
+        count
+    }
+
     /// Daily transient-session sweep. For every non-persisted (quick)
     /// session with real content, ask the model to extract anything worth
     /// remembering into persistent memory, then drop the session from
@@ -2006,13 +2057,29 @@ impl Agent {
                 if let Some(s) = sessions.get_mut(&session_id) {
                     // Compact stale tool results before the prompt overflows
                     // the context window. Snip then prune — both free.
-                    let estimated = compact_context(&mut s.history, system_prompt);
+                    compact_context(&mut s.history, system_prompt);
+
+                    // Use provider-reported prompt_tokens from the last API
+                    // call as the authoritative context size. Falls back to
+                    // the coarse estimator when no call has been made yet
+                    // (fresh session or just after a compaction reset).
+                    let context_size =
+                        s.last_prompt_tokens.map(|t| t as usize).unwrap_or_else(|| {
+                            estimate_tokens(system_prompt)
+                                + s.history.iter().map(message_tokens).sum::<usize>()
+                        });
+
                     // If still over the compaction threshold after
                     // snip+prune, fold older conversation into a summary.
-                    if estimated > compact_threshold {
+                    if context_size > compact_threshold {
                         drop(sessions);
-                        self.compact_summary(session_id, system_prompt).await;
+                        let did_compact = self.compact_summary(session_id).await;
                         sessions = self.sessions.lock().await;
+                        if did_compact {
+                            if let Some(s) = sessions.get_mut(&session_id) {
+                                s.last_prompt_tokens = None;
+                            }
+                        }
                     }
                 }
                 if let Some(s) = sessions.get(&session_id) {
@@ -2221,6 +2288,15 @@ impl Agent {
                 stats.last_prompt_tokens = u.prompt_tokens;
                 stats.cache_hit_tokens += u.cache_hit_tokens;
                 stats.cache_miss_tokens += u.cache_miss_tokens;
+
+                // Persist the ground-truth context size reported by the
+                // provider so the next compaction decision uses real
+                // token counts instead of the coarse estimator.
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.last_prompt_tokens = Some(u.prompt_tokens);
+                }
+                drop(sessions);
             }
 
             if result.tool_calls.is_empty() {
@@ -2939,7 +3015,7 @@ Git conventions:
                 }
             }
 
-            "grep_code" => {
+            "grep_code" | "grep-code" => {
                 let pattern = args["pattern"]
                     .as_str()
                     .ok_or("grep_code: missing pattern")?;
@@ -2955,16 +3031,16 @@ Git conventions:
                 };
                 crate::direct_tools::DirectTools::grep_code(&cwd, pattern, 50)
             }
-            "fetch-fetch" => {
+            "fetch" | "fetch-fetch" => {
                 let url = args["url"].as_str().ok_or("fetch: missing url")?;
                 self.direct.fetch(url).await
             }
-            "searxng-web_search" => {
+            "searxng-web_search" | "searxng_web_search" => {
                 let query = args["query"].as_str().ok_or("searxng: missing query")?;
                 let count = args["count"].as_u64().unwrap_or(5) as usize;
                 self.direct.searxng_search(query, count).await
             }
-            "nixos-nix" => {
+            "nixos-nix" | "nixos_nix" => {
                 let action = args["action"].as_str().unwrap_or("search");
                 let query = args["query"].as_str().unwrap_or("");
                 let channel = args["channel"].as_str().unwrap_or("unstable");
@@ -2995,6 +3071,15 @@ Git conventions:
                 } else {
                     std::path::Path::new(&cwd).join(path)
                 };
+                self.check_perm(
+                    session_id,
+                    &full,
+                    AccessKind::Read,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
                 let data_url =
                     crate::direct_tools::DirectTools::read_image_base64(&full.to_string_lossy())?;
                 Ok(format!(
@@ -3009,21 +3094,24 @@ Git conventions:
                     let s = sessions.get(&session_id).ok_or("session not found")?;
                     (s.history.clone(), s.title.clone())
                 };
-                let mut out = match format {
-                    "json" => {
-                        let title_str = title.as_deref().unwrap_or("untitled");
-                        format!("# Session: {title_str}\n\n")
-                    }
-                    _ => {
-                        let title_str = title.as_deref().unwrap_or("untitled");
-                        format!("# Session: {title_str}\n\n")
-                    }
+                let mut out = if format == "json" {
+                    let title_str = title.as_deref().unwrap_or("untitled");
+                    format!(
+                        "{{\"title\":{},\"messages\":[",
+                        serde_json::to_string(title_str).unwrap_or_default()
+                    )
+                } else {
+                    let title_str = title.as_deref().unwrap_or("untitled");
+                    format!("# Session: {title_str}\n\n")
                 };
-                for m in &history {
+                for (i, m) in history.iter().enumerate() {
                     if let Some(text) = m.content_text() {
                         if format == "json" {
+                            if i > 0 {
+                                out.push(',');
+                            }
                             out.push_str(&format!(
-                                "{{\"role\":\"{}\",\"content\":{}}}\n",
+                                "{{\"role\":\"{}\",\"content\":{}}}",
                                 m.role,
                                 serde_json::to_string(text).unwrap_or_default()
                             ));
@@ -3032,7 +3120,11 @@ Git conventions:
                         }
                     }
                 }
-                Ok(out.trim_end().to_string())
+                if format == "json" {
+                    out.push(']');
+                    out.push('}');
+                }
+                Ok(out)
             }
 
             "ast_grep" | "ast-grep" => {
@@ -3369,7 +3461,7 @@ fn local_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             type_field: "function".into(),
             function: ToolFunctionDef {
-                name: "fetch-fetch".into(),
+                name: "fetch".into(),
                 description: "Fetch content from a URL and extract plain text.".into(),
                 parameters: serde_json::json!({
                     "type": "object",

@@ -377,9 +377,12 @@ impl App {
                             ServerMessage::ModelList { models } => {
                                 s.available_models =
                                     models.iter().map(|m| m.id.clone()).collect();
-                                s.entries.push(ChatEntry::System(
-                                    "use / + Tab to cycle commands and models".into(),
-                                ));
+                                let mut body = String::from("models:\n");
+                                for m in &models {
+                                    body.push_str(&format!("  {}\n", m.id));
+                                }
+                                body.push_str("use /model <name> to switch, Tab to cycle");
+                                s.entries.push(ChatEntry::System(body));
                             }
                             ServerMessage::ModelChanged { model, .. } => {
                                 s.model = model.clone();
@@ -641,6 +644,11 @@ impl App {
                                     });
                                 }
                             }
+                            ServerMessage::DocumentUploaded { id: _, filename } => {
+                                s.entries.push(ChatEntry::System(format!(
+                                    "uploaded {filename}"
+                                )));
+                            }
                             ServerMessage::Pong
                             | ServerMessage::SessionClosed { .. }
                             | ServerMessage::ToolResult { .. }
@@ -655,6 +663,12 @@ impl App {
                             }
                         }
                     }
+                    // Connection dropped — show status in UI
+                    let mut s = s_clone.lock().unwrap();
+                    s.entries.push(ChatEntry::System(
+                        "disconnected from server — press /q to exit".into(),
+                    ));
+                    s.status = "disconnected".into();
                 });
 
                 // Request model list for tab-completion on connect.
@@ -773,8 +787,8 @@ impl App {
             // Render
             let mut visible_text = Vec::new();
             let _ = terminal.draw(|f| {
-                let s = self.state.lock().unwrap();
-                let (prompt_area, text) = ui::draw(f, &s, self.tick_count);
+                let mut s = self.state.lock().unwrap();
+                let (prompt_area, text) = ui::draw(f, &mut s, self.tick_count);
                 visible_text = text;
 
                 // Position cursor at prompt input position

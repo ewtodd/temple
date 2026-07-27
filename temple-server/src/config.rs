@@ -62,22 +62,20 @@ impl Default for NextcloudConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct ModelConfig {
     /// Default model for fallback / Medium complexity
     pub default_model: String,
     /// Fast model for Simple queries
     pub simple_model: String,
-    /// Planner model for Complex pipeline (deepseek on son-of-anton)
+    /// Planner model for Complex pipeline
     pub planner_model: String,
-    /// Executor model for Complex pipeline (qwen coding on anton)
+    /// Executor model for Complex pipeline
     pub executor_model: String,
-    /// Reviewer model for Complex pipeline (deepseek on son-of-anton)
+    /// Reviewer model for Complex pipeline
     pub reviewer_model: String,
-    /// Model for Critical complexity (deepseek direct)
-    pub critical_model: String,
-    /// Model for research/lookups (gemma on anton)
+    /// Model for research/lookups
     pub researcher_model: String,
     /// Model for complexity classification. Falls back to
     /// researcher_model when unset.
@@ -87,22 +85,10 @@ pub struct ModelConfig {
     /// researcher_model when unset.
     #[serde(default)]
     pub title_model: Option<String>,
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            default_model: "deepseek-v4-flash-high".into(),
-            simple_model: "qwen3-4b-instruct".into(),
-            planner_model: "deepseek-v4-flash-high".into(),
-            executor_model: "qwen3.6-27b-coding".into(),
-            reviewer_model: "deepseek-v4-flash-high".into(),
-            critical_model: "deepseek-v4-flash-high".into(),
-            researcher_model: "gemma-4-31b".into(),
-            router_model: None,
-            title_model: None,
-        }
-    }
+    /// Model for compaction summaries (long-context). Falls back to
+    /// default_model when unset. Must have at least 16K context.
+    #[serde(default)]
+    pub compact_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

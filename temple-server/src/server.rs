@@ -422,11 +422,14 @@ async fn handle_connection(
                         });
                         continue;
                     }
+                    let dropped = agent.drop_all_sessions().await;
                     match memory.nuke_sessions().await {
                         Ok(count) => {
                             let _ = tx.send(ServerMessage::ChatError {
                                 session_id: sid,
-                                error: format!("nuked all {count} sessions"),
+                                error: format!(
+                                    "nuked all {count} sessions ({dropped} unloaded from memory)"
+                                ),
                             });
                         }
                         Err(e) => {
@@ -574,8 +577,11 @@ async fn handle_connection(
 
             ClientMessage::ListModels => match agent.backend.list_models() {
                 Ok(models) => {
+                    let router = agent.models.router_model.as_deref();
+                    let title = agent.models.title_model.as_deref();
                     let infos: Vec<ModelInfo> = models
                         .into_iter()
+                        .filter(|id| Some(id.as_str()) != router && Some(id.as_str()) != title)
                         .map(|id| ModelInfo {
                             id,
                             provider: "backend".into(),
@@ -655,11 +661,14 @@ async fn handle_connection(
                     });
                     continue;
                 }
+                let dropped = agent.drop_all_sessions().await;
                 match memory.nuke_sessions().await {
                     Ok(count) => {
                         let _ = tx.send(ServerMessage::ChatError {
                             session_id,
-                            error: format!("deleted {count} sessions"),
+                            error: format!(
+                                "deleted {count} sessions ({dropped} unloaded from memory)"
+                            ),
                         });
                     }
                     Err(e) => {
@@ -707,11 +716,8 @@ async fn handle_connection(
                     .upload_document(&filename, &content, &owner, &mime_type)
                     .await
                 {
-                    Ok(_id) => {
-                        let _ = tx.send(ServerMessage::ChatError {
-                            session_id,
-                            error: format!("uploaded: {filename}"),
-                        });
+                    Ok(id) => {
+                        let _ = tx.send(ServerMessage::DocumentUploaded { id, filename });
                     }
                     Err(e) => {
                         let _ = tx.send(ServerMessage::ChatError {

@@ -45,53 +45,57 @@ pub async fn run(server: String, client_id: String, pubkey: String) -> Result<()
 
         // Main message loop
         while let Some(msg) = incoming.recv().await {
-            let ServerMessage::ToolRequest {
-                request_id,
-                session_id,
-                name,
-                args_json,
-                session_cwd,
-            } = msg
-            else {
-                continue;
-            };
-
-            // Execute every tool immediately — permission decisions come
-            // from the session, not the daemon. Use the session's CWD.
-            // Log the tool name and args for debugging — goes to journal via stderr
-            let args_preview = args_json.chars().take(300).collect::<String>();
-            eprintln!(
-                "temple-daemon: executing tool {} (request {}, session {}, cwd {})\n\
-                 \targs: {}",
-                name, request_id, session_id, session_cwd, args_preview
-            );
-            let result = execute_local_tool(
-                &name,
-                &args_json,
-                &session_cwd,
-                None,
-                request_id,
-                session_id,
-            )
-            .await;
-            // Log result (truncated) for debugging — goes to journal via stderr
-            let preview = result.chars().take(500).collect::<String>();
-            if result.starts_with("Error:") {
-                eprintln!("temple-daemon: tool {} ERROR: {}", name, preview);
-            } else {
-                eprintln!(
-                    "temple-daemon: tool {} OK ({} bytes): {}",
+            match msg {
+                ServerMessage::Shutdown => {
+                    eprintln!("temple-daemon: server shutting down, exiting");
+                    return Ok(());
+                }
+                ServerMessage::ToolRequest {
+                    request_id,
+                    session_id,
                     name,
-                    result.len(),
-                    preview
-                );
-            }
+                    args_json,
+                    session_cwd,
+                } => {
+                    // Execute every tool immediately — permission decisions come
+                    // from the session, not the daemon. Use the session's CWD.
+                    // Log the tool name and args for debugging — goes to journal via stderr
+                    let args_preview = args_json.chars().take(300).collect::<String>();
+                    eprintln!(
+                        "temple-daemon: executing tool {} (request {}, session {}, cwd {})\n\
+                         \targs: {}",
+                        name, request_id, session_id, session_cwd, args_preview
+                    );
+                    let result = execute_local_tool(
+                        &name,
+                        &args_json,
+                        &session_cwd,
+                        None,
+                        request_id,
+                        session_id,
+                    )
+                    .await;
+                    // Log result (truncated) for debugging — goes to journal via stderr
+                    let preview = result.chars().take(500).collect::<String>();
+                    if result.starts_with("Error:") {
+                        eprintln!("temple-daemon: tool {} ERROR: {}", name, preview);
+                    } else {
+                        eprintln!(
+                            "temple-daemon: tool {} OK ({} bytes): {}",
+                            name,
+                            result.len(),
+                            preview
+                        );
+                    }
 
-            let _ = tx.send(ClientMessage::ToolResult {
-                request_id,
-                session_id,
-                result,
-            });
+                    let _ = tx.send(ClientMessage::ToolResult {
+                        request_id,
+                        session_id,
+                        result,
+                    });
+                }
+                _ => continue,
+            }
         }
 
         eprintln!(

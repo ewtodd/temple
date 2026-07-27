@@ -35,7 +35,6 @@ let
       planner_model = cfg.plannerModel;
       executor_model = cfg.executorModel;
       reviewer_model = cfg.reviewerModel;
-      critical_model = cfg.criticalModel;
       researcher_model = cfg.researcherModel;
       router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
       title_model = if cfg.titleModel != null then cfg.titleModel else cfg.researcherModel;
@@ -99,12 +98,6 @@ in
       type = types.str;
       default = "deepseek-v4-flash-high";
       description = "Reviewer model for Complex pipeline.";
-    };
-
-    criticalModel = mkOption {
-      type = types.str;
-      default = "deepseek-v4-flash-high";
-      description = "Model for Critical complexity queries.";
     };
 
     researcherModel = mkOption {
@@ -332,7 +325,6 @@ in
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [
       (lib.toIntBase10 port)
-      8080
     ];
   };
 }

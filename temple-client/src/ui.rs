@@ -262,7 +262,7 @@ pub fn cursor_position(s: &AppState, prompt_area: Rect, width: usize) -> Option<
 /// Draw the entire UI. Returns (prompt_area, visible_chat_text) where
 /// visible_chat_text is plain-text lines matching the rendered output
 /// 1:1, used for mouse hit-testing and selection.
-pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>) {
+pub fn draw(f: &mut Frame, s: &mut AppState, tick_count: u64) -> (Rect, Vec<String>) {
     let area = f.area();
     let w = area.width as usize;
     let h = area.height as usize;
@@ -282,12 +282,21 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
 
     // Chat lines
     let all_chat_lines = build_chat_lines(s, w);
+
+    // Scroll anchoring: when new content arrives at the bottom while the
+    // user is scrolled up, adjust the scroll offset so the viewport stays
+    // pinned to the same content instead of drifting down each frame.
+    let total = all_chat_lines.len();
+    if total > s.last_total && s.scroll > 0 {
+        s.scroll = s.scroll.saturating_add(total - s.last_total);
+    }
+    s.last_total = total;
+
     let prompt_h = prompt_box_height(s, w);
     let status_h = 1usize;
     let chat_avail = h.saturating_sub(prompt_h + status_h + art_extra);
 
     // Scroll handling
-    let total = all_chat_lines.len();
     let max_scroll = total.saturating_sub(chat_avail);
     let scroll = s.scroll.min(max_scroll);
     let start = max_scroll.saturating_sub(scroll);
@@ -315,9 +324,8 @@ pub fn draw(f: &mut Frame, s: &AppState, tick_count: u64) -> (Rect, Vec<String>)
             .into_iter()
             .enumerate()
             .map(|(i, line)| {
-                let abs_idx = start + i;
                 let (top, bot) = if sl <= el { (sl, el) } else { (el, sl) };
-                if abs_idx >= top && abs_idx <= bot {
+                if i >= top && i <= bot {
                     line.patch_style(Style::default().bg(Color::DarkGray).fg(Color::Black))
                 } else {
                     line
