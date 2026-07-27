@@ -1673,7 +1673,7 @@ impl Agent {
     }
 
     /// Unload ALL in-memory sessions WITHOUT persisting them first.
-    /// Must be called before nuke_sessions so in-memory state can't
+    /// Must be called before nuke_all so in-memory state can't
     /// re-persist and resurrect rows the DB just deleted.
     pub async fn drop_all_sessions(&self) -> usize {
         self.cancel_all().await;

@@ -672,14 +672,23 @@ impl Memory {
         Ok(())
     }
 
-    /// Nuke ALL sessions and conversations. Returns count of deleted sessions.
-    pub async fn nuke_sessions(&self) -> rusqlite::Result<usize> {
+    /// Nuke EVERYTHING: sessions, conversations, memories, skills, documents,
+    /// and cron state. Signal user identities (auth) survive.
+    pub async fn nuke_all(&self) -> rusqlite::Result<String> {
         let conn = self.conn.lock().await;
         let tx = conn.unchecked_transaction()?;
-        let count = tx.execute("DELETE FROM sessions", [])?;
-        tx.execute("DELETE FROM conversations", [])?;
+        let sessions = tx.execute("DELETE FROM sessions", [])?;
+        let convos = tx.execute("DELETE FROM conversations", [])?;
+        let memories = tx.execute("DELETE FROM memory_store", [])?;
+        let skills = tx.execute("DELETE FROM skills", [])?;
+        let docs = tx.execute("DELETE FROM documents", [])?;
+        let _ = tx.execute("DELETE FROM documents_fts", []);
+        let cron = tx.execute("DELETE FROM cron_state", [])?;
         tx.commit()?;
-        Ok(count)
+        Ok(format!(
+            "nuked {} sessions, {} conversations, {} memories, {} skills, {} documents, {} cron entries",
+            sessions, convos, memories, skills, docs, cron
+        ))
     }
 
     /// Get all admin users' phone numbers + UUIDs.

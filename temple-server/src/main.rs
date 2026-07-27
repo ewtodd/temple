@@ -473,7 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                /sampling [p] \u{2014} show/set sampling preset (general \u{b7} coding \u{b7} deterministic \u{b7} creative)\n\
                                /new — new session\n\
                               /new <target> [dir] — new coding session\n\
-                              /nuke \u{2014} delete ALL sessions (admin, confirm with /nuke confirm)\n\
+                                                             /nuke \u{2014} total reset — wipe sessions, memories, skills, docs, cron (admin)\n\
                               /quick — back to the default session\n\
                               /reset — cancel ALL in-flight requests (admin)\n\
                               /session <id-prefix> — resume a session\n\
@@ -589,13 +589,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             }
                             let dropped = agent.drop_all_sessions().await;
-                            match memory.nuke_sessions().await {
-                                Ok(count) => {
+                            match memory.nuke_all().await {
+                                Ok(msg) => {
                                     send_conv(
                                         &signal,
                                         &sender,
                                         &group_id,
-                                        &format!("nuked all {count} sessions ({dropped} unloaded from memory)"),
+                                        &format!("{msg} ({dropped} unloaded from memory)"),
                                     )
                                     .await;
                                     let _ = agent.cancel_all().await;
@@ -618,7 +618,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &signal,
                                 &sender,
                                 &group_id,
-                                "type /nuke confirm to permanently delete ALL sessions (admin only)",
+                                "type /nuke confirm to permanently wipe ALL data (admin only)",
                             )
                             .await;
                             return;

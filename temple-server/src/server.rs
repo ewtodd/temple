@@ -456,13 +456,11 @@ async fn handle_connection(
                         continue;
                     }
                     let dropped = agent.drop_all_sessions().await;
-                    match memory.nuke_sessions().await {
-                        Ok(count) => {
+                    match memory.nuke_all().await {
+                        Ok(msg) => {
                             let _ = tx.send(ServerMessage::ChatError {
                                 session_id: sid,
-                                error: format!(
-                                    "nuked all {count} sessions ({dropped} unloaded from memory)"
-                                ),
+                                error: format!("{msg} ({dropped} unloaded from memory)"),
                             });
                         }
                         Err(e) => {
@@ -477,7 +475,7 @@ async fn handle_connection(
                 if trimmed == "/nuke" {
                     let _ = tx.send(ServerMessage::ChatError {
                         session_id: sid,
-                        error: "type /nuke confirm to permanently delete ALL sessions (admin only)"
+                        error: "type /nuke confirm to permanently wipe ALL data (admin only)"
                             .into(),
                     });
                     continue;
@@ -695,13 +693,11 @@ async fn handle_connection(
                     continue;
                 }
                 let dropped = agent.drop_all_sessions().await;
-                match memory.nuke_sessions().await {
-                    Ok(count) => {
+                match memory.nuke_all().await {
+                    Ok(msg) => {
                         let _ = tx.send(ServerMessage::ChatError {
                             session_id,
-                            error: format!(
-                                "deleted {count} sessions ({dropped} unloaded from memory)"
-                            ),
+                            error: format!("{msg} ({dropped} unloaded from memory)"),
                         });
                     }
                     Err(e) => {

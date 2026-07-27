@@ -755,7 +755,8 @@ fn handle_slash_command(
     }
     if content == "/nuke" {
         s.entries.push(crate::state::ChatEntry::System(
-            "type /nuke confirm to permanently delete ALL sessions".into(),
+            "type /nuke confirm to permanently wipe ALL data (sessions, memories, skills, docs)"
+                .into(),
         ));
         return true;
     }
