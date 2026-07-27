@@ -54,6 +54,12 @@ in
           findutils
           git
           ripgrep
+          nix
+          which
+          gcc
+          gnumake
+          cargo
+          rustc
         ];
 
         serviceConfig = {

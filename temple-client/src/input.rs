@@ -742,11 +742,11 @@ fn handle_slash_command(
         }
         return true;
     }
-    if content == "/pipeline" {
+    if content == "/pipeline" || content == "/pipeline off" {
         cmd_tx
             .send(ClientMessage::ChatInput {
                 session_id: s.session_id,
-                content: "/pipeline".into(),
+                content: content.to_string(),
             })
             .ok();
         return true;
