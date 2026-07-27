@@ -5,6 +5,7 @@ mod config;
 mod cron;
 mod direct_tools;
 
+mod mcp;
 mod memory;
 mod nextcloud;
 mod permissions;
@@ -136,6 +137,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_perm,
     );
     let agent = Arc::new(agent);
+
+    // Connect to configured MCP servers via stdio JSON-RPC 2.0
+    for (name, srv) in &cfg.mcp_servers {
+        match crate::mcp::McpClient::connect(name, &srv.command, &srv.args).await {
+            Ok(client) => {
+                agent.add_mcp_client(client).await;
+            }
+            Err(e) => {
+                tracing::error!("{e}");
+            }
+        }
+    }
 
     // Load tools (local + MCP)
     agent.refresh_tools().await;

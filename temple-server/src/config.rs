@@ -20,6 +20,16 @@ pub struct Config {
     /// Health check listen address (host:port). When set, responds with 200 OK on HTTP GET.
     #[serde(default = "default_health_listen")]
     pub listen_health: String,
+    /// MCP servers to connect via stdio JSON-RPC. Keyed by name.
+    #[serde(default)]
+    pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -153,6 +163,7 @@ impl Default for Config {
             auth_token_file: None,
             tls: TlsConfig::default(),
             listen_health: default_health_listen(),
+            mcp_servers: std::collections::HashMap::new(),
         }
     }
 }

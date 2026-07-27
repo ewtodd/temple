@@ -45,6 +45,8 @@ let
       cert = cfg.tlsCertFile;
       key = cfg.tlsKeyFile;
     };
+  } // optionalAttrs (cfg.mcpServers != {}) {
+    mcp_servers = cfg.mcpServers;
   });
 
   portStr = if lib.hasPrefix "[" cfg.listen
@@ -219,6 +221,34 @@ in
         type = types.str;
         default = "renco";
       };
+    };
+
+    mcpServers = mkOption {
+      type = types.attrsOf (types.submodule {
+        options = {
+          command = mkOption {
+            type = types.str;
+            example = "arxiv-mcp-server";
+            description = "Command to spawn the MCP server process.";
+          };
+          args = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            description = "Arguments for the MCP server command.";
+          };
+        };
+      });
+      default = { };
+      example = lib.literalExpression ''
+        {
+          arxiv.command = "arxiv-mcp-server";
+          fetch = { command = "uvx"; args = [ "mcp-server-fetch" ]; };
+          searxng = { command = "uvx"; args = [ "mcp-server-searxng" "--host" "127.0.0.1" "--port" "8081" ]; };
+        }
+      '';
+      description = ''MCP servers to connect via stdio JSON-RPC 2.0. Tools from
+        these servers are discovered at startup and made available to the LLM
+        alongside built-in local tools.'';
     };
 
     openFirewall = mkOption {
