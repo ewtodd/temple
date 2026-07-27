@@ -142,10 +142,10 @@ pub fn render_markdown(content: &str, width: usize) -> Vec<Line<'static>> {
                 base_style = base_style.remove_modifier(Modifier::ITALIC);
             }
             Event::Start(Tag::Strong) => {
-                base_style = base_style.add_modifier(Modifier::BOLD).fg(Color::Yellow);
+                base_style = base_style.add_modifier(Modifier::BOLD);
             }
             Event::End(TagEnd::Strong) => {
-                base_style = base_style.remove_modifier(Modifier::BOLD).fg(Color::Reset);
+                base_style = base_style.remove_modifier(Modifier::BOLD);
             }
             Event::Start(Tag::Item) => {
                 flush_line(&mut current, &mut out, w);
@@ -169,7 +169,9 @@ pub fn render_markdown(content: &str, width: usize) -> Vec<Line<'static>> {
             }
             Event::Text(text) => {
                 let style = if in_code_block {
-                    Style::default().fg(Color::Gray)
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC)
                 } else {
                     base_style
                 };
@@ -182,7 +184,7 @@ pub fn render_markdown(content: &str, width: usize) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(text) => {
-                let code_style = Style::default().fg(Color::Yellow).bg(Color::DarkGray);
+                let code_style = Style::default().fg(Color::Cyan).bg(Color::DarkGray);
                 for ch in text.chars() {
                     if ch == '\n' {
                         flush_line(&mut current, &mut out, w);

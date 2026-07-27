@@ -281,9 +281,12 @@ pub fn draw(f: &mut Frame, s: &mut AppState, tick_count: u64) -> (Rect, Vec<Stri
     let status_h = 1usize;
     let chat_avail = h.saturating_sub(prompt_h + status_h + art_extra);
 
-    // Scroll handling
+    // Clamp scroll to valid range. If it was out of bounds (e.g. terminal
+    // resized), snap to bottom so the user sees new content immediately.
     let max_scroll = total.saturating_sub(chat_avail);
-    s.scroll = s.scroll.min(max_scroll);
+    if s.scroll > max_scroll {
+        s.scroll = 0;
+    }
     let start = max_scroll.saturating_sub(s.scroll);
     let visible_chat: Vec<Line> = all_chat_lines
         .into_iter()
