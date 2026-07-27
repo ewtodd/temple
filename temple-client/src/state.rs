@@ -113,6 +113,7 @@ pub struct AppState {
     /// cycled with Shift+Tab.
     pub mode: PermissionMode,
     pub effort: String,
+    pub sampling_preset: String,
     /// Available models for tab-completion (populated on connect + /model)
     pub available_models: Vec<String>,
     /// Session search overlay: active + search text
@@ -148,6 +149,7 @@ impl AppState {
             last_total: 0,
             mode: PermissionMode::Default,
             effort: String::new(),
+            sampling_preset: String::new(),
             available_models: Vec::new(),
             session_search: None,
             session_search_idx: 0,

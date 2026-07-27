@@ -573,13 +573,13 @@ async fn handle_connection(
                 }
             }
 
-            ClientMessage::ListModels => match agent.litellm.list_models().await {
+            ClientMessage::ListModels => match agent.backend.list_models() {
                 Ok(models) => {
                     let infos: Vec<ModelInfo> = models
                         .into_iter()
                         .map(|id| ModelInfo {
                             id,
-                            provider: "litellm".into(),
+                            provider: "backend".into(),
                             description: None,
                             capabilities: vec![],
                         })
@@ -755,6 +755,24 @@ async fn handle_connection(
                 let _ = tx.send(ServerMessage::ReasoningEffortChanged {
                     session_id: sid,
                     effort: label,
+                });
+            }
+
+            ClientMessage::SetSamplingPreset {
+                session_id: sid,
+                preset,
+            } => {
+                if sid != session_id {
+                    continue;
+                }
+                agent.set_sampling_preset(sid, &preset).await;
+                let label = agent
+                    .sampling_preset(sid)
+                    .await
+                    .unwrap_or_else(|| "general".to_string());
+                let _ = tx.send(ServerMessage::SamplingPresetChanged {
+                    session_id: sid,
+                    preset: label,
                 });
             }
         }

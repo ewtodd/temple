@@ -1,10 +1,10 @@
 mod agent;
 mod auth;
+mod backend;
 mod config;
 mod cron;
 mod direct_tools;
-mod litellm;
-mod mcp;
+
 mod memory;
 mod nextcloud;
 mod permissions;
@@ -25,10 +25,6 @@ struct Cli {
     /// Path to config file
     #[arg(long)]
     config: Option<std::path::PathBuf>,
-
-    /// Litellm API URL (overrides config)
-    #[arg(long)]
-    litellm_url: Option<String>,
 
     /// Database path
     #[arg(long)]
@@ -84,14 +80,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load config
     let cfg = config::Config::load(cli.config.as_deref());
-    let cfg = if let Some(url) = cli.litellm_url {
-        config::Config {
-            litellm_url: url,
-            ..cfg
-        }
-    } else {
-        cfg
-    };
     let cfg = if let Some(db) = cli.db_path {
         config::Config { db_path: db, ..cfg }
     } else {
@@ -115,20 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
 
     tracing::info!("Starting temple server...");
-    tracing::info!("Litellm endpoint: {}", cfg.litellm_url);
+    tracing::info!("Backends configured: {} model(s)", cfg.backends.len());
     tracing::info!("Database: {}", cfg.db_path.display());
     tracing::info!("Listening on: {}", cfg.listen);
-
-    let api_key = cfg
-        .litellm_api_key
-        .clone()
-        .or_else(|| std::env::var("LITELLM_API_KEY").ok())
-        // Reuse the fleet's existing litellm-master-key agenix secret directly
-        .or_else(|| std::env::var("LITELLM_MASTER_KEY").ok())
-        .unwrap_or_else(|| {
-            tracing::warn!("No litellm API key set — using 'empty'");
-            "empty".into()
-        });
 
     let memory = Arc::new(
         memory::Memory::open(&cfg.db_path)
@@ -136,9 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Failed to open database"),
     );
 
-    // Initialize litellm + MCP clients
-    let litellm = litellm::LiteLLM::new(&cfg.litellm_url, &api_key);
-    let mcp = mcp::McpClient::new(&cfg.litellm_url, &api_key);
+    // Initialize model backend
+    let backend = backend::ModelBackend::new(cfg.backends.clone());
 
     // Initialize integrations
     let signal = Arc::new(signal::Signal::new(&cfg.signal));
@@ -146,8 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize agent
     let agent = agent::Agent::new(
-        litellm,
-        mcp,
+        backend,
         memory.clone(),
         cfg.models.clone(),
         nextcloud.clone(),
@@ -329,8 +304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 };
                                 let b64 = base64_encode(&bytes);
                                 let image_url = format!("data:image/{ext};base64,{b64}");
-                                match litellm_describe_image(
-                                    &agent.litellm,
+                                match backend_describe_image(
+                                    &agent.backend,
                                     vision_model,
                                     &image_url,
                                 )
@@ -455,9 +430,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                /effort [low|medium|high|max|off] — show/set reasoning effort\n\
                                /help — this\n\
                               /mode [default|ask|lockdown|yolo] — show/set permission mode\n\
-                              /model [auto|<name>] — show/set model for active session\n\
-                              /models — list available models\n\
-                              /new — new session\n\
+                               /model [auto|<name>] — show/set model for active session\n\
+                               /models — list available models\n\
+                               /sampling [p] \u{2014} show/set sampling preset (general \u{b7} coding \u{b7} deterministic \u{b7} creative)\n\
+                               /new — new session\n\
                               /new <target> [dir] — new coding session\n\
                               /nuke \u{2014} delete ALL sessions (admin, confirm with /nuke confirm)\n\
                               /quick — back to the default session\n\
@@ -915,7 +891,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if trimmed == "/models" {
-                            match agent.litellm.list_models().await {
+                            match agent.backend.list_models() {
                                 Ok(models) => {
                                     let body = if models.is_empty() {
                                         "no models available".to_string()
@@ -983,6 +959,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &sender,
                                         &group_id,
                                         &format!("unknown effort — {hint}"),
+                                    )
+                                    .await;
+                                }
+                            }
+                            return;
+                        }
+
+                        if trimmed == "/sampling" || trimmed.starts_with("/sampling ") {
+                            let arg = trimmed.strip_prefix("/sampling").unwrap().trim();
+                            let target_session = active.lock().await.get(&conv_key).copied();
+                            let Some(sid) = target_session else {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "no active session — /new one first",
+                                )
+                                .await;
+                                return;
+                            };
+                            match temple_protocol::commands::parse_sampling(arg) {
+                                Ok(preset) => {
+                                    agent.set_sampling_preset(sid, preset).await;
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("sampling -> {preset}"),
+                                    )
+                                    .await;
+                                }
+                                Err("") => {
+                                    let current = agent
+                                        .sampling_preset(sid)
+                                        .await
+                                        .unwrap_or_else(|| "general".to_string());
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!(
+                                            "sampling: {current} ({})",
+                                            temple_protocol::commands::SAMPLING_HINT
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Err(hint) => {
+                                    send_conv(
+                                        &signal,
+                                        &sender,
+                                        &group_id,
+                                        &format!("unknown preset — {hint}"),
                                     )
                                     .await;
                                 }
@@ -1603,12 +1632,12 @@ async fn notify_admins(
 
 /// Describe an image via a vision-capable model. Takes a pre-encoded
 /// data:image/...;base64,... URL and returns the model's text response.
-async fn litellm_describe_image(
-    litellm: &crate::litellm::LiteLLM,
+async fn backend_describe_image(
+    backend: &crate::backend::ModelBackend,
     model: &str,
     image_url: &str,
 ) -> Result<String, String> {
-    use crate::litellm::{ContentPart, ImageUrl, MessageContent};
+    use crate::backend::{ContentPart, ImageUrl, MessageContent};
 
     let content = MessageContent::Parts(vec![
         ContentPart::ImageUrl {
@@ -1619,9 +1648,9 @@ async fn litellm_describe_image(
         },
     ]);
 
-    let req = crate::litellm::ChatRequest {
+    let req = crate::backend::ChatRequest {
         model: model.to_string(),
-        messages: vec![crate::litellm::ChatMessage {
+        messages: vec![crate::backend::ChatMessage {
             role: "user".into(),
             content: Some(content),
             tool_calls: None,
@@ -1636,7 +1665,7 @@ async fn litellm_describe_image(
         ..Default::default()
     };
 
-    let resp = litellm
+    let resp = backend
         .chat(req)
         .await
         .map_err(|e| format!("vision model: {e}"))?;

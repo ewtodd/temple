@@ -159,13 +159,13 @@ impl CronScheduler {
              <<<BEGIN CONVERSATION DATA>>>\n{conv_summary}\n<<<END CONVERSATION DATA>>>"
         );
 
-        let req = crate::litellm::ChatRequest {
+        let req = crate::backend::ChatRequest {
             model: self.agent.models.default_model.clone(),
             messages: vec![
-                crate::litellm::ChatMessage::system(
+                crate::backend::ChatMessage::system(
                     "You are a skill extraction assistant. Output only JSON objects, one per line.",
                 ),
-                crate::litellm::ChatMessage::user(&prompt),
+                crate::backend::ChatMessage::user(&prompt),
             ],
             tools: None,
             stream: Some(false),
@@ -175,7 +175,7 @@ impl CronScheduler {
             ..Default::default()
         };
 
-        match self.agent.litellm.chat(req).await {
+        match self.agent.backend.chat(req).await {
             Ok(resp) => {
                 if let Some(choice) = resp.choices.first() {
                     if let Some(content) = choice.message.content_text() {
@@ -413,9 +413,9 @@ impl CronScheduler {
                     }
                 }
 
-                let req = crate::litellm::ChatRequest {
+                let req = crate::backend::ChatRequest {
                     model: self.agent.models.default_model.clone(),
-                    messages: vec![crate::litellm::ChatMessage::system(&prompt)],
+                    messages: vec![crate::backend::ChatMessage::system(&prompt)],
                     tools: None,
                     stream: Some(false),
                     stream_options: None,
@@ -424,7 +424,7 @@ impl CronScheduler {
                     ..Default::default()
                 };
 
-                match self.agent.litellm.chat(req).await {
+                match self.agent.backend.chat(req).await {
                     Ok(resp) => {
                         if let Some(choice) = resp.choices.first() {
                             if let Some(content) = choice.message.content_text() {
@@ -496,9 +496,9 @@ impl CronScheduler {
                      Ask about today. Keep it short."
                 )
             };
-            let req = crate::litellm::ChatRequest {
+            let req = crate::backend::ChatRequest {
                 model: self.agent.models.default_model.clone(),
-                messages: vec![crate::litellm::ChatMessage::system(&prompt)],
+                messages: vec![crate::backend::ChatMessage::system(&prompt)],
                 tools: None,
                 stream: Some(false),
                 stream_options: None,
@@ -506,7 +506,7 @@ impl CronScheduler {
                 temperature: Some(0.7),
                 ..Default::default()
             };
-            if let Ok(resp) = self.agent.litellm.chat(req).await {
+            if let Ok(resp) = self.agent.backend.chat(req).await {
                 if let Some(choice) = resp.choices.first() {
                     if let Some(content) = choice.message.content_text() {
                         self.signal.send(recipient, content).await.ok();

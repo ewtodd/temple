@@ -99,6 +99,10 @@ pub enum ClientMessage {
         session_id: Uuid,
         effort: String,
     },
+    SetSamplingPreset {
+        session_id: Uuid,
+        preset: String,
+    },
     SetPermissionMode {
         session_id: Uuid,
         mode: PermissionMode,
@@ -205,6 +209,10 @@ pub enum ServerMessage {
     ReasoningEffortChanged {
         session_id: Uuid,
         effort: String,
+    },
+    SamplingPresetChanged {
+        session_id: Uuid,
+        preset: String,
     },
     PermissionRequired(PermissionRequest),
     PermissionResult(PermissionResponse),

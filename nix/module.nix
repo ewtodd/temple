@@ -15,7 +15,7 @@ let
 
   configFile = toml.generate "temple-config.toml" ({
     listen = cfg.listen;
-    litellm_url = cfg.litellmUrl;
+    backends = cfg.modelEndpoints;
     db_path = "${cfg.dataDir}/memory.db";
     allowed_dirs = cfg.allowedDirs;
     signal = {
@@ -59,10 +59,15 @@ in
       description = "WebSocket listen address (host:port).";
     };
 
-    litellmUrl = mkOption {
-      type = types.str;
-      default = "https://llm.ethanwtodd.com";
-      description = "LiteLLM proxy URL used for model access and MCP tools.";
+    modelEndpoints = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      example = {
+        "qwen3.6-27b" = "http://anton:8080/v1";
+        "deepseek-v4-flash" = "http://son-of-anton:8080/v1";
+        "supra-router" = "http://127.0.0.1:8081/v1";
+      };
+      description = "Model name to llama-swap endpoint mappings. Each value should include the /v1 prefix.";
     };
 
     defaultModel = mkOption {
@@ -138,8 +143,8 @@ in
         EnvironmentFile for secrets (systemd-style). Can be a single path
         or a list of paths — all are loaded. Any of these env vars are
         picked up:
-        - LITELLM_API_KEY or LITELLM_MASTER_KEY (litellm auth)
         - SIGNAL_RECIPIENT (E.164 phone number, + prefix)
+        - NEXTCLOUD_PASSWORD (Nextcloud app password)
       '';
     };
 

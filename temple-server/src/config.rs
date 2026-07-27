@@ -5,8 +5,7 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Config {
     pub listen: String,
-    pub litellm_url: String,
-    pub litellm_api_key: Option<String>,
+    pub backends: std::collections::HashMap<String, String>,
     pub db_path: PathBuf,
     pub signal: SignalConfig,
     pub nextcloud: NextcloudConfig,
@@ -85,8 +84,6 @@ pub struct ModelConfig {
     /// researcher_model when unset.
     #[serde(default)]
     pub router_model: Option<String>,
-    /// Model definitions
-    pub models: Vec<ModelDef>,
 }
 
 impl Default for ModelConfig {
@@ -100,18 +97,8 @@ impl Default for ModelConfig {
             critical_model: "deepseek-v4-flash-high".into(),
             researcher_model: "gemma-4-31b".into(),
             router_model: None,
-            models: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelDef {
-    pub id: String,
-    pub host: String,
-    pub litellm_model: String,
-    pub capabilities: Vec<String>,
-    pub priority: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -154,8 +141,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:42123".into(),
-            litellm_url: "https://llm.ethanwtodd.com".into(),
-            litellm_api_key: None,
+            backends: std::collections::HashMap::new(),
             db_path: PathBuf::from("./temple-memory.db"),
             signal: SignalConfig::default(),
             nextcloud: NextcloudConfig::default(),

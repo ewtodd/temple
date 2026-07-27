@@ -652,6 +652,9 @@ impl App {
                             ServerMessage::ReasoningEffortChanged { effort, .. } => {
                                 s.effort = effort;
                             }
+                            ServerMessage::SamplingPresetChanged { preset, .. } => {
+                                s.sampling_preset = preset;
+                            }
                         }
                     }
                 });

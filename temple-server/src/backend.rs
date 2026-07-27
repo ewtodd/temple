@@ -1,16 +1,16 @@
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Timeout for draining error response bodies from a hung upstream.
 const ERROR_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
-pub struct LiteLLM {
+pub struct ModelBackend {
     client: HttpClient,
-    base_url: String,
-    api_key: String,
+    endpoints: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -154,6 +154,10 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
@@ -183,7 +187,7 @@ pub struct ChatResponse {
 pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
-    #[allow(dead_code)] // Kept on the wire result for diagnostics.
+    #[allow(dead_code)]
     pub finish_reason: Option<String>,
 }
 
@@ -258,11 +262,11 @@ impl<'de> Deserialize<'de> for Usage {
 /// Accumulated result of one streaming completion round.
 pub struct StreamResult {
     pub content: String,
-    #[allow(dead_code)] // Accumulated for future use but currently only streamed incrementally
+    #[allow(dead_code)]
     pub reasoning_content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
-    #[allow(dead_code)] // Kept on the wire result for diagnostics.
+    #[allow(dead_code)]
     pub finish_reason: Option<String>,
 }
 
@@ -311,27 +315,20 @@ pub enum StreamEvent {
     Error(String),
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ModelListResponse {
-    pub data: Vec<ModelListItem>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ModelListItem {
-    pub id: String,
-}
-
-impl LiteLLM {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+impl ModelBackend {
+    pub fn new(endpoints: HashMap<String, String>) -> Self {
         let client = HttpClient::builder()
             .timeout(Duration::from_secs(1800))
             .build()
             .expect("http client");
-        Self {
-            client,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
-        }
+        Self { client, endpoints }
+    }
+
+    fn get_endpoint(&self, model: &str) -> Result<&str, String> {
+        self.endpoints
+            .get(model)
+            .map(|s| s.as_str())
+            .ok_or_else(|| format!("model {model} not found in backends"))
     }
 
     /// Drain an error response body with a deadline, so a hung upstream
@@ -343,23 +340,13 @@ impl LiteLLM {
         }
     }
 
-    fn headers(&self) -> reqwest::header::HeaderMap {
-        use reqwest::header;
-        let mut h = header::HeaderMap::new();
-        h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        h.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {}", self.api_key).parse().unwrap(),
-        );
-        h
-    }
-
     /// Non-streaming completion (used for keep-alive pings).
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, String> {
+        let endpoint = self.get_endpoint(&req.model)?.to_string();
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .headers(self.headers())
+            .post(format!("{endpoint}/chat/completions"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&req)
             .send()
             .await
@@ -369,7 +356,7 @@ impl LiteLLM {
             let status = resp.status();
             let body = Self::drain_error_body(resp).await;
             return Err(format!(
-                "litellm {status}: {}",
+                "{status}: {}",
                 body.chars().take(500).collect::<String>()
             ));
         }
@@ -387,12 +374,19 @@ impl LiteLLM {
         mut req: ChatRequest,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) {
+        let endpoint = match self.get_endpoint(&req.model) {
+            Ok(ep) => ep.to_string(),
+            Err(e) => {
+                let _ = tx.send(StreamEvent::Error(e));
+                return;
+            }
+        };
         req.stream = Some(true);
         req.stream_options = Some(StreamOptions {
             include_usage: true,
         });
 
-        let result = self.stream_inner(req, tx.clone()).await;
+        let result = self.stream_inner(&endpoint, req, tx.clone()).await;
         if let Err(e) = result {
             let _ = tx.send(StreamEvent::Error(e));
         }
@@ -400,6 +394,7 @@ impl LiteLLM {
 
     async fn stream_inner(
         &self,
+        endpoint: &str,
         req: ChatRequest,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), String> {
@@ -407,8 +402,8 @@ impl LiteLLM {
 
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .headers(self.headers())
+            .post(format!("{endpoint}/chat/completions"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&req)
             .send()
             .await
@@ -418,7 +413,7 @@ impl LiteLLM {
             let status = resp.status();
             let body = Self::drain_error_body(resp).await;
             return Err(format!(
-                "litellm {status}: {}",
+                "{status}: {}",
                 body.chars().take(500).collect::<String>()
             ));
         }
@@ -427,23 +422,13 @@ impl LiteLLM {
         let mut reasoning_content = String::new();
         let mut usage: Option<Usage> = None;
         let mut finish_reason: Option<String> = None;
-        // tool call accumulators: index -> (id, name, args)
         let mut tool_accum: std::collections::BTreeMap<usize, (String, String, String)> =
             std::collections::BTreeMap::new();
-        // Completion markers: a healthy stream ends with data: [DONE] (and
-        // a finish_reason in the final chunk). Without one of these, a
-        // clean TCP close (proxy restart, crashed backend) is
-        // indistinguishable from a complete response — we'd ship truncated
-        // content as final. Track both; error out if neither arrives.
         let mut saw_done_marker = false;
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
 
-        // Idle timeout per chunk: a hung backend (model host down, proxy
-        // stuck) otherwise holds the connection for the full 1800s client
-        // timeout — and with the global request queue, wedges everyone.
-        // Timing out errors the attempt so the caller's retry loop runs.
         const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
         loop {
             let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
@@ -459,11 +444,6 @@ impl LiteLLM {
             let bytes = chunk;
             buffer.extend_from_slice(&bytes);
 
-            // Process complete SSE events (separated by \n\n, or \r\n\r\n
-            // for CRLF-framed proxies). Split on raw bytes — decoding each
-            // chunk with from_utf8_lossy corrupts multi-byte UTF-8 that
-            // straddles a chunk boundary (which also breaks tool-call
-            // argument JSON).
             loop {
                 let end = buffer
                     .windows(2)
@@ -593,70 +573,13 @@ impl LiteLLM {
         None
     }
 
-    pub async fn list_models(&self) -> Result<Vec<String>, String> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/models", self.base_url))
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("models request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("models error: {}", resp.status()));
-        }
-        let data: ModelListResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("models parse: {e}"))?;
-        Ok(data.data.into_iter().map(|m| m.id).collect())
-    }
-
-    /// List MCP tools exposed by the proxy (OpenAI tool schema format).
-    pub async fn list_mcp_tools(&self) -> Result<Vec<ToolDefinition>, String> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/mcp/tools", self.base_url))
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("mcp tools request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("mcp tools error: {}", resp.status()));
-        }
-
-        let body: Value = resp.json().await.map_err(|e| format!("mcp parse: {e}"))?;
-        let mut out = Vec::new();
-        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-            for t in tools {
-                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-                let desc = t
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or_default();
-                let params = t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
-                if !name.is_empty() {
-                    out.push(ToolDefinition {
-                        type_field: "function".into(),
-                        function: ToolFunctionDef {
-                            name: name.to_string(),
-                            description: desc.chars().take(1024).collect(),
-                            parameters: params,
-                        },
-                    });
-                }
-            }
-        }
-        Ok(out)
+    pub fn list_models(&self) -> Result<Vec<String>, String> {
+        Ok(self.endpoints.keys().cloned().collect())
     }
 
     /// Quick complexity classification. Sends a tiny prompt (~200 tokens in,
     /// ~10 tokens out) to determine Simple/Medium/Complex/Critical.
-    /// Expects the model to respond with a single word.
+    /// Expects the Supra Router model to respond with domain/complexity/route.
     pub async fn classify_query(
         &self,
         model: &str,
@@ -666,21 +589,11 @@ impl LiteLLM {
 
         let req = ChatRequest {
             model: model.to_string(),
-            messages: vec![
-                ChatMessage::system(
-                    "Classify this user query into exactly one word: simple, medium, complex, or critical.\n\
-                     simple = greeting, thanks, short factual question\n\
-                     medium = explanation, chat, opinion, general discussion\n\
-                     complex = coding, debugging, multi-step task, file operations\n\
-                     critical = system design, architecture, novel problems\n\
-                     Respond with ONLY the word, nothing else."
-                ),
-                ChatMessage::user(query),
-            ],
+            messages: vec![ChatMessage::user(format!("Task: {query}\nAnalysis: "))],
             tools: None,
             stream: Some(false),
             stream_options: None,
-            max_tokens: Some(10),
+            max_tokens: Some(128),
             temperature: Some(0.0),
             ..Default::default()
         };
@@ -689,14 +602,85 @@ impl LiteLLM {
         let choice = resp.choices.first()?;
         let content = choice.message.content_text()?.trim().to_lowercase();
 
-        if content.starts_with("simple") {
-            Some(ComplexityClass::Simple)
-        } else if content.starts_with("complex") {
-            Some(ComplexityClass::Complex)
-        } else if content.starts_with("critical") {
-            Some(ComplexityClass::Critical)
+        // Supra Router output: "Domain: ... | Complexity: N | Route: small model/big model"
+        if let Some(cap) = content
+            .split("complexity:")
+            .nth(1)
+            .or_else(|| content.split("Complexity:").nth(1))
+        {
+            let level = cap.trim().chars().next().and_then(|c| c.to_digit(10));
+            match level {
+                Some(1..=2) => Some(ComplexityClass::Simple),
+                Some(3) => Some(ComplexityClass::Medium),
+                Some(4) => Some(ComplexityClass::Complex),
+                Some(5) => Some(ComplexityClass::Critical),
+                _ => {
+                    if content.contains("Route: small model")
+                        || content.contains("route: small model")
+                    {
+                        Some(ComplexityClass::Simple)
+                    } else {
+                        Some(ComplexityClass::Medium)
+                    }
+                }
+            }
         } else {
-            Some(ComplexityClass::Medium)
+            // Fallback on route field
+            if content.contains("Route: small model") || content.contains("route: small model") {
+                Some(ComplexityClass::Simple)
+            } else {
+                Some(ComplexityClass::Medium)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SamplingPreset {
+    Deterministic,
+    Coding,
+    General,
+    Creative,
+}
+
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+}
+
+impl SamplingPreset {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "deterministic" => Self::Deterministic,
+            "coding" => Self::Coding,
+            "creative" => Self::Creative,
+            _ => Self::General,
+        }
+    }
+
+    pub fn params(&self) -> SamplingParams {
+        match self {
+            Self::Deterministic => SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 1,
+            },
+            Self::Coding => SamplingParams {
+                temperature: 0.1,
+                top_p: 0.95,
+                top_k: 40,
+            },
+            Self::General => SamplingParams {
+                temperature: 0.7,
+                top_p: 0.95,
+                top_k: 40,
+            },
+            Self::Creative => SamplingParams {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 80,
+            },
         }
     }
 }

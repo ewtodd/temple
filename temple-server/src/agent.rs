@@ -6,11 +6,11 @@ use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::ModelConfig;
-use crate::litellm::{
-    ChatMessage, ChatRequest, LiteLLM, MessageContent, StreamEvent, ToolDefinition,
+use crate::backend::{
+    ChatMessage, ChatRequest, MessageContent, ModelBackend, SamplingPreset, StreamEvent,
+    ToolDefinition,
 };
-use crate::mcp::McpClient;
+use crate::config::ModelConfig;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
 use crate::router::{Route, Router, SessionKind};
@@ -292,14 +292,15 @@ struct SessionCtx {
     /// Reasoning effort for DeepSeek / reasoning-capable models.
     /// "low", "medium", "high", "max", or "none"/"off".
     reasoning_effort: Option<String>,
+    /// Sampling preset: "general", "coding", "deterministic", "creative".
+    sampling_preset: Option<String>,
     /// SSH target machine for sessions created via /new (e.g. "e-play").
     /// Determines where tools execute via the daemon on that machine.
     ssh_target: Option<String>,
 }
 
 pub struct Agent {
-    pub litellm: LiteLLM,
-    pub mcp: McpClient,
+    pub backend: ModelBackend,
     pub direct: crate::direct_tools::DirectTools,
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
@@ -334,15 +335,13 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(
-        litellm: LiteLLM,
-        mcp: McpClient,
+        backend: ModelBackend,
         memory: Arc<Memory>,
         models: ModelConfig,
         nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
     ) -> Self {
         Self {
-            litellm,
-            mcp,
+            backend,
             direct: crate::direct_tools::DirectTools::new(),
             memory,
             permissions: Arc::new(PermissionResolver::new()),
@@ -452,7 +451,7 @@ impl Agent {
             ..Default::default()
         };
 
-        let summary = match self.litellm.chat(req).await {
+        let summary = match self.backend.chat(req).await {
             Ok(resp) => resp
                 .choices
                 .first()
@@ -573,7 +572,7 @@ impl Agent {
     /// Sandboxed tool set — memories and tasks only, no filesystem or shell.
     /// For Signal users without a daemon.
     fn sandboxed_tools() -> Vec<ToolDefinition> {
-        use crate::litellm::ToolFunctionDef;
+        use crate::backend::ToolFunctionDef;
         vec![
             ToolDefinition {
                 type_field: "function".into(),
@@ -677,18 +676,9 @@ impl Agent {
         out
     }
 
-    /// Load tool definitions: local tools + MCP tools from litellm.
+    /// Load local tool definitions.
     pub async fn refresh_tools(&self) {
-        let mut tools = local_tools();
-        match self.litellm.list_mcp_tools().await {
-            Ok(mcp_tools) => {
-                tracing::info!("Loaded {} MCP tools from litellm", mcp_tools.len());
-                tools.extend(mcp_tools);
-            }
-            Err(e) => {
-                tracing::warn!("MCP tools unavailable: {e} (local tools only)");
-            }
-        }
+        let tools = local_tools();
         *self.tools.lock().await = tools;
     }
 
@@ -717,7 +707,7 @@ impl Agent {
             temperature: Some(0.0),
             ..Default::default()
         };
-        let _ = self.litellm.chat(req).await;
+        let _ = self.backend.chat(req).await;
     }
 
     pub async fn open_session(
@@ -755,6 +745,7 @@ impl Agent {
                 cached_system_prompt: None,
                 cached_tools: None,
                 reasoning_effort: None,
+                sampling_preset: None,
                 ssh_target: None,
             },
         );
@@ -806,6 +797,7 @@ impl Agent {
                 cached_system_prompt: None,
                 cached_tools: None,
                 reasoning_effort: None,
+                sampling_preset: None,
                 ssh_target: ssh_target.map(|s| s.to_string()),
             },
         );
@@ -905,6 +897,7 @@ impl Agent {
                 cached_system_prompt: None,
                 cached_tools: None,
                 reasoning_effort: None,
+                sampling_preset: None,
                 ssh_target: row.ssh_target.clone(),
             },
         );
@@ -1015,7 +1008,7 @@ impl Agent {
             ..Default::default()
         };
 
-        let model_title = match self.litellm.chat(req).await {
+        let model_title = match self.backend.chat(req).await {
             Ok(resp) => resp
                 .choices
                 .first()
@@ -1192,6 +1185,27 @@ impl Agent {
             .and_then(|s| s.reasoning_effort.clone())
     }
 
+    /// Set the sampling preset for a session. Supported values:
+    /// "general", "coding", "deterministic", "creative".
+    pub async fn set_sampling_preset(&self, session_id: Uuid, preset: &str) {
+        if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
+            let cleaned = preset.trim();
+            if cleaned.is_empty() {
+                s.sampling_preset = None;
+            } else {
+                s.sampling_preset = Some(cleaned.to_lowercase());
+            }
+        }
+    }
+
+    pub async fn sampling_preset(&self, session_id: Uuid) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|s| s.sampling_preset.clone())
+    }
+
     /// The full agent loop for one user message. Routes the query, then
     /// either runs a direct tool loop or a planner→executor→reviewer pipeline.
     /// `priority_user` overrides who the queue priority is attributed to
@@ -1296,7 +1310,7 @@ impl Agent {
         } else {
             let heuristic = Router::classify(content);
             if heuristic == ComplexityClass::Medium {
-                // Ambiguous — ask the classifier model via litellm.
+                // Ambiguous — ask the classifier model via backend.
                 // Uses router_model if configured (small 4B model co-resident
                 // with deepseek on son-of-anton for ~50ms latency), falls back
                 // to researcher_model (gemma-4-31b on anton, ~500ms).
@@ -1307,7 +1321,7 @@ impl Agent {
                     .unwrap_or(&self.models.researcher_model);
                 tracing::info!("Router heuristic: Medium — refining via {classifier}");
                 let refined = self
-                    .litellm
+                    .backend
                     .classify_query(classifier, content)
                     .await
                     .unwrap_or(ComplexityClass::Medium);
@@ -1664,7 +1678,7 @@ impl Agent {
                     temperature: Some(0.2),
                     ..Default::default()
         };
-                if let Ok(resp) = self.litellm.chat(req).await {
+                if let Ok(resp) = self.backend.chat(req).await {
                     if let Some(choice) = resp.choices.first() {
                         if let Some(content) = choice.message.content_text() {
                             for line in content.lines() {
@@ -1872,7 +1886,7 @@ impl Agent {
         };
 
         tokio::select! {
-            resp = self.litellm.chat(req) => {
+            resp = self.backend.chat(req) => {
                 match resp {
                     Ok(resp) => {
                         if let Some(choice) = resp.choices.first() {
@@ -1926,7 +1940,7 @@ impl Agent {
         };
 
         tokio::select! {
-            resp = self.litellm.chat(req) => {
+            resp = self.backend.chat(req) => {
                 match resp {
                     Ok(resp) => {
                         if let Some(choice) = resp.choices.first() {
@@ -2023,22 +2037,34 @@ impl Agent {
             } else {
                 pinned_tools.to_vec()
             };
-            let req = ChatRequest {
-                model: model.to_string(),
-                messages,
-                tools: if tools.is_empty() { None } else { Some(tools) },
-                stream: Some(true),
-                stream_options: None,
-                max_tokens: Some(16384),
-                temperature: None,
-                reasoning_effort: reasoning_effort.map(|s| s.to_string()),
-                ..Default::default()
+            let req = {
+                let sampling = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&session_id)
+                        .and_then(|s| s.sampling_preset.clone())
+                };
+                let sp =
+                    SamplingPreset::from_str(sampling.as_deref().unwrap_or("general")).params();
+                ChatRequest {
+                    model: model.to_string(),
+                    messages,
+                    tools: if tools.is_empty() { None } else { Some(tools) },
+                    stream: Some(true),
+                    stream_options: None,
+                    max_tokens: Some(16384),
+                    temperature: Some(sp.temperature),
+                    top_p: Some(sp.top_p),
+                    top_k: Some(sp.top_k),
+                    reasoning_effort: reasoning_effort.map(|s| s.to_string()),
+                    ..Default::default()
+                }
             };
 
             // ── Stream with retry (self-healing) ──
             let result = {
                 let mut last_err = String::new();
-                let mut stream_result: Option<crate::litellm::StreamResult> = None;
+                let mut stream_result: Option<crate::backend::StreamResult> = None;
                 let stream_round_start = Instant::now();
 
                 for attempt in 0..MAX_STREAM_RETRIES {
@@ -2046,10 +2072,10 @@ impl Agent {
                         break;
                     }
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
-                    let litellm = self.litellm.clone();
+                    let backend = self.backend.clone();
                     let req_clone = req.clone();
                     let stream_handle = tokio::spawn(async move {
-                        litellm.chat_stream(req_clone, tx).await;
+                        backend.chat_stream(req_clone, tx).await;
                     });
 
                     let mut attempt_error: Option<String> = None;
@@ -2363,10 +2389,10 @@ impl Agent {
                     ..Default::default()
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
-                let litellm = self.litellm.clone();
+                let backend = self.backend.clone();
                 let req_clone = req.clone();
                 let stream_handle = tokio::spawn(async move {
-                    litellm.chat_stream(req_clone, tx).await;
+                    backend.chat_stream(req_clone, tx).await;
                 });
                 let mut text = String::new();
                 loop {
@@ -2540,7 +2566,7 @@ Git conventions:
         cancel_token: &CancellationToken,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String, String> {
-        let args = LiteLLM::recover_tool_call(args_json)
+        let args = ModelBackend::recover_tool_call(args_json)
             .ok_or_else(|| format!("cannot parse arguments for {name}"))?;
 
         // Reject paths and commands that leak the server's base directory.
@@ -3036,7 +3062,7 @@ Git conventions:
                 Ok(out.trim_end().to_string())
             }
 
-            _ => self.mcp.call_tool(name, args).await,
+            _ => Err(format!("unknown tool: {name}")),
         }
     }
 
@@ -3144,7 +3170,7 @@ Git conventions:
             ..Default::default()
         };
 
-        match self.litellm.chat(req).await {
+        match self.backend.chat(req).await {
             Ok(resp) => {
                 if let Some(choice) = resp.choices.first() {
                     if let Some(new_personality) = choice.message.content_text() {
@@ -3165,7 +3191,7 @@ Git conventions:
 
 /// Local (non-MCP) tools.
 fn local_tools() -> Vec<ToolDefinition> {
-    use crate::litellm::ToolFunctionDef;
+    use crate::backend::ToolFunctionDef;
     vec![
         ToolDefinition {
             type_field: "function".into(),
@@ -3642,7 +3668,7 @@ async fn detect_project_context(cwd: &str) -> String {
 }
 
 fn summarize_args(args_json: &str) -> String {
-    let v = LiteLLM::recover_tool_call(args_json);
+    let v = ModelBackend::recover_tool_call(args_json);
     match v {
         Some(serde_json::Value::Object(map)) => {
             let mut lines: Vec<String> = Vec::new();

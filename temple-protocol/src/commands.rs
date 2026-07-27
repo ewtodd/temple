@@ -6,6 +6,7 @@ Commands:
   /clear <account>   delete sessions for a user (admin)
   /delete <id>       permanently delete session
   /effort [e]        show/set reasoning effort
+  /sampling [p]      show/set sampling preset
   /help              this help
   /mode <m>          set permission mode
   /model [name]      show/set model (\"auto\" to re-route)
@@ -21,6 +22,7 @@ Commands:
   /clear          clear chat
   /delete <n>     permanently delete session
   /effort [e]     show/set reasoning effort
+  /sampling [p]   show/set sampling preset
   /help           this help
   /mode <m>       set permission mode
   /model <name>   set model (bare to show current)
@@ -45,6 +47,24 @@ Keys:
 /// Valid reasoning-effort values and error text.
 pub const EFFORT_VALUES: &[&str] = &["low", "medium", "high", "max", "off"];
 pub const EFFORT_HINT: &str = "low · medium · high · max · off";
+
+/// Valid sampling-preset values and error text.
+pub const SAMPLING_VALUES: &[&str] = &["general", "coding", "deterministic", "creative"];
+pub const SAMPLING_HINT: &str = "general \u{b7} coding \u{b7} deterministic \u{b7} creative";
+
+/// Parse a raw `/sampling` argument. Returns the canonical preset name
+/// or an error message on invalid input.
+pub fn parse_sampling(raw: &str) -> Result<&str, &str> {
+    let cleaned = raw.trim();
+    if cleaned.is_empty() {
+        return Err(""); // caller should show current value
+    }
+    let lower = cleaned.to_lowercase();
+    match lower.as_str() {
+        "general" | "coding" | "deterministic" | "creative" => Ok(cleaned),
+        _ => Err(SAMPLING_HINT),
+    }
+}
 
 /// Parse a raw `/effort` argument. Returns the canonical effort string
 /// ("off" for "none"/"off") or an error message on invalid input.
@@ -174,5 +194,25 @@ mod tests {
         let a = parse_new("");
         assert_eq!(a.ssh_target, None);
         assert_eq!(a.start_dir, None);
+    }
+
+    #[test]
+    fn sampling_valid() {
+        assert_eq!(parse_sampling("general").unwrap(), "general");
+        assert_eq!(parse_sampling("coding").unwrap(), "coding");
+        assert_eq!(parse_sampling("deterministic").unwrap(), "deterministic");
+        assert_eq!(parse_sampling("creative").unwrap(), "creative");
+        assert_eq!(parse_sampling("  general ").unwrap(), "general");
+    }
+
+    #[test]
+    fn sampling_invalid() {
+        assert!(parse_sampling("fastmode").is_err());
+        assert!(parse_sampling("x").is_err());
+    }
+
+    #[test]
+    fn sampling_empty() {
+        assert!(parse_sampling("").is_err_and(|e| e.is_empty()));
     }
 }
