@@ -821,15 +821,18 @@ impl App {
             .cmd_tx
             .send(ClientMessage::CloseSession { session_id: sid });
 
-        // Cleanup
-        terminal::disable_raw_mode()?;
+        // Cleanup — leave alternate screen before disabling raw mode
+        // so escape sequences process correctly. Move cursor to (0,0)
+        // so the user isn't dropped at the bottom of their terminal.
         execute!(
             io::stdout(),
             terminal::LeaveAlternateScreen,
             event::DisableMouseCapture,
             event::DisableBracketedPaste,
             cursor::Show,
+            cursor::MoveTo(0, 0),
         )?;
+        terminal::disable_raw_mode()?;
 
         Ok(())
     }
@@ -936,13 +939,14 @@ struct RestoreGuard;
 
 impl Drop for RestoreGuard {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
         let _ = execute!(
             io::stdout(),
             terminal::LeaveAlternateScreen,
             event::DisableMouseCapture,
             event::DisableBracketedPaste,
             cursor::Show,
+            cursor::MoveTo(0, 0),
         );
+        let _ = terminal::disable_raw_mode();
     }
 }
