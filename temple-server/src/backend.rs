@@ -161,6 +161,8 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -595,6 +597,7 @@ impl ModelBackend {
             stream_options: None,
             max_tokens: Some(128),
             temperature: Some(0.0),
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
             ..Default::default()
         };
 

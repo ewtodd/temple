@@ -450,6 +450,7 @@ impl Agent {
             temperature: Some(0.0),
             top_p: Some(1.0),
             top_k: Some(1),
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
             ..Default::default()
         };
 
@@ -1009,6 +1010,7 @@ impl Agent {
             temperature: Some(0.0),
             top_p: Some(1.0),
             top_k: Some(1),
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
             ..Default::default()
         };
 
