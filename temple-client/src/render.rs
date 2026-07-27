@@ -1,31 +1,7 @@
+use pulldown_cmark::{Event, Tag, TagEnd};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-/// A single styled display line — text plus a semantic kind that
-/// determines colour.
-#[derive(Clone)]
-pub struct StyledLine {
-    pub text: String,
-    pub kind: LineKind,
-}
-
-/// Semantic kind for colour-coding display lines.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum LineKind {
-    Normal,
-    Code,
-    Dim,
-    System,
-    Error,
-    ToolStart,
-    ToolDone,
-    ToolFail,
-    ToolDetail,
-    Separator,
-    UserHeader,
-    AgentHeader,
-    Stats,
-}
 
 /// Strip ANSI escape sequences and control characters (except \n).
 /// Tabs become 4 spaces. Raw control bytes corrupt terminal state
@@ -128,35 +104,181 @@ pub fn wrap_piece(line: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Render markdown-lite: fenced code blocks are rendered as indented
-/// dim lines, normal text is word-wrapped. Returns StyledLine vec.
-pub fn render_markdown_lite(content: &str, width: usize) -> Vec<StyledLine> {
+/// Render markdown to styled ratatui Lines. Handles bold, italic,
+/// inline code, fenced code blocks, headers, and bullet lists. Text
+/// is word-wrapped at `width` display columns.
+pub fn render_markdown(content: &str, width: usize) -> Vec<Line<'static>> {
     let w = if width < 2 { 40 } else { width };
-    let mut out = Vec::new();
-    let mut in_block = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_block = !in_block;
-            continue;
-        }
-        if in_block {
-            for l in wrap_text(line, w.saturating_sub(2)) {
-                out.push(StyledLine {
-                    text: format!("  {l}"),
-                    kind: LineKind::Code,
-                });
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let parser = pulldown_cmark::Parser::new(content);
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut base_style = Style::default();
+    let mut in_code_block = false;
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                flush_line(&mut current, &mut out, w);
+                in_code_block = true;
             }
-        } else {
-            for l in wrap_text(line, w) {
-                out.push(StyledLine {
-                    text: l,
-                    kind: LineKind::Normal,
-                });
+            Event::End(TagEnd::CodeBlock) => {
+                flush_line(&mut current, &mut out, w);
+                in_code_block = false;
+            }
+            Event::Start(Tag::Heading { .. }) => {
+                flush_line(&mut current, &mut out, w);
+                base_style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                flush_line(&mut current, &mut out, w);
+                base_style = Style::default();
+            }
+            Event::Start(Tag::Emphasis) => {
+                base_style = base_style.add_modifier(Modifier::ITALIC);
+            }
+            Event::End(TagEnd::Emphasis) => {
+                base_style = base_style.remove_modifier(Modifier::ITALIC);
+            }
+            Event::Start(Tag::Strong) => {
+                base_style = base_style.add_modifier(Modifier::BOLD).fg(Color::Yellow);
+            }
+            Event::End(TagEnd::Strong) => {
+                base_style = base_style.remove_modifier(Modifier::BOLD).fg(Color::Reset);
+            }
+            Event::Start(Tag::Item) => {
+                flush_line(&mut current, &mut out, w);
+            }
+            Event::End(TagEnd::Item) => {
+                flush_line(&mut current, &mut out, w);
+            }
+            Event::Start(Tag::List(_)) | Event::End(TagEnd::List(_)) => {}
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {}
+            Event::Start(Tag::BlockQuote(_)) => {
+                base_style = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                flush_line(&mut current, &mut out, w);
+                base_style = Style::default();
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                flush_line(&mut current, &mut out, w);
+            }
+            Event::Text(text) => {
+                let style = if in_code_block {
+                    Style::default().fg(Color::Gray)
+                } else {
+                    base_style
+                };
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        flush_line(&mut current, &mut out, w);
+                    } else {
+                        current.push(Span::styled(ch.to_string(), style));
+                    }
+                }
+            }
+            Event::Code(text) => {
+                let code_style = Style::default().fg(Color::Yellow).bg(Color::DarkGray);
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        flush_line(&mut current, &mut out, w);
+                    } else {
+                        current.push(Span::styled(ch.to_string(), code_style));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_line(&mut current, &mut out, w);
+
+    if out.is_empty() {
+        out.push(Line::default());
+    }
+    out
+}
+
+/// Flush accumulated spans into wrapped lines. An empty current vec
+/// produces nothing (no empty lines for repeated breaks).
+fn flush_line(current: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>, width: usize) {
+    if current.is_empty() {
+        return;
+    }
+    let spans = std::mem::take(current);
+    let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    if line_text.width() <= width {
+        out.push(Line::from(spans));
+    } else {
+        for wrapped in wrap_spans(&spans, width) {
+            out.push(wrapped);
+        }
+    }
+}
+
+/// Wrap a sequence of styled spans at display width, preserving styles
+/// across line breaks.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::default()];
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_w = 0usize;
+
+    for span in spans {
+        let mut remaining = span.content.as_ref();
+        let mut consumed: usize = 0;
+        while !remaining.is_empty() {
+            let space = width.saturating_sub(current_w);
+            if space == 0 {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_w = 0;
+                continue;
+            }
+            let (chunk, rest) = split_at_width(remaining, space);
+            let chunk_style = span.style;
+            if !chunk.is_empty() {
+                current.push(Span::styled(chunk.to_string(), chunk_style));
+                current_w += chunk.width();
+            }
+            if rest.is_empty() {
+                break;
+            }
+            remaining = rest;
+            if current_w >= width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_w = 0;
+            }
+            consumed += chunk.len();
+            if consumed < span.content.len() {
+                remaining = &span.content[consumed..];
             }
         }
     }
-    out
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+/// Split a string at `max_width` display columns. Returns (first part, remainder).
+fn split_at_width(s: &str, max_width: usize) -> (&str, &str) {
+    if max_width == 0 {
+        return ("", s);
+    }
+    let mut w = 0usize;
+    for (bi, ch) in s.char_indices() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max_width {
+            return (&s[..bi], &s[bi..]);
+        }
+        w += cw;
+    }
+    (s, "")
 }
 
 /// Insert a character at a given char index in a String.
@@ -344,17 +466,28 @@ mod tests {
     }
 
     #[test]
-    fn test_render_markdown_lite_plain() {
-        let result = render_markdown_lite("hello world", 40);
+    fn test_render_markdown_plain() {
+        let result = render_markdown("hello world", 40);
         assert!(!result.is_empty());
-        assert_eq!(result[0].text, "hello world");
+        let text: String = result[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "hello world");
     }
 
     #[test]
-    fn test_render_markdown_lite_code_block() {
+    fn test_render_markdown_code_block() {
         let input = "```\ncode line\n```";
-        let result = render_markdown_lite(input, 40);
-        assert!(result.iter().any(|l| l.text.contains("code line")));
+        let result = render_markdown(input, 40);
+        let text: String = result
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("code line"));
+    }
+
+    #[test]
+    fn test_render_markdown_bold() {
+        let result = render_markdown("hello **world**", 40);
+        assert!(!result.is_empty());
     }
 
     #[test]

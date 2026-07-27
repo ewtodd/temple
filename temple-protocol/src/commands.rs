@@ -12,6 +12,7 @@ Commands:
   /model [name]      show/set model (\"auto\" to re-route)
   /models            list available models
   /new [target]      start new session
+  /pipeline          force planner→executor→reviewer for next message
   /q                 exit (TUI only)
   /session <id>      resume session
   /sessions          list your sessions";
@@ -28,6 +29,7 @@ Commands:
   /model <name>   set model (bare to show current)
   /models         list available models
   /new [target]   start new session
+  /pipeline       force pipeline for next message
   /q              exit
   /quit           exit
   /session <n>    resume session

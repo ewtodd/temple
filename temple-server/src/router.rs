@@ -148,17 +148,11 @@ impl Router {
                 ComplexityClass::Simple => Route::Direct {
                     model: models.simple_model.clone(),
                 },
-                ComplexityClass::Medium => Route::Direct {
-                    model: models.default_model.clone(),
-                },
-                ComplexityClass::Complex => Route::Direct {
-                    model: models.executor_model.clone(),
-                },
-                ComplexityClass::Critical => Route::Pipeline {
-                    planner: models.planner_model.clone(),
-                    executor: models.executor_model.clone(),
-                    reviewer: models.reviewer_model.clone(),
-                },
+                ComplexityClass::Medium | ComplexityClass::Complex | ComplexityClass::Critical => {
+                    Route::Direct {
+                        model: models.default_model.clone(),
+                    }
+                }
             },
         }
     }

@@ -8,7 +8,6 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::input::SPINNER;
-use crate::render::LineKind;
 use crate::state::{AppState, ChatEntry};
 use crate::tools::mode_tag;
 
@@ -17,7 +16,7 @@ pub const TEMPLE_ART: &str = include_str!("../../assets/temple.asc");
 
 /// Build a Vec<Line> from ChatEntry items for the chat area.
 fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
-    use crate::render::{render_markdown_lite, wrap_text};
+    use crate::render::{render_markdown, wrap_text};
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let content_width = width.saturating_sub(4);
@@ -43,15 +42,8 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     )])
                     .centered(),
                 );
-                for l in render_markdown_lite(text, content_width.saturating_sub(2)) {
-                    let color = match l.kind {
-                        LineKind::Code => Color::White,
-                        _ => Color::Reset,
-                    };
-                    lines.push(Line::from(Span::styled(
-                        l.text.to_string(),
-                        Style::default().fg(color),
-                    )));
+                for l in render_markdown(text, content_width.saturating_sub(2)) {
+                    lines.push(l);
                 }
             }
             ChatEntry::Assistant {
@@ -85,16 +77,9 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                         )));
                     }
                 }
-                let body = render_markdown_lite(content, content_width.saturating_sub(2));
-                for l in body.iter() {
-                    let color = match l.kind {
-                        LineKind::Code => Color::Gray,
-                        _ => Color::Reset,
-                    };
-                    lines.push(Line::from(Span::styled(
-                        l.text.to_string(),
-                        Style::default().fg(color),
-                    )));
+                let body = crate::render::render_markdown(content, content_width.saturating_sub(2));
+                for l in body {
+                    lines.push(l);
                 }
                 if let Some(st) = stats {
                     lines.push(Line::from(Span::styled(

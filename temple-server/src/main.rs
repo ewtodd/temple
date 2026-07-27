@@ -472,8 +472,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                /models — list available models\n\
                                /sampling [p] \u{2014} show/set sampling preset (general \u{b7} coding \u{b7} deterministic \u{b7} creative)\n\
                                /new — new session\n\
-                              /new <target> [dir] — new coding session\n\
-                                                             /nuke \u{2014} total reset — wipe sessions, memories, skills, docs, cron (admin)\n\
+                                /new <target> [dir] — new coding session\n\
+                                /pipeline — force planner→executor→reviewer for next message\n\
+                                                              /nuke \u{2014} total reset — wipe sessions, memories, skills, docs, cron (admin)\n\
                               /quick — back to the default session\n\
                               /reset — cancel ALL in-flight requests (admin)\n\
                               /session <id-prefix> — resume a session\n\
@@ -621,6 +622,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "type /nuke confirm to permanently wipe ALL data (admin only)",
                             )
                             .await;
+                            return;
+                        }
+
+                        // /pipeline — force next message through planner→executor→reviewer
+                        if trimmed == "/pipeline" {
+                            let target_session = active.lock().await.get(&conv_key).copied();
+                            let Some(sid) = target_session else {
+                                send_conv(
+                                    &signal,
+                                    &sender,
+                                    &group_id,
+                                    "no active session — send a message first",
+                                )
+                                .await;
+                                return;
+                            };
+                            agent.set_session_pipeline(sid, true).await;
+                            send_conv(
+                                &signal,
+                                &sender,
+                                &group_id,
+                                "pipeline enabled for next message",
+                            )
+                            .await;
+                            return;
+                        }
+                        if trimmed == "/pipeline off" {
+                            let target_session = active.lock().await.get(&conv_key).copied();
+                            let Some(sid) = target_session else {
+                                send_conv(&signal, &sender, &group_id, "no active session").await;
+                                return;
+                            };
+                            agent.set_session_pipeline(sid, false).await;
+                            send_conv(&signal, &sender, &group_id, "pipeline disabled").await;
                             return;
                         }
 

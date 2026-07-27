@@ -319,6 +319,10 @@ struct SessionCtx {
     reasoning_effort: Option<String>,
     /// Sampling preset: "general", "coding", "deterministic", "creative".
     sampling_preset: Option<String>,
+    /// When true, the next message forces the planner→executor→reviewer
+    /// pipeline regardless of complexity classification. Toggled with
+    /// /pipeline. Resets after one message — re-apply for each turn.
+    force_pipeline: bool,
     /// SSH target machine for sessions created via /new (e.g. "e-play").
     /// Determines where tools execute via the daemon on that machine.
     ssh_target: Option<String>,
@@ -783,6 +787,7 @@ impl Agent {
                 cached_tools: None,
                 reasoning_effort: None,
                 sampling_preset: None,
+                force_pipeline: false,
                 ssh_target: None,
                 last_prompt_tokens: None,
             },
@@ -834,6 +839,7 @@ impl Agent {
                 cached_tools: None,
                 reasoning_effort: None,
                 sampling_preset: None,
+                force_pipeline: false,
                 ssh_target: ssh_target.map(|s| s.to_string()),
                 last_prompt_tokens: None,
             },
@@ -935,6 +941,7 @@ impl Agent {
                 cached_tools: None,
                 reasoning_effort: None,
                 sampling_preset: None,
+                force_pipeline: false,
                 ssh_target: row.ssh_target.clone(),
                 last_prompt_tokens: None,
             },
@@ -1199,6 +1206,16 @@ impl Agent {
         self.persist_session(session_id).await;
     }
 
+    /// Toggle pipeline mode for the next message. When enabled, the next
+    /// message forces planner→executor→reviewer regardless of complexity.
+    /// Resets after one message — the user must /pipeline again each turn.
+    pub async fn set_session_pipeline(&self, session_id: Uuid, enabled: bool) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(&session_id) {
+            s.force_pipeline = enabled;
+        }
+    }
+
     pub async fn session_model(&self, session_id: Uuid) -> String {
         self.sessions
             .lock()
@@ -1294,7 +1311,15 @@ impl Agent {
         let _loop_guard = loop_lock.lock().await;
 
         // Get session info
-        let (username, cwd, session_model, session_kind, model_override, last_routed_model) = {
+        let (
+            username,
+            cwd,
+            session_model,
+            session_kind,
+            model_override,
+            last_routed_model,
+            force_pipeline,
+        ) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
@@ -1335,6 +1360,7 @@ impl Agent {
                 s.kind,
                 s.model_override,
                 s.last_routed_model.clone(),
+                s.force_pipeline,
             )
         };
 
@@ -1388,6 +1414,23 @@ impl Agent {
             (None, false, None) => Route::Direct {
                 model: self.models.default_model.clone(),
             },
+        };
+        // Manual pipeline override — forces planner→executor→reviewer
+        // regardless of complexity classification. Resets after one use.
+        let route = if force_pipeline {
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&session_id) {
+                    s.force_pipeline = false;
+                }
+            }
+            Route::Pipeline {
+                planner: self.models.planner_model.clone(),
+                executor: self.models.executor_model.clone(),
+                reviewer: self.models.reviewer_model.clone(),
+            }
+        } else {
+            route
         };
         let lane = match &route {
             Route::Direct { model } => model.clone(),

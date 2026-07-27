@@ -742,6 +742,15 @@ fn handle_slash_command(
         }
         return true;
     }
+    if content == "/pipeline" {
+        cmd_tx
+            .send(ClientMessage::ChatInput {
+                session_id: s.session_id,
+                content: "/pipeline".into(),
+            })
+            .ok();
+        return true;
+    }
     if content == "/q" || content == "/quit" || content == ":q" {
         s.running = false;
         return true;

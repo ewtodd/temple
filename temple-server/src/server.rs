@@ -480,6 +480,27 @@ async fn handle_connection(
                     });
                     continue;
                 }
+                if trimmed == "/pipeline" {
+                    agent.set_session_pipeline(sid, true).await;
+                    let _ = tx.send(ServerMessage::ChatDelta {
+                        session_id: sid,
+                        delta: "pipeline enabled for next message (planner→executor→reviewer)\n"
+                            .into(),
+                        reasoning: None,
+                        done: true,
+                    });
+                    continue;
+                }
+                if trimmed == "/pipeline off" {
+                    agent.set_session_pipeline(sid, false).await;
+                    let _ = tx.send(ServerMessage::ChatDelta {
+                        session_id: sid,
+                        delta: "pipeline disabled\n".into(),
+                        reasoning: None,
+                        done: true,
+                    });
+                    continue;
+                }
 
                 // Run agent loop in a task; forward events to this client
                 let agent = agent.clone();
