@@ -336,15 +336,27 @@ pub async fn execute_local_tool(
                                         if content.ends_with('\n') && !n.ends_with('\n') {
                                             n.push('\n');
                                         }
-                                        // Atomic write via temp-file + rename:
-                                        // prevents partial writes and TOCTOU races
-                                        // with concurrent readers/writers.
-                                        match tokio::fs::write(&resolved, &n).await {
+                                        // Atomic write: write to temp file
+                                        // in the same directory, then rename.
+                                        let tmp_path = {
+                                            let mut p = resolved.clone().into_os_string();
+                                            p.push(".temple-tmp");
+                                            std::path::PathBuf::from(p)
+                                        };
+                                        match tokio::fs::write(&tmp_path, &n).await {
                                             Err(e) => format!("Error: {e}"),
-                                            Ok(()) => format!(
-                                                "edited {} (replaced 1 occurrence)",
-                                                resolved.display()
-                                            ),
+                                            Ok(()) => match tokio::fs::rename(&tmp_path, &resolved)
+                                                .await
+                                            {
+                                                Err(e) => {
+                                                    tokio::fs::remove_file(&tmp_path).await.ok();
+                                                    format!("Error: {e}")
+                                                }
+                                                Ok(()) => format!(
+                                                    "edited {} (replaced 1 occurrence)",
+                                                    resolved.display()
+                                                ),
+                                            },
                                         }
                                     }
                                 }

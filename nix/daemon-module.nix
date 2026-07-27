@@ -60,7 +60,7 @@ in
           Type = "simple";
           User = name;
           Group = "users";
-          ExecStart = "${cfg.package}/bin/temple --server ${cfg.server} --daemon --identity /home/${name}/.ssh/id_ed25519";
+          ExecStart = escapeShellArgs [ "${cfg.package}/bin/temple" "--daemon" "--server" cfg.server "--identity" "/home/${name}/.ssh/id_ed25519" ];
           Restart = "always";
           RestartSec = "10s";
           StandardOutput = "journal";

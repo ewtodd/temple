@@ -1,4 +1,5 @@
 use crate::memory::Memory;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// A user authenticated via token.
@@ -41,8 +42,29 @@ fn token_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Refuse to use a token file that has group or other permissions set.
+/// The file contains plain-text authentication tokens and must be mode 0600.
+fn require_owner_only(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("stat token file: {e}"))?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            "token file {:?} has unsafe permissions {:o} — \
+             refusing to use it (secure it with chmod 600)",
+            path,
+            mode
+        );
+        return Err(format!(
+            "token file has unsafe permissions {:o} (must be owner-only)",
+            mode
+        ));
+    }
+    Ok(())
+}
+
 /// Check a token against the auth_token_file.
 pub fn check_token(token_file: &Path, token: &str) -> Result<AuthUser, String> {
+    require_owner_only(token_file)?;
     let content =
         std::fs::read_to_string(token_file).map_err(|e| format!("read token file: {e}"))?;
     for line in content.lines() {
@@ -87,6 +109,7 @@ pub async fn load_signal_users(
         .auth_token_file
         .as_ref()
         .ok_or("auth_token_file not set")?;
+    require_owner_only(token_file)?;
     let content =
         std::fs::read_to_string(token_file).map_err(|e| format!("read token file: {e}"))?;
     let mut users = Vec::new();

@@ -2623,7 +2623,7 @@ Git conventions:
             }
         }
 
-        if let Ok(skills) = self.memory.get_all_skills().await {
+        if let Ok(skills) = self.memory.get_skills_for_user(username).await {
             if !skills.is_empty() {
                 let mut s = "\n\nSkills you've learned:\n".to_string();
                 for skill in skills.iter().take(10) {
@@ -3029,6 +3029,15 @@ Git conventions:
                         .map(|s| s.cwd.clone())
                         .unwrap_or_else(|| ".".into())
                 };
+                self.check_perm(
+                    session_id,
+                    std::path::Path::new(&cwd),
+                    AccessKind::Read,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
                 crate::direct_tools::DirectTools::grep_code(&cwd, pattern, 50)
             }
             "fetch" | "fetch-fetch" => {
@@ -3139,6 +3148,15 @@ Git conventions:
                         .map(|s| s.cwd.clone())
                         .unwrap_or_else(|| ".".into())
                 };
+                self.check_perm(
+                    session_id,
+                    std::path::Path::new(&cwd),
+                    AccessKind::Read,
+                    scope.clone(),
+                    cancel_token,
+                    emit,
+                )
+                .await?;
                 crate::direct_tools::DirectTools::ast_grep(&cwd, pattern, lang, 50)
             }
             "calendar_events" => {

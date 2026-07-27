@@ -45,12 +45,14 @@ impl Memory {
             );
             CREATE TABLE IF NOT EXISTS skills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
                 description TEXT NOT NULL,
                 pattern TEXT NOT NULL,
                 source_session TEXT,
                 frequency INTEGER NOT NULL DEFAULT 1,
-                last_used TEXT
+                last_used TEXT,
+                username TEXT NOT NULL DEFAULT 'system',
+                UNIQUE(name, username)
             );
             CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
             CREATE INDEX IF NOT EXISTS idx_memory_key ON memory_store(key);
@@ -90,6 +92,10 @@ impl Memory {
                 uploaded_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_documents_username ON documents(username);
+            CREATE TABLE IF NOT EXISTS cron_state (
+                job_name TEXT PRIMARY KEY,
+                last_run TEXT NOT NULL
+            );
             ",
         )?;
 
@@ -117,6 +123,12 @@ impl Memory {
         }
         if user_version < 3 && has_column("sessions", "todos") {
             user_version = 3;
+        }
+        if user_version < 6 && has_column("cron_state", "job_name") {
+            user_version = 6;
+        }
+        if user_version < 7 && has_column("skills", "username") {
+            user_version = 7;
         }
 
         // Persist the detected starting point
@@ -187,6 +199,37 @@ impl Memory {
                 INSERT INTO documents_fts(documents_fts, rowid, filename, content) VALUES ('delete', old.rowid, old.filename, old.content);\
                 INSERT INTO documents_fts(rowid, filename, content) VALUES (new.rowid, new.filename, new.content);\
             END;",
+        )?;
+
+        // Version 6: cron_state table — persists last-run dates across restarts
+        migrate(
+            6,
+            "CREATE TABLE IF NOT EXISTS cron_state (\
+                job_name TEXT PRIMARY KEY,\
+                last_run TEXT NOT NULL\
+            );",
+        )?;
+
+        // Version 7: per-user skills — add username column and switch
+        // unique constraint from (name) to (name, username) so each user
+        // can have their own skill entries alongside system defaults.
+        migrate(
+            7,
+            "CREATE TABLE skills_v7 (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                name TEXT NOT NULL,\
+                description TEXT NOT NULL,\
+                pattern TEXT NOT NULL,\
+                source_session TEXT,\
+                frequency INTEGER NOT NULL DEFAULT 1,\
+                last_used TEXT,\
+                username TEXT NOT NULL DEFAULT 'system',\
+                UNIQUE(name, username)\
+            );\
+            INSERT INTO skills_v7 (id, name, description, pattern, source_session, frequency, last_used, username) \
+                SELECT id, name, description, pattern, source_session, frequency, last_used, 'system' FROM skills;\
+            DROP TABLE skills;\
+            ALTER TABLE skills_v7 RENAME TO skills;",
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -300,32 +343,33 @@ impl Memory {
 
     pub async fn upsert_skill(&self, skill: &Skill) -> rusqlite::Result<()> {
         let conn = self.conn.lock().await;
-        let last_used = skill.last_used.map(|d| d.to_rfc3339());
+        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO skills (name, description, pattern, source_session, frequency, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(name) DO UPDATE SET
+            "INSERT INTO skills (name, description, pattern, source_session, frequency, last_used, username) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(name, username) DO UPDATE SET
                description = EXCLUDED.description,
                pattern = EXCLUDED.pattern,
                frequency = skills.frequency + 1,
-               last_used = ?6",
+               last_used = EXCLUDED.last_used",
             params![
                 skill.name,
                 skill.description,
                 skill.pattern,
                 skill.source_session.map(|s| s.to_string()),
                 skill.frequency,
-                last_used,
+                now,
+                skill.username,
             ],
         )?;
         Ok(())
     }
 
-    pub async fn get_all_skills(&self) -> rusqlite::Result<Vec<Skill>> {
+    pub async fn get_skills_for_user(&self, username: &str) -> rusqlite::Result<Vec<Skill>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT name, description, pattern, source_session, frequency, last_used FROM skills ORDER BY frequency DESC",
+            "SELECT name, description, pattern, source_session, frequency, last_used, username FROM skills WHERE username = ?1 OR username = 'system' ORDER BY frequency DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![username], |row| {
             Ok(Skill {
                 name: row.get(0)?,
                 description: row.get(1)?,
@@ -338,6 +382,7 @@ impl Memory {
                     .get::<_, Option<String>>(5)?
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                     .map(|d| d.to_utc()),
+                username: row.get(6)?,
             })
         })?;
         let mut results = Vec::new();
@@ -359,6 +404,39 @@ impl Memory {
             "SELECT session_id, role, content, timestamp, model_used FROM conversations ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
+            Ok(ConversationEntry {
+                session_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                role: row.get(1)?,
+                content: row.get(2)?,
+                timestamp: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                    .map(|d| d.to_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                model_used: row.get(4)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows.flatten() {
+            results.push(r);
+        }
+        Ok(results)
+    }
+
+    /// Get recent conversations for a specific user (joins sessions table).
+    /// Only covers persisted sessions — transient Signal chats are excluded.
+    pub async fn get_recent_conversations_for_user(
+        &self,
+        username: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<ConversationEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT c.session_id, c.role, c.content, c.timestamp, c.model_used \
+             FROM conversations c \
+             JOIN sessions s ON c.session_id = s.id \
+             WHERE s.username = ?1 \
+             ORDER BY c.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![username, limit], |row| {
             Ok(ConversationEntry {
                 session_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                 role: row.get(1)?,
@@ -798,6 +876,28 @@ impl Memory {
             params![id.to_string(), username],
         )?;
         Ok(n)
+    }
+
+    // ── Cron state ──
+
+    pub async fn get_cron_state(&self, job_name: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT last_run FROM cron_state WHERE job_name = ?1",
+            params![job_name],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    pub async fn set_cron_state(&self, job_name: &str, last_run: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO cron_state (job_name, last_run) VALUES (?1, ?2) \
+             ON CONFLICT(job_name) DO UPDATE SET last_run = EXCLUDED.last_run",
+            params![job_name, last_run],
+        )?;
+        Ok(())
     }
 }
 

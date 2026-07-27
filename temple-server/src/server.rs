@@ -10,6 +10,9 @@ use crate::config::Config;
 use crate::memory::Memory;
 use crate::permissions::PermissionScope;
 
+const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+const MAX_UPLOAD_CONTENT_SIZE: usize = 5 * 1024 * 1024; // 5 MiB
+
 pub async fn run_server(
     agent: Arc<Agent>,
     memory: Arc<Memory>,
@@ -96,6 +99,18 @@ async fn handle_connection(
             tokio_tungstenite::tungstenite::Message::Close(_) => break,
             _ => continue,
         };
+
+        if text.len() > MAX_MESSAGE_SIZE {
+            let _ = tx.send(ServerMessage::ChatError {
+                session_id,
+                error: format!(
+                    "message too large: {} bytes exceeds {} MiB limit",
+                    text.len(),
+                    MAX_MESSAGE_SIZE / (1024 * 1024),
+                ),
+            });
+            continue;
+        }
 
         let client_msg: ClientMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
@@ -711,6 +726,17 @@ async fn handle_connection(
                 content,
                 mime_type,
             } => {
+                if content.len() > MAX_UPLOAD_CONTENT_SIZE {
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: format!(
+                            "upload too large: {} bytes exceeds {} MiB limit",
+                            content.len(),
+                            MAX_UPLOAD_CONTENT_SIZE / (1024 * 1024),
+                        ),
+                    });
+                    continue;
+                }
                 let owner = auth_owner.clone().unwrap_or_default();
                 match memory
                     .upload_document(&filename, &content, &owner, &mime_type)

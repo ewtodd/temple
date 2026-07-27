@@ -97,9 +97,18 @@ pub async fn connect(
     });
 
     tokio::spawn(async move {
+        const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                    if text.len() > MAX_MESSAGE_SIZE {
+                        eprintln!(
+                            "warning: dropping oversized message: {} bytes exceeds {} MiB limit",
+                            text.len(),
+                            MAX_MESSAGE_SIZE / (1024 * 1024),
+                        );
+                        continue;
+                    }
                     if let Ok(m) = serde_json::from_str::<ServerMessage>(&text) {
                         if incoming_tx.send(m).is_err() {
                             break;

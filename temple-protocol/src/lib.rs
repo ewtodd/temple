@@ -387,6 +387,12 @@ pub struct Skill {
     pub source_session: Option<Uuid>,
     pub frequency: u32,
     pub last_used: Option<DateTime<Utc>>,
+    #[serde(default = "default_skill_username")]
+    pub username: String,
+}
+
+fn default_skill_username() -> String {
+    "system".to_string()
 }
 
 // ── Router decision ──────────────────────────────────────────────────
