@@ -228,8 +228,8 @@ in
         options = {
           command = mkOption {
             type = types.str;
-            example = "arxiv-mcp-server";
-            description = "Command to spawn the MCP server process.";
+            example = "uvx";
+            description = "Command to spawn the MCP server process. uvx is recommended for Python MCP servers — temple's systemd service already has uv in PATH.";
           };
           args = mkOption {
             type = types.listOf types.str;
@@ -238,17 +238,17 @@ in
           };
         };
       });
-      default = { };
-      example = lib.literalExpression ''
-        {
-          arxiv.command = "arxiv-mcp-server";
-          fetch = { command = "uvx"; args = [ "mcp-server-fetch" ]; };
-          searxng = { command = "uvx"; args = [ "mcp-server-searxng" "--host" "127.0.0.1" "--port" "8081" ]; };
-        }
-      '';
+      default = {
+        fetch = { command = "uvx"; args = [ "mcp-server-fetch" ]; };
+        arxiv = { command = "uvx"; args = [ "arxiv-mcp-server" "--store-path" "/tmp/arxiv-cache" ]; };
+        nixos = { command = "uvx"; args = [ "mcp-server-nixos" ]; };
+        searxng = { command = "uvx"; args = [ "mcp-server-searxng" "--search-url" "http://127.0.0.1:8081/search?q={query}&format=json" ]; };
+        context7 = { command = "uvx"; args = [ "mcp-server-context7" ]; };
+      };
       description = ''MCP servers to connect via stdio JSON-RPC 2.0. Tools from
         these servers are discovered at startup and made available to the LLM
-        alongside built-in local tools.'';
+        alongside built-in local tools. Defaults cover fetch, arxiv, nixos,
+        searxng (localhost:8081), and context7 — override or add your own.'';
     };
 
     openFirewall = mkOption {
@@ -346,7 +346,7 @@ in
       environment.RUST_LOG = "temple_server=info";
       environment.HOME = cfg.dataDir;
 
-      path = [ pkgs.nix ];
+      path = [ pkgs.nix pkgs.uv ];
 
       serviceConfig = {
         Type = "simple";
