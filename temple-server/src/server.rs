@@ -131,7 +131,11 @@ async fn handle_connection(
                     }
                 }
                 if auth_owner.is_none() {
-                    auth_owner = Some(open.username.clone());
+                    let _ = tx.send(ServerMessage::ChatError {
+                        session_id,
+                        error: "authentication required — provide a daemon public key".into(),
+                    });
+                    continue;
                 }
                 // Auto-create a persisted Coding session (no SSH — tools run
                 // client-side via ToolRequest, so every `temple` invocation
@@ -391,11 +395,6 @@ async fn handle_connection(
                 session_id: sid,
                 content,
             } => {
-                // Web sessions: if no OpenSession was received (session_id is nil),
-                // accept the sid from the client — it was created by verify_web_code.
-                if session_id == Uuid::nil() {
-                    session_id = sid;
-                }
                 if sid != session_id {
                     let _ = tx.send(ServerMessage::ChatError {
                         session_id: sid,
@@ -737,8 +736,6 @@ async fn handle_connection(
                     }
                 }
             }
-
-            ClientMessage::WebAuth => {} // web UI removed, no-op
 
             ClientMessage::SetReasoningEffort {
                 session_id: sid,

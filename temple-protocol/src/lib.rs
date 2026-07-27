@@ -145,8 +145,6 @@ pub enum ClientMessage {
         account: String,
     },
     Ping,
-    /// Web client requests a verification code (displayed to user).
-    WebAuth,
     /// Admin: delete ALL sessions from the database (requires confirmation).
     NukeSessions,
     /// List uploaded documents for the authenticated user
@@ -288,15 +286,6 @@ pub enum ServerMessage {
         /// Tokens NOT in cache (full-recompute)
         #[serde(default)]
         cache_miss_tokens: u32,
-    },
-    /// Web auth: verification code to display to the user.
-    WebAuthCode {
-        code: String,
-    },
-    /// Web auth: authentication successful.
-    WebAuthDone {
-        username: String,
-        session_id: Uuid,
     },
     /// Uploaded documents for the authenticated user
     DocumentList {
