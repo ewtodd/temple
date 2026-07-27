@@ -2808,12 +2808,25 @@ Git conventions:
             }
 
             "execute_command" => {
-                let command = args["command"].as_str().ok_or("missing command")?;
+                let raw_command = args["command"].as_str().ok_or("missing command")?;
+                // Strip leading `cd <path> &&` / `cd <path> ;` — the daemon
+                // already sets .current_dir(), so the cd is redundant. Models
+                // sometimes prepend it despite the system prompt telling them
+                // not to.
+                let mut command = raw_command.to_string();
+                if let Some(rest) = raw_command.strip_prefix("cd ").and_then(|s| {
+                    s.find("&&")
+                        .or_else(|| s.find(';'))
+                        .map(|idx| s[idx + 2..].trim_start())
+                }) {
+                    tracing::info!("stripped cd prefix: {raw_command} -> {rest}");
+                    command = rest.to_string();
+                }
                 // Local session: check permission mode. Lockdown always
                 // prompts for commands. Unsafe commands always prompt.
                 // Safe read-only commands are allowed automatically.
                 let must_check = {
-                    if !temple_protocol::command::is_safe_command(command) {
+                    if !temple_protocol::command::is_safe_command(&command) {
                         true
                     } else {
                         let sessions = self.sessions.lock().await;
@@ -2823,7 +2836,7 @@ Git conventions:
                     }
                 };
                 if must_check {
-                    let cmd_path = std::path::Path::new(command);
+                    let cmd_path = std::path::Path::new(&command);
                     self.check_perm(
                         session_id,
                         cmd_path,
@@ -2846,7 +2859,11 @@ Git conventions:
                 emit(AgentEvent::ToolRequestNeeded {
                     request_id,
                     name: "execute_command".to_string(),
-                    args_json: args_json.to_string(),
+                    args_json: if command == raw_command {
+                        args_json.to_string()
+                    } else {
+                        serde_json::json!({ "command": command }).to_string()
+                    },
                     session_cwd,
                 });
                 self.wait_tool_result(request_id, rx, cancel_token).await
