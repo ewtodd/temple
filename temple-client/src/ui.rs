@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::input::SPINNER;
-use crate::state::{AppState, ChatEntry};
+use crate::state::{AppState, ChatEntry, PromptState};
 use crate::tools::mode_tag;
 
 /// Temple ASCII art banner.
@@ -66,15 +66,22 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     )])
                     .centered(),
                 );
-                // Reasoning/thinking content rendered dimmed and italic
+                // Reasoning/thinking content rendered dimmed and italic.
+                // Wrap it so the pre-computed line count matches what the
+                // chat Paragraph actually renders (keeps scroll & mouse in
+                // sync — an unwrapped long line would break both).
                 if let Some(ref r) = reasoning {
                     if !r.trim().is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            format!("\u{2026}{r}"),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(ratatui::style::Modifier::ITALIC),
-                        )));
+                        let wrapped = wrap_text(r, content_width.saturating_sub(2));
+                        for (i, l) in wrapped.iter().enumerate() {
+                            let prefix = if i == 0 { "\u{2026} " } else { "   " };
+                            lines.push(Line::from(Span::styled(
+                                format!("{prefix}{l}"),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(ratatui::style::Modifier::ITALIC),
+                            )));
+                        }
                     }
                 }
                 let body = crate::render::render_markdown(content, content_width.saturating_sub(2));
@@ -82,10 +89,12 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     lines.push(l);
                 }
                 if let Some(st) = stats {
-                    lines.push(Line::from(Span::styled(
-                        format!("\u{23F1} {st}"),
-                        Style::default().fg(Color::Magenta),
-                    )));
+                    for l in wrap_text(&format!("\u{23F1} {st}"), content_width.saturating_sub(2)) {
+                        lines.push(Line::from(Span::styled(
+                            l,
+                            Style::default().fg(Color::Magenta),
+                        )));
+                    }
                 }
             }
             ChatEntry::System(text) => {
@@ -115,10 +124,15 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
                     ToolStatus::Finished => ("\u{2713}", Color::Green),
                     ToolStatus::Failed => ("\u{2717}", Color::Red),
                 };
-                lines.push(Line::from(Span::styled(
-                    format!(" {icon} {name}"),
-                    Style::default().fg(color),
-                )));
+                let wrapped =
+                    wrap_text(&format!(" {icon} {name}"), content_width.saturating_sub(2));
+                for (i, l) in wrapped.iter().enumerate() {
+                    let prefix = if i == 0 { "" } else { "   " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{prefix}{l}"),
+                        Style::default().fg(color),
+                    )));
+                }
                 if !detail.is_empty() {
                     let d = if detail.contains('\n') && detail.len() > 120 {
                         let first = detail.lines().next().unwrap_or("");
@@ -171,6 +185,106 @@ fn build_chat_lines(s: &AppState, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Map the prompt cursor to a (line, col) pair within the wrapped display
+/// lines of the sanitized prompt. Mirrors the render path exactly: newlines
+/// split lines, tabs expand to 4 spaces, long words wrap at the width, and
+/// spaces dropped at word-wrap boundaries belong to the previous line.
+fn cursor_in_prompt_lines(prompt: &str, prompt_cursor: usize, width: usize) -> (usize, usize) {
+    use crate::render::sanitize;
+    use unicode_width::UnicodeWidthChar;
+
+    let sanitized = sanitize(prompt);
+    let width = width.max(1);
+
+    // Map the raw cursor index to a char index within `sanitized` (tabs
+    // expand to 4 chars, control chars except '\n' vanish).
+    let mut sidx = 0usize;
+    for c in prompt.chars().take(prompt_cursor) {
+        match c {
+            '\t' => sidx += 4,
+            c if c.is_control() && c != '\n' => {}
+            _ => sidx += 1,
+        }
+    }
+    sidx = sidx.min(sanitized.chars().count());
+
+    // Replicate wrap_text's segmentation (newline pieces + word wrapping),
+    // recording the sanitized char range [start, end) of each display line.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0usize;
+    for piece in sanitized.split('\n') {
+        let piece_len = piece.chars().count();
+        if piece_len == 0 {
+            ranges.push((offset, offset));
+        } else {
+            let mut line_start = 0usize;
+            let mut current_w = 0usize;
+            let mut word_start = 0usize;
+            for word in piece.split(' ') {
+                let wlen = word.chars().count();
+                let word_end = word_start + wlen;
+                let need = if current_w == 0 { wlen } else { wlen + 1 };
+                if current_w > 0 && current_w + need > width {
+                    // The word starts a new line; the previous line ends at
+                    // word_start - 1 (the space in between is dropped).
+                    ranges.push((offset + line_start, offset + word_start - 1));
+                    current_w = 0;
+                    line_start = word_start;
+                }
+                if current_w > 0 {
+                    current_w += 1;
+                }
+                if wlen > width {
+                    // Words wider than the display are chunked across
+                    // multiple lines, mirroring wrap_piece.
+                    let mut chunk_w = 0usize;
+                    for (chunk_start, ch) in (word_start..).zip(word.chars()) {
+                        let cw = ch.width().unwrap_or(0);
+                        if chunk_w + cw > width {
+                            ranges.push((offset + line_start, offset + chunk_start));
+                            line_start = chunk_start;
+                            chunk_w = 0;
+                        }
+                        chunk_w += cw;
+                    }
+                    current_w = chunk_w;
+                } else {
+                    current_w += wlen;
+                }
+                word_start = word_end + 1;
+            }
+            ranges.push((offset + line_start, offset + word_start - 1));
+        }
+        offset += piece_len + 1;
+    }
+    if ranges.is_empty() {
+        ranges.push((0, 0));
+    }
+
+    // Find the line that contains sidx. A cursor exactly on a line boundary
+    // belongs to the end of the previous line (chunked long words), while a
+    // cursor inside a gap (dropped space or '\n') sits at the end of the
+    // line before the gap.
+    let mut line = 0usize;
+    for (i, &(start, _)) in ranges.iter().enumerate() {
+        if start < sidx {
+            line = i;
+        } else if start == sidx {
+            let prev_end = if i > 0 { ranges[i - 1].1 } else { 0 };
+            if prev_end != sidx {
+                line = i;
+            }
+        } else {
+            break;
+        }
+    }
+    let (start, end) = ranges[line];
+    (
+        line,
+        sidx.saturating_sub(start).min(end.saturating_sub(start)),
+    )
+}
+
 /// Return (cursor_x, cursor_y) in terminal coordinates for the prompt
 /// input position, or None if the cursor should be hidden (permission
 /// prompt active).
@@ -191,32 +305,8 @@ pub fn cursor_position(s: &AppState, prompt_area: Rect, width: usize) -> Option<
     let prompt_lines = crate::render::wrap_text(&sanitized, prompt_inner_w);
 
     // Find the display position of the cursor character index
-    let cursor_vis: usize = s
-        .prompt
-        .chars()
-        .take(s.prompt_cursor.min(s.prompt.chars().count()))
-        .filter(|c| !c.is_control())
-        .count();
-
-    let mut char_count = 0usize;
-    let (cursor_line, cursor_col) = prompt_lines
-        .iter()
-        .enumerate()
-        .find_map(|(i, line)| {
-            let line_len = line.chars().count();
-            if char_count + line_len > cursor_vis {
-                Some((i, cursor_vis - char_count))
-            } else {
-                char_count += line_len;
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            (
-                prompt_lines.len().max(1) - 1,
-                prompt_lines.last().map(|l| l.chars().count()).unwrap_or(0),
-            )
-        });
+    let (cursor_line, cursor_col) =
+        cursor_in_prompt_lines(&s.prompt, s.prompt_cursor, prompt_inner_w);
 
     // Window into prompt_lines (max 8 rows)
     const MAX_PROMPT_ROWS: usize = 8;
@@ -281,11 +371,12 @@ pub fn draw(f: &mut Frame, s: &mut AppState, tick_count: u64) -> (Rect, Vec<Stri
     let status_h = 1usize;
     let chat_avail = h.saturating_sub(prompt_h + status_h + art_extra);
 
-    // Clamp scroll to valid range. If it was out of bounds (e.g. terminal
-    // resized), snap to bottom so the user sees new content immediately.
+    // Clamp scroll to the valid range. Scrolling up further than the top of
+    // the conversation must clamp at the top (max_scroll), never wrap around
+    // to the bottom — otherwise the user can't reach the first message.
     let max_scroll = total.saturating_sub(chat_avail);
     if s.scroll > max_scroll {
-        s.scroll = 0;
+        s.scroll = max_scroll;
     }
     let start = max_scroll.saturating_sub(s.scroll);
     let visible_chat: Vec<Line> = all_chat_lines
@@ -445,9 +536,19 @@ pub fn draw(f: &mut Frame, s: &mut AppState, tick_count: u64) -> (Rect, Vec<Stri
             ))]
         } else {
             let idx = s.session_search_idx.min(filtered.len().saturating_sub(1));
+            // Window the list around the selection so the highlighted row
+            // stays visible when there are more sessions than the popup rows.
+            let view_h = inner.height as usize;
+            let start = if filtered.len() > view_h {
+                idx.saturating_sub(view_h / 2).min(filtered.len() - view_h)
+            } else {
+                0
+            };
             filtered
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(view_h)
                 .map(|(i, m)| {
                     let title = m.title.as_deref().unwrap_or("(untitled)");
                     let id8: String = m.id.simple().to_string().chars().take(8).collect();
@@ -492,9 +593,9 @@ fn prompt_box_height(s: &AppState, width: usize) -> usize {
         return 3; // border + empty line + border
     }
     if let Some(ref pstate) = s.permission {
-        let text = format!("Allow {}? (y/N)", crate::render::sanitize(&pstate.text));
-        let lines = crate::render::wrap_text(&text, width.saturating_sub(3).max(1));
-        return lines.len() + 2; // +2 for borders
+        let lines =
+            crate::render::wrap_text(&permission_text(pstate), width.saturating_sub(3).max(1));
+        return lines.len().min(MAX_PROMPT_ROWS) + 2; // +2 for borders
     }
     let prompt_inner_w = width.saturating_sub(3).max(1);
     let prompt_lines =
@@ -502,6 +603,23 @@ fn prompt_box_height(s: &AppState, width: usize) -> usize {
     const MAX_PROMPT_ROWS: usize = 8;
     let shown = prompt_lines.len().min(MAX_PROMPT_ROWS);
     shown + 2 // +2 for borders
+}
+
+/// Format the permission prompt line, truncating very long payloads (e.g.
+/// huge shell commands) so the prompt box can never grow taller than the
+/// terminal and squeeze the chat area out.
+fn permission_text(pstate: &PromptState) -> String {
+    let raw = crate::render::sanitize(&pstate.text);
+    let body = if raw.chars().count() > 200 {
+        format!(
+            "{} \u{2026} ({} chars)",
+            raw.chars().take(180).collect::<String>(),
+            raw.chars().count()
+        )
+    } else {
+        raw
+    };
+    format!("Allow {body}? (y/N)")
 }
 
 fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
@@ -524,10 +642,10 @@ fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
     let prompt_inner_w = width.saturating_sub(3).max(1);
 
     if let Some(ref pstate) = s.permission {
-        let text = format!("Allow {}? (y/N)", crate::render::sanitize(&pstate.text));
-        let lines = crate::render::wrap_text(&text, prompt_inner_w);
+        let lines = crate::render::wrap_text(&permission_text(pstate), prompt_inner_w);
         let display: Vec<Line> = lines
             .into_iter()
+            .take(MAX_PROMPT_ROWS)
             .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::White))))
             .collect();
         f.render_widget(Paragraph::new(display), inner_area);
@@ -543,27 +661,8 @@ fn draw_prompt(f: &mut Frame, s: &AppState, area: Rect, width: usize) {
     const MAX_PROMPT_ROWS: usize = 8;
     let shown_rows = prompt_lines.len().min(MAX_PROMPT_ROWS);
 
-    // Find cursor position in the full prompt_lines
-    let cursor_vis: usize = s
-        .prompt
-        .chars()
-        .take(s.prompt_cursor.min(s.prompt.chars().count()))
-        .filter(|c| !c.is_control())
-        .count();
-    let mut char_count = 0usize;
-    let cursor_line = prompt_lines
-        .iter()
-        .enumerate()
-        .find_map(|(i, line)| {
-            let line_len = line.chars().count();
-            if char_count + line_len > cursor_vis {
-                Some(i)
-            } else {
-                char_count += line_len;
-                None
-            }
-        })
-        .unwrap_or(prompt_lines.len().saturating_sub(1));
+    // Find cursor position in the full prompt_lines (multi-line aware)
+    let (cursor_line, _) = cursor_in_prompt_lines(&s.prompt, s.prompt_cursor, prompt_inner_w);
 
     // Ensure the visible window contains the cursor line
     let window_start = (cursor_line + 1)
@@ -593,6 +692,13 @@ fn draw_status(f: &mut Frame, s: &AppState, area: Rect, tick_count: u64) {
     } else if s.permission.is_some() {
         " permission? (y/N)".to_string()
     } else {
+        // Connection/session state (e.g. "connecting…", "disconnected") —
+        // never show the trivial "ready" state.
+        let state_str = if s.status.is_empty() || s.status == "ready" {
+            String::new()
+        } else {
+            format!(" {}", s.status)
+        };
         let model_info = if s.model.is_empty() {
             String::new()
         } else {
@@ -621,7 +727,7 @@ fn draw_status(f: &mut Frame, s: &AppState, area: Rect, tick_count: u64) {
         } else {
             String::new()
         };
-        format!("{spinner}{elapsed}{model_info}{mode_str}{scroll_indicator}")
+        format!("{state_str}{spinner}{elapsed}{model_info}{mode_str}{scroll_indicator}")
     };
 
     let style = if s.working {
@@ -634,4 +740,71 @@ fn draw_status(f: &mut Frame, s: &AppState, area: Rect, tick_count: u64) {
 
     let line = Line::from(Span::styled(status_text, style));
     f.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cursor_single_line() {
+        assert_eq!(cursor_in_prompt_lines("hello", 0, 40), (0, 0));
+        assert_eq!(cursor_in_prompt_lines("hello", 3, 40), (0, 3));
+        assert_eq!(cursor_in_prompt_lines("hello", 5, 40), (0, 5));
+    }
+
+    #[test]
+    fn test_cursor_wrapped_line() {
+        assert_eq!(cursor_in_prompt_lines("hello world foo", 0, 11), (0, 0));
+        assert_eq!(cursor_in_prompt_lines("hello world foo", 6, 11), (0, 6));
+        // "world" ends the first display line; the space at idx 11 belongs
+        // to the end of the first line
+        assert_eq!(cursor_in_prompt_lines("hello world foo", 11, 11), (0, 11));
+        // after the space, cursor is on the second display line
+        assert_eq!(cursor_in_prompt_lines("hello world foo", 12, 11), (1, 0));
+        assert_eq!(cursor_in_prompt_lines("hello world foo", 15, 11), (1, 3));
+    }
+
+    #[test]
+    fn test_cursor_before_newline_belongs_to_prev_line() {
+        let prompt = "ab\ncd";
+        // cursor right before the '\n' → end of the first line
+        assert_eq!(cursor_in_prompt_lines(prompt, 2, 40), (0, 2));
+        // cursor right after the '\n' → start of the second line
+        assert_eq!(cursor_in_prompt_lines(prompt, 3, 40), (1, 0));
+        // cursor at the very end → end of the last line
+        assert_eq!(cursor_in_prompt_lines(prompt, 5, 40), (1, 2));
+    }
+
+    #[test]
+    fn test_cursor_between_double_newlines() {
+        let prompt = "ab\n\ncd";
+        // in the empty middle line
+        assert_eq!(cursor_in_prompt_lines(prompt, 3, 40), (1, 0));
+    }
+
+    #[test]
+    fn test_cursor_with_tab_expansion() {
+        let prompt = "a\tb";
+        // tab → 4 spaces: cursor after the tab sits after the expansion
+        assert_eq!(cursor_in_prompt_lines(prompt, 2, 40), (0, 5));
+        // cursor before the tab sits before the expansion
+        assert_eq!(cursor_in_prompt_lines(prompt, 1, 40), (0, 1));
+        // cursor at the very end
+        assert_eq!(cursor_in_prompt_lines(prompt, 3, 40), (0, 6));
+    }
+}
+
+#[test]
+fn test_cursor_long_word_chunked() {
+    // "abcdefghij" wraps into chunks of 5
+    assert_eq!(cursor_in_prompt_lines("abcdefghij", 0, 5), (0, 0));
+    assert_eq!(cursor_in_prompt_lines("abcdefghij", 3, 5), (0, 3));
+    // idx 5 = between 'e' and 'f' → end of the first chunk
+    assert_eq!(cursor_in_prompt_lines("abcdefghij", 5, 5), (0, 5));
+    // idx 6 = between 'f' and 'g' → col 1 of the second chunk
+    assert_eq!(cursor_in_prompt_lines("abcdefghij", 6, 5), (1, 1));
+    // idx 9 = between 'i' and 'j' → col 4 of the second chunk
+    assert_eq!(cursor_in_prompt_lines("abcdefghij", 9, 5), (1, 4));
+    assert_eq!(cursor_in_prompt_lines("abcdefghij", 10, 5), (1, 5));
 }

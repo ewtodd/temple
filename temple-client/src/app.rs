@@ -274,6 +274,20 @@ impl App {
                                     continue;
                                 }
                                 if done {
+                                    // Stream finished — clear the working flag
+                                    // here rather than waiting for ChatStats,
+                                    // so a lost stats message can't leave the
+                                    // spinner spinning forever.
+                                    s.working = false;
+                                    s.work_started = None;
+                                    // Server-side chat commands (/pipeline,
+                                    // /clear <account>, ...) reply with a
+                                    // single-shot done delta — show it as its
+                                    // own System line instead of appending it
+                                    // to the previous assistant message.
+                                    if !delta.is_empty() {
+                                        s.entries.push(ChatEntry::System(delta));
+                                    }
                                 } else {
                                     if let Some(ref r) = reasoning {
                                         write_log(&format!("REASONING: {r}"));
@@ -339,16 +353,14 @@ impl App {
                                     fmt_k(completion_tokens),
                                     duration_ms as f64 / 1000.0,
                                 );
+                                // Attach stats only to the most recent entry if
+                                // it is an assistant — never to an assistant
+                                // from an earlier turn (e.g. when this turn
+                                // produced zero deltas).
                                 if let Some(ChatEntry::Assistant {
                                     stats: ref mut st,
                                     ..
-                                }) = s
-                                    .entries
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|e| {
-                                        matches!(e, ChatEntry::Assistant { .. })
-                                    })
+                                }) = s.entries.last_mut()
                                 {
                                     *st = Some(stats);
                                 }
@@ -471,10 +483,20 @@ impl App {
                                 if session_id != s.session_id {
                                     continue;
                                 }
-                                if let Some(pos) = s.entries.iter().rposition(|e| {
-                                    matches!(e, ChatEntry::Assistant { .. })
-                                }) {
-                                    s.entries.truncate(pos);
+                                // Drop the whole failed attempt (partial
+                                // assistant + its tool entries) but keep the
+                                // user's message that started it. Anchoring on
+                                // the last User entry is safe even when the
+                                // stream errored before the first delta —
+                                // anchoring on the last Assistant would have
+                                // deleted the user's message after a previous
+                                // turn's assistant.
+                                if let Some(pos) = s
+                                    .entries
+                                    .iter()
+                                    .rposition(|e| matches!(e, ChatEntry::User(_)))
+                                {
+                                    s.entries.truncate(pos + 1);
                                 }
                             }
                             ServerMessage::SessionList { sessions } => {
@@ -891,6 +913,18 @@ impl App {
     }
 
     fn handle_editor(&self, prompt: String) {
+        // Exit TUI (raw mode + alternate screen) so the external editor gets a
+        // normal, usable terminal — launching it while raw mode is active
+        // garbles the editor's rendering and key handling.
+        let _ = execute!(
+            io::stdout(),
+            terminal::LeaveAlternateScreen,
+            event::DisableMouseCapture,
+            event::DisableBracketedPaste,
+            cursor::Show,
+        );
+        let _ = terminal::disable_raw_mode();
+
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
         let tmp = std::env::temp_dir().join(format!(
             "temple_prompt_{}_{}.md",
@@ -900,6 +934,7 @@ impl App {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let mut wrote = false;
         {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
@@ -909,23 +944,32 @@ impl App {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            match opts.open(&tmp) {
-                Ok(mut f) => {
-                    f.write_all(prompt.as_bytes()).ok();
-                }
-                Err(_) => {
-                    let mut s = self.state.lock().unwrap();
-                    s.editor_pending = false;
-                    return;
-                }
+            if let Ok(mut f) = opts.open(&tmp) {
+                f.write_all(prompt.as_bytes()).ok();
+                wrote = true;
             }
         }
-        std::process::Command::new(&editor).arg(&tmp).status().ok();
-        let edited = std::fs::read_to_string(&tmp)
-            .unwrap_or_default()
-            .trim_end()
-            .to_string();
-        std::fs::remove_file(&tmp).ok();
+
+        let edited = if wrote {
+            std::process::Command::new(&editor).arg(&tmp).status().ok();
+            let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+            std::fs::remove_file(&tmp).ok();
+            text.trim_end().to_string()
+        } else {
+            // Couldn't create the temp file — nothing to edit.
+            String::new()
+        };
+
+        // Re-enter TUI (raw mode + alternate screen). The render loop redraws
+        // on the next iteration.
+        let _ = terminal::enable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            terminal::EnterAlternateScreen,
+            event::EnableMouseCapture,
+            event::EnableBracketedPaste,
+            cursor::Hide,
+        );
 
         let mut s = self.state.lock().unwrap();
         s.prompt = edited;

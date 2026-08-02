@@ -108,9 +108,13 @@ pub fn wrap_piece(line: &str, width: usize) -> Vec<String> {
 /// inline code, fenced code blocks, headers, and bullet lists. Text
 /// is word-wrapped at `width` display columns.
 pub fn render_markdown(content: &str, width: usize) -> Vec<Line<'static>> {
-    let w = if width < 2 { 40 } else { width };
+    // Strip ANSI/control bytes first — raw escapes would corrupt the
+    // terminal canvas. Markdown syntax itself survives (sanitize only
+    // removes control chars and rewrites tabs).
+    let content = sanitize(content);
+    let w = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
-    let parser = pulldown_cmark::Parser::new(content);
+    let parser = pulldown_cmark::Parser::new(&content);
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut base_style = Style::default();
     let mut in_code_block = false;
@@ -299,7 +303,7 @@ pub fn remove_char_at(s: &mut String, idx: usize) {
 /// Extract selected text from visible lines given a normalized selection.
 pub fn extract_selection(lines: &[String], sel: ((usize, usize), (usize, usize))) -> String {
     let ((sl, sc), (el, ec)) = sel;
-    if sl > lines.len() || el > lines.len() {
+    if sl >= lines.len() || el >= lines.len() {
         return String::new();
     }
     if sl == el {
@@ -473,6 +477,30 @@ mod tests {
         assert!(!result.is_empty());
         let text: String = result[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn test_render_markdown_strips_ansi() {
+        let result = render_markdown("\x1b[31mred\x1b[0m text", 40);
+        let text: String = result
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(text, "red text");
+    }
+
+    #[test]
+    fn test_render_markdown_narrow_width_matches_actual() {
+        // Wrapping must use the requested width, not a hardcoded fallback —
+        // otherwise the line count desyncs from the real render.
+        let result = render_markdown("a very long line that needs wrapping", 10);
+        let width: usize = result
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.width()).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        assert!(width <= 10);
+        assert!(result.len() > 1);
     }
 
     #[test]

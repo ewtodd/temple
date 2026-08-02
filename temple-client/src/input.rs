@@ -159,24 +159,27 @@ fn handle_key_event(
                                 );
                             }
                         }
-                        // Drop the lock before blocking on tool completion
-                        // so the render loop can refresh the UI.
-                        drop(s);
-                        let result = responder_rx
-                            .recv()
-                            .unwrap_or_else(|_| "Error: tool execution failed".into());
-                        let _ = cmd_tx.send(ClientMessage::ToolResult {
-                            request_id,
-                            session_id,
-                            result,
+                        // Wait for the tool result on a background thread so the
+                        // UI thread returns immediately — a consented tool can
+                        // run for up to 120s and must not freeze the render loop
+                        // or swallow key input during that time.
+                        let state2 = state.clone();
+                        let cmd_tx2 = cmd_tx.clone();
+                        std::thread::spawn(move || {
+                            let result = responder_rx
+                                .recv()
+                                .unwrap_or_else(|_| "Error: tool execution failed".into());
+                            let _ = cmd_tx2.send(ClientMessage::ToolResult {
+                                request_id,
+                                session_id,
+                                result,
+                            });
+                            if let Ok(mut g) = state2.lock() {
+                                g.entries.push(crate::state::ChatEntry::System(format!(
+                                    "tool {tool_name} completed"
+                                )));
+                            }
                         });
-                        // Re-acquire the lock to push a completion entry
-                        // so the UI shows the tool finished promptly.
-                        if let Ok(mut g) = state.lock() {
-                            g.entries.push(crate::state::ChatEntry::System(format!(
-                                "tool {tool_name} completed"
-                            )));
-                        }
                     }
                 }
                 return true;
@@ -527,6 +530,8 @@ fn handle_key_event(
                     "/model ",
                     "/models",
                     "/new ",
+                    "/nuke",
+                    "/pipeline",
                     "/q",
                     "/quit",
                     "/sampling ",
@@ -538,7 +543,10 @@ fn handle_key_event(
                     let next = (current + 1) % commands.len();
                     s.prompt = commands[next].to_string();
                     s.prompt_cursor = s.prompt.chars().count();
-                } else {
+                } else if !prefix.contains(' ') {
+                    // Only complete bare command prefixes. A prompt with
+                    // arguments (contains a space) is already a full command
+                    // line — completing it would wipe the user's args.
                     let start = commands
                         .iter()
                         .position(|c| c.starts_with(prefix))
@@ -583,35 +591,49 @@ fn handle_slash_command(
         return true;
     }
     if let Some(n_str) = content.strip_prefix("/session ") {
-        if let Ok(idx) = n_str.trim().parse::<usize>() {
-            if let Some(meta) = s.last_sessions.get(idx) {
-                let sid = meta.id;
-                cmd_tx
-                    .send(ClientMessage::ResumeSession { session_id: sid })
-                    .ok();
-                s.entries.push(crate::state::ChatEntry::System(format!(
-                    "resuming session {}",
-                    sid.simple().to_string().chars().take(8).collect::<String>()
-                )));
-            } else {
-                s.entries.push(crate::state::ChatEntry::System(format!(
-                    "no session at index {idx}"
-                )));
+        match n_str.trim().parse::<usize>() {
+            Ok(idx) => {
+                if let Some(meta) = s.last_sessions.get(idx) {
+                    let sid = meta.id;
+                    cmd_tx
+                        .send(ClientMessage::ResumeSession { session_id: sid })
+                        .ok();
+                    s.entries.push(crate::state::ChatEntry::System(format!(
+                        "resuming session {}",
+                        sid.simple().to_string().chars().take(8).collect::<String>()
+                    )));
+                } else {
+                    s.entries.push(crate::state::ChatEntry::System(format!(
+                        "no session at index {idx}"
+                    )));
+                }
+            }
+            Err(_) => {
+                s.entries.push(crate::state::ChatEntry::System(
+                    "use /session <n> with a number from /sessions".into(),
+                ));
             }
         }
         return true;
     }
     if let Some(n_str) = content.strip_prefix("/delete ") {
-        if let Ok(idx) = n_str.trim().parse::<usize>() {
-            if let Some(meta) = s.last_sessions.get(idx) {
-                let sid = meta.id;
-                cmd_tx
-                    .send(ClientMessage::DeleteSession { session_id: sid })
-                    .ok();
-            } else {
-                s.entries.push(crate::state::ChatEntry::System(format!(
-                    "no session at index {idx}"
-                )));
+        match n_str.trim().parse::<usize>() {
+            Ok(idx) => {
+                if let Some(meta) = s.last_sessions.get(idx) {
+                    let sid = meta.id;
+                    cmd_tx
+                        .send(ClientMessage::DeleteSession { session_id: sid })
+                        .ok();
+                } else {
+                    s.entries.push(crate::state::ChatEntry::System(format!(
+                        "no session at index {idx}"
+                    )));
+                }
+            }
+            Err(_) => {
+                s.entries.push(crate::state::ChatEntry::System(
+                    "use /delete <n> with a number from /sessions".into(),
+                ));
             }
         }
         return true;
