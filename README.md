@@ -20,48 +20,37 @@ system. Use at your own risk. Do not expose to untrusted networks.
 <!---->
 ## What is this?
 <!---->
-`temple` is an always-on server/client AI agent harness. **renco** is the
-agent — a persistent coding assistant that lives on oracle (M2 Mac mini,
-aarch64) and talks to GPU-hosted models served by llama-swap on
-son-of-anton. Tools execute on
-your local machine through a headless daemon or the TUI client.
+`temple` is an always-on agent harness. **renco** is the agent — a
+persistent coding assistant that runs on your workstation(s) as a
+per-user daemon and talks to GPU-hosted models served by llama-swap on
+son-of-anton. The TUI connects to the local daemon; Signal works through
+the daemon that owns the shared number.
 <!---->
 The names `renco` and `temple` are a reference to the character Renco from the novel *Temple* by Matthew Reilly.
 <!---->
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│               temple-server (oracle, daemon)                 │
-│  • WebSocket API + pubkey auth                               │
-│  • Agent loop with remote tool dispatch                      │
-│  • MCP tools (fetch, searxng, nixos, arxiv,                 │
-│    context7) — run server-side                              │
-│  • Permission system (per-session, user-prompted)            │
-│  • SQLite memory + skills + personality                      │
-│  • Planner/executor/reviewer pipeline (deepseek + qwen)      │
-│  • Signal bot (two-way via signal-cli)                       │
-│  • Cron: skills extraction, smart flake updates              │
-└──────────────────────────────────────────────────────────────┘
-         ▲ WebSocket (JSON + pubkey)
-    (TUI or daemon)
-┌───────┴─────────────────┐
-│ temple (TUI + daemon)   │
-│ ratatui, local tools    │
-│ runs on your machine    │
-└─────────────────────────┘
-         │                        ▲
-         ▼                        │ Signal
-    llama-swap → models
-    (everything on son-of-anton:
-     deepseek, qwen, gemma)      (phone)
+│  temple --daemon (per user, e.g. e-play on e-desktop)        │
+│  • Full agent: loop, sessions, session log, cron            │
+│  • Local tool execution (fs confined to the session cwd)    │
+│  • WebSocket API on 127.0.0.1 + pubkey auth                 │
+│  • Memory bridge to Open WebUI (write-through + recall)     │
+│  • Signal presence (shared number, one owning daemon)       │
+└─────────────────────────────────────────────────────────────┘
+         ▲ WebSocket (127.0.0.1, pubkey auth)
+    (TUI client)
+         │
+         ▼
+    son-of-anton llama-swap → models
+    (deepseek, qwen, gemma, bge-m3 embeddings)
 ```
 <!---->
 ## Quick start
 <!---->
 ```bash
-nix build                    # both binaries in result/bin/
-result/bin/temple-server     # daemon (needs LITELLM_MASTER_KEY env)
-result/bin/temple            # TUI client
-temple --daemon              # headless daemon (for Signal sessions)
+nix build                    # binaries in result/bin/
+result/bin/temple --daemon --config /etc/temple/daemon.toml  # full agent daemon
+result/bin/temple            # TUI client (connects to 127.0.0.1:42123 by default)
 ```
 <!---->
 ## Client commands
@@ -100,28 +89,26 @@ prompt locally with y/N, regardless of the server's mode.
 ### Auth — pubkey only
 Clients authenticate via SSH public key (ed25519).
 The TUI auto-discovers
-`~/.ssh/id_ed25519.pub`.
-The daemon uses `--identity ~/.ssh/id_ed25519`.
-The server verifies keys against `/var/lib/temple/authorized_keys/<user>`.
+`~/.ssh/id_ed25519.pub` and sends it on session open; the daemon verifies
+it against the key files in its `authorized_keys_dir` (per-user keyed).
 Token-based auth is retained as a legacy fallback for Signal registration
 only (one-time use, 5-minute expiry, never stored to disk).
 <!---->
-### Headless daemon (`temple --daemon`)
-Runs as a systemd user service on each workstation.
-Connects to temple-server,
-authenticates with pubkey, and executes tool requests (file read/write, shell
-commands) locally.
-No SSH needed.
-Signal sessions use the daemon for tool
-execution — if no daemon is connected, the session is sandboxed (memories
-+ tasks only, no filesystem access).
+### Per-user agent daemon (`temple --daemon`)
+Runs as a systemd SYSTEM service per user (boot-starting, no login).
+Each daemon hosts the complete agent: loop, session log, tools (executed
+in-process, confined to the session working directory), memory bridge,
+cron, and the WebSocket front on 127.0.0.1. The TUI connects to the local
+daemon. Exactly one daemon (the Signal owner) connects to the shared
+signal-cli socket.
 <!---->
 ### Tool execution
-Local tools (`read_file`, `write_file`, `list_dir`, `edit_file`,
-`execute_command`) execute on the client machine via ToolRequest/ToolResult
-messages over WebSocket.
-MCP tools (fetch, searxng, nixos, arxiv, context7)
-and `save_memory` run on oracle.
+All tools execute in the agent process:
+fs tools (`read_file`, `write_file`, `list_dir`, `edit_file`,
+`execute_command`) are confined to the session cwd (reads may touch
+/tmp), and the permission modes gate risky operations.
+Web tools (fetch, searxng, nixos, arxiv, context7) are direct HTTP
+calls; `save_memory`/`recall_memory` go through the Open WebUI bridge.
 <!---->
 ### Router
 Heuristic classifier determines model routing.
@@ -137,10 +124,10 @@ router model.
 <!---->
 ### Signal bot
 Two-way via signal-cli JSON-RPC daemon on server-mu (x86_64 — signal-cli's
-native library is x86-only).
+native library is x86-only). The Signal-owning daemon (one per deployment —
+the shared number) connects to its socket and handles all Signal sessions.
 Read receipts, typing bubbles, and "still
 consulting the oracle..." status updates.
-Non-daemon sessions are sandboxed.
 <!---->
 ### Queue
 One agent loop at a time across all sessions (Signal, TUI).
@@ -165,32 +152,39 @@ API, reverts if risky), Sunday 05:00 personality self-update.
 # flake.nix
 inputs.temple.url = "github:ewtodd/temple";
 #
-# configuration.nix
-imports = [ inputs.temple.nixosModules.temple-server ];
+# configuration.nix — per-user agent daemons on the workstation
+imports = [ inputs.temple.nixosModules.temple-daemon ];
 #
-services.temple-server = {
+services.temple-daemon = {
   enable = true;
-  listen = "0.0.0.0:42123";
-  openFirewall = true;
-  litellmUrl = "https://llm.ethanwtodd.com";
-  defaultModel = "qwen3.6-27b-coding";
-  environmentFile = "/run/agenix/temple-env";  # LITELLM_MASTER_KEY=...
-  allowedDirs = [ "/etc/nixos" "/home" ];
-  signal.enable = true;
-  signal.socketAddr = "10.0.0.2:7583";
-  gitSafeDirectories = [ "/etc/nixos" ];
-  daemonAuthorizedKeys = {
-    ethan = "ssh-ed25519 AAAAC3Nz...";
-    val   = "ssh-ed25519 AAAAC3Nz...";
+  userDaemons = [ "e-play" "e-work" ];
+  modelEndpoints = {
+    "qwen3.6-27b" = "http://10.0.0.5:8080/v1";
+    "qwen3.6-35b-a3b" = "http://10.0.0.5:8080/v1";
   };
+  defaultModel = "qwen3.6-35b-a3b";
+  # e-play owns the shared Signal number (signal-cli on mu).
+  signal = {
+    enable = true;
+    owner = "e-play";
+    socketAddr = "10.0.0.2:7583";
+  };
+  openWebUI = {
+    enable = true;
+    baseUrl = "http://10.0.0.6:8081";
+  };
+  environmentFile = "/run/agenix/temple-env";  # OPENWEBUI_API_KEY=...
+  allowedDirs = [ "/etc/nixos" "/home" ];
+  authorizedKeys.e-play = [ "ssh-ed25519 AAAAC3Nz..." ];
 };
 ```
 <!---->
-The module creates a hardened systemd service (`temple` user,
-`ProtectSystem=full`, state in `/var/lib/temple`), generates the
-config TOML, writes authorized daemon keys, and opens the firewall
-if requested.
-Secrets come from agenix via `environmentFile`.
+The module creates a hardened systemd service per user (`temple --daemon
+--config /etc/temple/daemon-<user>.toml`, boot-starting, no login), per-user
+state under `/var/lib/temple/<user>/`, and pubkey auth files under
+`/etc/temple/keys/`. Secrets come from agenix via `environmentFile`.
+The standalone `temple-server` binary (older topology: a single shared
+server) still exists for one-host deployments.
 <!---->
 ## License
 <!---->
