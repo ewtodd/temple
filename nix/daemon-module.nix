@@ -1,12 +1,14 @@
-# temple-daemon NixOS module — full per-user agent services.
+# temple-daemon NixOS module — one full agent service.
 # Imported via the temple flake:
 #   imports = [ temple.nixosModules.temple-daemon ];
 #
-# Creates systemd SYSTEM services that start at boot (no login required),
-# one per configured user, each running the complete agent: loop, tools
-# (executed in-process), sessions, cron, and — on the daemon marked as
-# owning Signal — the shared Signal presence. The TUI connects to the
-# local daemon's WebSocket (pubkey auth via /etc/temple/keys).
+# Creates a single systemd SYSTEM service (boot-starting, no login) running
+# the complete agent: loop, session log, local tools (confined to the
+# session cwd), sessions, memory bridge, cron, and the WebSocket front on
+# 127.0.0.1. Session isolation is enforced per authenticated TUI client
+# (pubkey → owner) and the Signal presence is built in — one DB, one
+# process, both surfaces. The service runs under its own account so it is
+# not tied to any person's desktop user.
 {
   config,
   lib,
@@ -18,25 +20,24 @@ with lib;
 let
   cfg = config.services.temple-daemon;
 
-  modelLines = m: [
-    "default_model = \"${m.defaultModel}\""
-    "simple_model = \"${m.simpleModel}\""
-    "planner_model = \"${m.plannerModel}\""
-    "executor_model = \"${m.executorModel}\""
-    "reviewer_model = \"${m.reviewerModel}\""
-    "researcher_model = \"${m.researcherModel}\""
-    "router_model = \"${if m.routerModel != null then m.routerModel else m.researcherModel}\""
-    "title_model = \"${if m.titleModel != null then m.titleModel else m.researcherModel}\""
+  modelLines = [
+    "default_model = \"${cfg.defaultModel}\""
+    "simple_model = \"${cfg.simpleModel}\""
+    "planner_model = \"${cfg.plannerModel}\""
+    "executor_model = \"${cfg.executorModel}\""
+    "reviewer_model = \"${cfg.reviewerModel}\""
+    "researcher_model = \"${cfg.researcherModel}\""
+    "router_model = \"${if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel}\""
+    "title_model = \"${if cfg.titleModel != null then cfg.titleModel else cfg.researcherModel}\""
   ];
 
   backendLines = mapAttrsToList (name: url: ''  "${name}" = "${url}"'') cfg.modelEndpoints;
 
-  # One TOML config file per user (the daemon's --config).
-  mkConfig = name: idx: concatStringsSep "\n" (
+  configText = concatStringsSep "\n" (
     [
-      "listen = \"127.0.0.1:${toString (cfg.listenBasePort + idx)}\""
-      "listen_health = \"127.0.0.1:${toString (cfg.listenBasePort + idx + 100)}\""
-      "db_path = \"${cfg.stateDir}/${name}/temple.db\""
+      "listen = \"${cfg.listen}\""
+      "listen_health = \"${cfg.listenHealth}\""
+      "db_path = \"${cfg.stateDir}/temple.db\""
       "authorized_keys_dir = \"/etc/temple/keys\""
       "searxng_url = \"${cfg.searxngUrl}\""
       "default_permission = \"${cfg.defaultPermission}\""
@@ -45,7 +46,7 @@ let
       "]"
     ]
     ++ optional (cfg.authTokenFile != null) "auth_token_file = \"${toString cfg.authTokenFile}\""
-    ++ optional (cfg.signal.enable && name == cfg.signal.owner) (
+    ++ optional cfg.signal.enable (
       concatStringsSep "\n" [
         ""
         "[signal]"
@@ -73,35 +74,40 @@ let
       ""
       "[models]"
     ]
-    ++ modelLines cfg
+    ++ modelLines
   );
 in
 {
   options.services.temple-daemon = {
-    enable = mkEnableOption "temple full-agent daemons";
+    enable = mkEnableOption "temple full-agent daemon";
 
     package = mkOption {
       type = types.package;
       default = templePackage;
     };
 
+    serviceUser = mkOption {
+      type = types.str;
+      default = "temple";
+      description = "System account the daemon runs as (created by the module).";
+    };
+
     stateDir = mkOption {
       type = types.str;
       default = "/var/lib/temple";
-      description = "Per-user state: DBs, session logs.";
+      description = "State: DB, session logs, tokens.";
     };
 
-    userDaemons = mkOption {
-      type = types.listOf types.str;
-      default = [ ];
-      example = [ "e-play" "e-work" ];
-      description = "System usernames to run a full agent for.";
+    listen = mkOption {
+      type = types.str;
+      default = "127.0.0.1:42123";
+      description = "WebSocket listen address (TUI + Signal clients).";
     };
 
-    listenBasePort = mkOption {
-      type = types.port;
-      default = 42123;
-      description = "First daemon WebSocket port; each user gets basePort + index.";
+    listenHealth = mkOption {
+      type = types.str;
+      default = "127.0.0.1:42223";
+      description = "Health endpoint listen address.";
     };
 
     modelEndpoints = mkOption {
@@ -162,7 +168,7 @@ in
     authTokenFile = mkOption {
       type = types.nullOr types.path;
       default = null;
-      description = "Auth token file for Signal /verify registration (Signal-owning daemon).";
+      description = "Auth token file for Signal /verify registration.";
     };
 
     environmentFile = mkOption {
@@ -171,13 +177,29 @@ in
       description = "EnvironmentFile for secrets (e.g. OPENWEBUI_API_KEY).";
     };
 
+    supplementaryGroups = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "nixconfig" ];
+      description = "Extra groups for the service account (e.g. the fleet's nix config group).";
+    };
+
+    readWritePaths = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "/etc/nixos" ];
+      description = "Additional writable paths under ProtectSystem=full (e.g. the nix config repo).";
+    };
+
+    gitSafeDirectories = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "/etc/nixos" ];
+      description = "Git repos the service may open despite not owning them (cron flake updates).";
+    };
+
     signal = {
-      enable = mkEnableOption "Signal presence (one daemon owns the shared number)";
-      owner = mkOption {
-        type = types.str;
-        default = "";
-        description = "Username whose daemon owns the shared Signal number.";
-      };
+      enable = mkEnableOption "Signal presence (shared number)";
       socketAddr = mkOption {
         type = types.str;
         default = "127.0.0.1:7583";
@@ -210,20 +232,28 @@ in
       default = { };
       example = {
         e-play = [ "ssh-ed25519 AAAA... ethan-desktop" ];
+        e-work = [ "ssh-ed25519 AAAA... ethan-desktop" ];
       };
-      description = "TUI client public keys, keyed by owner (pubkey auth on the local WebSocket).";
+      description = "TUI client public keys, keyed by owner — the key file name is the session owner (per-user session isolation).";
     };
   };
 
   config = mkIf cfg.enable {
+    users.users.${cfg.serviceUser} = {
+      isSystemUser = true;
+      group = cfg.serviceUser;
+      home = cfg.stateDir;
+      description = "temple agent service account";
+    };
+    users.groups.${cfg.serviceUser} = { };
+
     environment.etc = lib.mkMerge [
-      (listToAttrs (imap0 (idx: name: {
-        name = "temple/daemon-${name}.toml";
-        value = {
-          text = mkConfig name idx;
+      {
+        "temple/temple-daemon.toml" = {
+          text = configText;
           mode = "0400";
         };
-      }) cfg.userDaemons))
+      }
       (listToAttrs (mapAttrsToList (owner: keys: {
         name = "temple/keys/${owner}";
         value = {
@@ -231,75 +261,85 @@ in
           mode = "0400";
         };
       }) cfg.authorizedKeys))
+      (optionalAttrs (cfg.gitSafeDirectories != [ ]) {
+        "temple/gitconfig".text = ''
+          [safe]
+          ${concatStringsSep "\n" (map (d: "\tdirectory = ${d}") cfg.gitSafeDirectories)}
+        '';
+      })
     ];
 
-    systemd.tmpfiles.rules = map (name: "d ${cfg.stateDir}/${name} 0700 ${name} users - -") cfg.userDaemons;
+    systemd.tmpfiles.rules = [
+      "d ${cfg.stateDir} 0700 ${cfg.serviceUser} ${cfg.serviceUser} - -"
+    ];
 
-    systemd.services = listToAttrs (imap0 (idx: name:
-      nameValuePair "temple-daemon-${name}" {
-        description = "temple agent daemon — ${name}";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
+    systemd.services.temple-daemon = {
+      description = "temple agent daemon (${cfg.serviceUser})";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
 
-        environment.HOME = "/home/${name}";
-        environment.RUST_LOG = "temple_agent=info,temple_server=info";
+      environment = {
+        HOME = cfg.stateDir;
+        GIT_CONFIG_GLOBAL = "/etc/temple/gitconfig";
+      };
+      environment.RUST_LOG = "temple_agent=info,temple_server=info";
 
-        path = with pkgs; [
-          bash
-          coreutils
-          gnugrep
-          gnused
-          findutils
-          git
-          ripgrep
-          nix
-          which
-          gcc
-          gnumake
-          cargo
-          rustc
+      path = with pkgs; [
+        bash
+        coreutils
+        gnugrep
+        gnused
+        findutils
+        git
+        ripgrep
+        nix
+        which
+        gcc
+        gnumake
+        cargo
+        rustc
+      ];
+
+      serviceConfig = {
+        Type = "simple";
+        User = cfg.serviceUser;
+        Group = cfg.serviceUser;
+        ExecStart = escapeShellArgs [
+          "${cfg.package}/bin/temple"
+          "--daemon"
+          "--config"
+          "/etc/temple/temple-daemon.toml"
         ];
+        Restart = "always";
+        RestartSec = "10s";
+        StandardOutput = "journal";
+        StandardError = "journal";
 
-        serviceConfig = {
-          Type = "simple";
-          User = name;
-          Group = "users";
-          ExecStart = escapeShellArgs [
-            "${cfg.package}/bin/temple"
-            "--daemon"
-            "--config"
-            "/etc/temple/daemon-${name}.toml"
-          ];
-          Restart = "always";
-          RestartSec = "10s";
-          StandardOutput = "journal";
-          StandardError = "journal";
+        SupplementaryGroups = cfg.supplementaryGroups;
+        ReadWritePaths = [ cfg.stateDir ] ++ cfg.readWritePaths;
 
-          ReadWritePaths = [ cfg.stateDir ];
-
-          NoNewPrivileges = true;
-          ProtectSystem = "full";
-          PrivateTmp = true;
-          PrivateDevices = true;
-          ProtectKernelTunables = true;
-          ProtectKernelModules = true;
-          ProtectKernelLogs = true;
-          ProtectControlGroups = true;
-          ProtectClock = true;
-          ProtectHostname = true;
-          RestrictSUIDSGID = true;
-          RestrictNamespaces = true;
-          RestrictRealtime = true;
-          LockPersonality = true;
-          RemoveIPC = true;
-          CapabilityBoundingSet = "";
-          RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
-        }
-        // (optionalAttrs (cfg.environmentFile != null) {
-          EnvironmentFile = cfg.environmentFile;
-        });
+        NoNewPrivileges = true;
+        ProtectSystem = "full";
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        RestrictSUIDSGID = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        RemoveIPC = true;
+        CapabilityBoundingSet = "";
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       }
-    ) cfg.userDaemons);
+      // (optionalAttrs (cfg.environmentFile != null) {
+        EnvironmentFile = cfg.environmentFile;
+      });
+    };
   };
 }

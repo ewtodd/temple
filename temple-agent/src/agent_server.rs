@@ -1398,6 +1398,13 @@ pub async fn run_agent_server(
                                         temple_protocol::PermissionMode::Default,
                                         None,
                                     ));
+                                // Label the session owner so shared-instance
+                                // replies are unambiguous (e-play vs e-work
+                                // sessions both live in this agent).
+                                let owner = agent
+                                    .session_owner(target_session)
+                                    .await
+                                    .unwrap_or_default();
                                 let id8: String = target_session
                                     .simple()
                                     .to_string()
@@ -1405,7 +1412,8 @@ pub async fn run_agent_server(
                                     .take(8)
                                     .collect();
                                 format!(
-                                    "📋 {} · {}{} [{}]\n\n{}",
+                                    "📋 {} · {} · {}{} [{}]\n\n{}",
+                                    owner,
                                     target.as_deref().unwrap_or("temple"),
                                     id8,
                                     title.map(|t| format!(" · {t}")).unwrap_or_default(),
