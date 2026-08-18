@@ -151,6 +151,14 @@ fn generate_and_save_token(
         format!("{}\n{}", lines.join("\n"), line)
     };
     std::fs::write(token_file, new_content)?;
+    // The daemon refuses token files with group/other permission bits
+    // (auth::require_owner_only demands 0600), so enforce it regardless
+    // of umask — also fixes a pre-existing too-permissive file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(token_file, std::fs::Permissions::from_mode(0o600))?;
+    }
 
     Ok(token)
 }

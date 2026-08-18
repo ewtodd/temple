@@ -309,6 +309,10 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      # A rebuild that regenerates the config restarts the daemon, so the
+      # running process never serves a stale config (e.g. missing token
+      # file path).
+      restartTriggers = [ config.environment.etc."temple/temple-daemon.toml".source ];
 
       environment = {
         HOME = cfg.stateDir;
