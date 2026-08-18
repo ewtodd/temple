@@ -346,6 +346,8 @@ pub struct Agent {
     pub direct: crate::direct_tools::DirectTools,
     pub memory: Arc<Memory>,
     pub permissions: Arc<PermissionResolver>,
+    /// Append-only per-session record of every model-visible event.
+    session_logs: Arc<crate::session_log::SessionLog>,
     sessions: Mutex<HashMap<Uuid, SessionCtx>>,
     /// Per-session cancellation tokens for in-progress agent loops.
     /// The generation counter guards against a stale loop deleting the
@@ -385,12 +387,14 @@ impl Agent {
         models: ModelConfig,
         nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
         default_permission: PermissionMode,
+        session_logs: Arc<crate::session_log::SessionLog>,
     ) -> Self {
         Self {
             backend,
             direct: crate::direct_tools::DirectTools::new(),
             memory,
             permissions: Arc::new(PermissionResolver::new()),
+            session_logs,
             sessions: Mutex::new(HashMap::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
             token_generation: std::sync::atomic::AtomicU64::new(0),
@@ -755,6 +759,22 @@ impl Agent {
         self.mcp_clients.lock().await.push(client);
     }
 
+    /// Append one event to a session's log, never blocking the loop on
+    /// failures (the log is a record, not a gate).
+    fn log(&self, session_id: Uuid, event: crate::session_log::SessionEvent) {
+        if let Err(e) = self
+            .session_logs
+            .append(&crate::session_log::SessionLogEntry::new(session_id, event))
+        {
+            tracing::warn!("session {session_id}: session log append failed: {e}");
+        }
+    }
+
+    /// Remove a session's log file (session deletion / /clear).
+    pub fn delete_session_log(&self, session_id: Uuid) {
+        self.session_logs.delete(session_id);
+    }
+
     pub async fn open_session(
         &self,
         session_id: Uuid,
@@ -797,6 +817,15 @@ impl Agent {
             },
         );
         drop(sessions);
+        self.log(
+            session_id,
+            crate::session_log::SessionEvent::SessionOpened {
+                user: username.to_string(),
+                kind: session_kind_str(kind),
+                cwd: cwd.to_string(),
+                model: self.models.default_model.clone(),
+            },
+        );
         // Quick sessions are ephemeral — don't persist
     }
 
@@ -849,6 +878,15 @@ impl Agent {
             },
         );
         drop(sessions);
+        self.log(
+            session_id,
+            crate::session_log::SessionEvent::SessionOpened {
+                user: owner.to_string(),
+                kind: "interactive".into(),
+                cwd: cwd.clone(),
+                model: self.models.default_model.clone(),
+            },
+        );
         // Don't persist yet — wait until the first user message arrives
         // so empty sessions never hit the DB.
         Ok(session_id)
@@ -895,21 +933,35 @@ impl Agent {
             _ => PermissionMode::Default,
         };
 
-        // Build transcript of user/assistant text turns for client replay
-        let transcript: Vec<(String, String)> = history
-            .iter()
-            .filter_map(|m| {
-                let content = m.content_text_owned()?;
-                if (m.role == "user" || m.role == "assistant")
-                    && !content.is_empty()
-                    && m.tool_call_id.is_none()
-                {
-                    Some((m.role.clone(), content))
-                } else {
-                    None
+        // Build transcript of user/assistant text turns for client replay.
+        // Log-backed sessions project the transcript from the append-only
+        // log; legacy sessions (no log yet) fall back to history. Backfill
+        // the log from the conversations table so old sessions get a record
+        // too.
+        let transcript = if self.session_logs.exists(session_id) {
+            crate::session_log::transcript(&self.session_logs.replay(session_id))
+        } else {
+            if let Ok(rows) = self.memory.get_session_history(session_id, 100_000).await {
+                for row in rows {
+                    let event = match row.role.as_str() {
+                        "user" => Some(crate::session_log::SessionEvent::UserMessage {
+                            content: row.content,
+                            username: owner.to_string(),
+                        }),
+                        "assistant" => Some(crate::session_log::SessionEvent::AssistantMessage {
+                            text: row.content,
+                            model: row.model_used.unwrap_or_default(),
+                            stage: "assistant".into(),
+                        }),
+                        _ => None,
+                    };
+                    if let Some(e) = event {
+                        self.log(session_id, e);
+                    }
                 }
-            })
-            .collect();
+            }
+            crate::session_log::transcript(&self.session_logs.replay(session_id))
+        };
 
         let meta = temple_protocol::SessionMeta {
             id: session_id,
@@ -1150,6 +1202,12 @@ impl Agent {
         // Cancel any in-progress loop, persist state, then unload
         self.cancel_chat(session_id).await;
         self.persist_session(session_id).await;
+        self.log(
+            session_id,
+            crate::session_log::SessionEvent::SessionClosed {
+                reason: "closed".into(),
+            },
+        );
         self.sessions.lock().await.remove(&session_id);
     }
 
@@ -1333,6 +1391,21 @@ impl Agent {
             // Build dynamic preamble (date, memories, skills) and prepend to
             // the user turn so the system prompt stays byte-stable.
             let preamble = self.build_dynamic_preamble(&s.username).await;
+            if !preamble.is_empty() {
+                self.log(
+                    session_id,
+                    crate::session_log::SessionEvent::Preamble {
+                        text: preamble.clone(),
+                    },
+                );
+            }
+            self.log(
+                session_id,
+                crate::session_log::SessionEvent::UserMessage {
+                    content: content.to_string(),
+                    username: s.username.clone(),
+                },
+            );
             let content_with_ctx = if preamble.is_empty() {
                 content.to_string()
             } else {
@@ -1375,6 +1448,9 @@ impl Agent {
         // Classification costs ~500ms for a ~10-token response — acceptable
         // for the correctness gain.
         let is_command = content.starts_with('/') || content.starts_with(':');
+        // Classifier model used to refine an ambiguous (Medium) query; None
+        // when the heuristic was conclusive. Logged with the routing event.
+        let mut refined_by: Option<String> = None;
         let complexity = if is_command
             || session_kind == SessionKind::Headless
             || model_override
@@ -1394,6 +1470,7 @@ impl Agent {
                     .as_deref()
                     .unwrap_or(&self.models.researcher_model);
                 tracing::info!("Router heuristic: Medium — refining via {classifier}");
+                refined_by = Some(classifier.to_string());
                 let refined = self
                     .backend
                     .classify_query(classifier, content)
@@ -1440,6 +1517,36 @@ impl Agent {
             Route::Direct { model } => model.clone(),
             Route::Pipeline { executor, .. } => executor.clone(),
         };
+
+        // Record the routing decision in the session log: the lane the
+        // turn runs on, the complexity class, and the classifier model
+        // that refined an ambiguous query.
+        {
+            let (model_desc, complexity_str, refined_by) = match &route {
+                Route::Direct { model } => (
+                    model.clone(),
+                    complexity.map(complexity_str),
+                    refined_by.clone(),
+                ),
+                Route::Pipeline {
+                    planner,
+                    executor,
+                    reviewer,
+                } => (
+                    format!("pipeline: {planner} → {executor} → {reviewer}"),
+                    complexity.map(complexity_str),
+                    refined_by.clone(),
+                ),
+            };
+            self.log(
+                session_id,
+                crate::session_log::SessionEvent::ModelRouted {
+                    model: model_desc,
+                    complexity: complexity_str,
+                    refined_by,
+                },
+            );
+        }
 
         // Lock the model for the session if this was a substantive routed
         // message — avoids shuffling models mid-conversation.  Simple
@@ -1622,6 +1729,14 @@ impl Agent {
 
         // Store assistant reply in history (needed for context in next turns)
         if !final_content.is_empty() {
+            self.log(
+                session_id,
+                crate::session_log::SessionEvent::AssistantMessage {
+                    text: final_content.clone(),
+                    model: model_for_stats.clone(),
+                    stage: "assistant".into(),
+                },
+            );
             {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
@@ -1713,6 +1828,7 @@ impl Agent {
             self.cancel_chat(id).await;
             self.sessions.lock().await.remove(&id);
             self.loop_locks.lock().await.remove(&id);
+            self.delete_session_log(id);
         }
         n
     }
@@ -1862,6 +1978,17 @@ impl Agent {
             return (String::new(), executor.to_string());
         }
 
+        // The plan is model-visible: it is injected into the executor's
+        // system prompt verbatim.
+        self.log(
+            session_id,
+            crate::session_log::SessionEvent::AssistantMessage {
+                text: plan.clone(),
+                model: planner.to_string(),
+                stage: "planner".into(),
+            },
+        );
+
         emit(AgentEvent::ToolEvent {
             name: "planner".into(),
             status: ToolStatus::Finished,
@@ -1929,6 +2056,17 @@ impl Agent {
 
             // Inject revision feedback as a user message in session history
             {
+                // The reviewer's verdict is model-visible: it becomes the
+                // next executor turn. The reviewer stage folds into the
+                // transcript as a user turn, mirroring history.
+                self.log(
+                    session_id,
+                    crate::session_log::SessionEvent::AssistantMessage {
+                        text: feedback.clone(),
+                        model: reviewer.to_string(),
+                        stage: "reviewer".into(),
+                    },
+                );
                 let mut sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&session_id) {
                     s.history
@@ -2403,6 +2541,23 @@ impl Agent {
                             "stuck: {name} repeated {repeat_count}× — try different approach"
                         ),
                     });
+                    self.log(
+                        session_id,
+                        crate::session_log::SessionEvent::ToolCall {
+                            name: name.clone(),
+                            args: args_str.clone(),
+                        },
+                    );
+                    self.log(
+                        session_id,
+                        crate::session_log::SessionEvent::ToolResult {
+                            name: name.clone(),
+                            ok: false,
+                            result: format!(
+                                "ERROR: {name} called {repeat_count}× with same args. Try a different approach."
+                            ),
+                        },
+                    );
                     let mut sessions = self.sessions.lock().await;
                     if let Some(s) = sessions.get_mut(&session_id) {
                         s.history.push(ChatMessage::tool_result(
@@ -2419,6 +2574,13 @@ impl Agent {
                     status: ToolStatus::Started,
                     detail: summarize_args(args_str),
                 });
+                self.log(
+                    session_id,
+                    crate::session_log::SessionEvent::ToolCall {
+                        name: name.clone(),
+                        args: args_str.clone(),
+                    },
+                );
 
                 let output = self
                     .execute_tool(
@@ -2439,6 +2601,14 @@ impl Agent {
                     status,
                     detail: text.chars().take(200).collect(),
                 });
+                self.log(
+                    session_id,
+                    crate::session_log::SessionEvent::ToolResult {
+                        name: name.clone(),
+                        ok: output.is_ok(),
+                        result: text.clone(),
+                    },
+                );
 
                 let result_text = output.unwrap_or_else(|e| format!("Error: {e}"));
                 let mut sessions = self.sessions.lock().await;
@@ -2464,6 +2634,15 @@ impl Agent {
                                 tc.function.name.clone(),
                                 "ERROR: tool call skipped — request was cancelled.".to_string(),
                             ));
+                            self.log(
+                                session_id,
+                                crate::session_log::SessionEvent::ToolResult {
+                                    name: tc.function.name.clone(),
+                                    ok: false,
+                                    result: "ERROR: tool call skipped — request was cancelled."
+                                        .to_string(),
+                                },
+                            );
                         }
                     }
                 }
@@ -3318,6 +3497,14 @@ Git conventions:
                     path: needs_path.display().to_string(),
                     access,
                 }));
+                self.log(
+                    session_id,
+                    crate::session_log::SessionEvent::PermissionPrompt {
+                        request_id: request_id.to_string(),
+                        path: needs_path.display().to_string(),
+                        access: crate::session_log::access_kind_str(&access),
+                    },
+                );
 
                 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
                 let out = tokio::select! {
@@ -3330,6 +3517,17 @@ Git conventions:
                     }
                     _ = cancel_token.cancelled() => Err("cancelled by user".to_string()),
                 };
+                self.log(
+                    session_id,
+                    crate::session_log::SessionEvent::PermissionResult {
+                        request_id: request_id.to_string(),
+                        granted: out.is_ok(),
+                        note: match &out {
+                            Ok(()) => "granted".into(),
+                            Err(e) => e.clone(),
+                        },
+                    },
+                );
                 if out.is_err() {
                     self.permissions.forget(request_id).await;
                 }
@@ -3897,6 +4095,26 @@ async fn detect_project_context(cwd: &str) -> String {
     } else {
         format!("\n## Project context\n{}\n", detected.join("\n"))
     }
+}
+
+/// Session kind label for the session log.
+fn session_kind_str(kind: SessionKind) -> String {
+    match kind {
+        SessionKind::Interactive => "interactive",
+        SessionKind::Headless => "headless",
+    }
+    .into()
+}
+
+/// Complexity class label for the session log.
+fn complexity_str(c: temple_protocol::ComplexityClass) -> String {
+    match c {
+        temple_protocol::ComplexityClass::Simple => "simple",
+        temple_protocol::ComplexityClass::Medium => "medium",
+        temple_protocol::ComplexityClass::Complex => "complex",
+        temple_protocol::ComplexityClass::Critical => "critical",
+    }
+    .into()
 }
 
 fn summarize_args(args_json: &str) -> String {

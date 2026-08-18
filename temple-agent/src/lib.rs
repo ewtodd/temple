@@ -17,4 +17,5 @@ pub mod permissions;
 pub mod queue;
 pub mod router;
 pub mod server;
+pub mod session_log;
 pub mod signal;

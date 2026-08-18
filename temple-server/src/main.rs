@@ -2,7 +2,8 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
 use std::sync::Arc;
 use temple_agent::{
-    agent, auth, backend, config, cron, mcp, memory, nextcloud, permissions, router, server, signal,
+    agent, auth, backend, config, cron, mcp, memory, nextcloud, permissions, router, server,
+    session_log, signal,
 };
 use temple_protocol::PermissionMode;
 use tokio::sync::Mutex;
@@ -116,12 +117,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize agent
+    let session_logs = Arc::new(session_log::SessionLog::open(session_log::default_log_dir(
+        &cfg.db_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| "/var/lib/temple".into()),
+    )));
     let agent = agent::Agent::new(
         backend,
         memory.clone(),
         cfg.models.clone(),
         nextcloud.clone(),
         default_perm,
+        session_logs,
     );
     let agent = Arc::new(agent);
 
@@ -709,6 +717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 return;
                                             }
                                             agent.close_session(r.id).await;
+                                            agent.delete_session_log(r.id);
                                             match memory.delete_session(r.id).await {
                                                 Ok(_) => {
                                                     // Drop any active-map pointers to it

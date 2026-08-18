@@ -362,6 +362,7 @@ async fn handle_connection(
                 }
                 // Close in-memory session if loaded, then remove from DB.
                 agent.close_session(sid).await;
+                agent.delete_session_log(sid);
                 match memory.delete_session(sid).await {
                     Ok(_) => {
                         let _ = tx.send(ServerMessage::SessionDeleted { session_id: sid });
