@@ -27,6 +27,9 @@ pub struct Config {
     /// (pubkey auth for TUI/daemon connections).
     #[serde(default = "default_authorized_keys_dir")]
     pub authorized_keys_dir: String,
+    /// Mandatory Landlock confinement for executed commands.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     /// Open WebUI memory bridge.
     #[serde(default)]
     pub openwebui: OpenWebUiConfig,
@@ -38,6 +41,18 @@ fn default_searxng_url() -> String {
 
 fn default_authorized_keys_dir() -> String {
     "/var/lib/temple/authorized_keys".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Confine `execute_command` with Landlock: read-only filesystem
+    /// except the session cwd, allowed dirs, HOME, and /tmp + /dev.
+    pub enabled: bool,
+    /// Extra writable directories beyond `allowed_dirs` (deployment
+    /// tunable; the session cwd is always writable).
+    #[serde(default)]
+    pub extra_writable_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,6 +211,7 @@ impl Default for Config {
             listen_health: default_health_listen(),
             searxng_url: default_searxng_url(),
             authorized_keys_dir: default_authorized_keys_dir(),
+            sandbox: SandboxConfig::default(),
             openwebui: OpenWebUiConfig::default(),
         }
     }

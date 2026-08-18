@@ -398,6 +398,79 @@ impl Memory {
         }
     }
 
+    /// Converge the local cache with Open WebUI: rows whose "key: " line
+    /// (scope marker included) no longer exists remotely are pruned
+    /// (deleted in the web UI), and rows whose remote value changed are
+    /// refreshed. Runs after the startup import, so a mirror failure
+    /// cannot prune a row that was never mirrored — a failed remote list
+    /// skips the whole pass.
+    pub async fn reconcile_memories_from_openwebui(&self) {
+        let Some(ow) = &self.openwebui else {
+            return;
+        };
+        let remote = match ow.list_memories().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("openwebui reconcile: list failed, skipping: {e}");
+                return;
+            }
+        };
+        let mut by_prefix: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for m in &remote {
+            by_prefix
+                .entry(crate::openwebui::line_prefix(&m.content))
+                .or_insert_with(|| m.content.clone());
+        }
+        let local = match self.list_all_memories().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("openwebui reconcile: local read failed: {e}");
+                return;
+            }
+        };
+        let conn = self.conn.lock().await;
+        let mut changed = 0usize;
+        for entry in &local {
+            let line = crate::openwebui::memory_line(&entry.key, &entry.value, &entry.scope);
+            let prefix = crate::openwebui::line_prefix(&line);
+            match by_prefix.get(&prefix) {
+                None => {
+                    if conn
+                        .execute(
+                            "DELETE FROM memory_store WHERE id = ?1",
+                            params![entry.id.to_string()],
+                        )
+                        .is_ok()
+                    {
+                        changed += 1;
+                    }
+                }
+                Some(remote_line) => {
+                    let remote_value = remote_line[prefix.len()..].to_string();
+                    if remote_value != entry.value
+                        && conn
+                            .execute(
+                                "UPDATE memory_store SET value = ?1, updated_at = ?2 WHERE id = ?3",
+                                params![
+                                    remote_value,
+                                    chrono::Utc::now().to_rfc3339(),
+                                    entry.id.to_string()
+                                ],
+                            )
+                            .is_ok()
+                    {
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        drop(conn);
+        if changed > 0 {
+            tracing::info!("openwebui reconcile: {changed} local cache rows updated");
+        }
+    }
+
     /// Every local memory row across all scopes (for the one-time import).
     pub async fn list_all_memories(&self) -> rusqlite::Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;

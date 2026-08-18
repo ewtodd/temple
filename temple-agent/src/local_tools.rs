@@ -57,7 +57,16 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Execute a tool against the local filesystem, confined to `cwd`.
-pub async fn execute_local_tool(name: &str, args_json: &str, cwd: &str) -> String {
+/// When `sandboxed`, `execute_command` runs under a Landlock domain with
+/// `sandbox_writable` as the writable set; a command that cannot be
+/// confined fails instead of running unrestricted.
+pub async fn execute_local_tool(
+    name: &str,
+    args_json: &str,
+    cwd: &str,
+    sandboxed: bool,
+    sandbox_writable: &[String],
+) -> String {
     let args: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(e) => return format!("Error: invalid tool arguments JSON: {e}"),
@@ -137,12 +146,20 @@ pub async fn execute_local_tool(name: &str, args_json: &str, cwd: &str) -> Strin
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "/bin/sh".to_string());
-            let child = tokio::process::Command::new(&shell)
-                .arg("-c")
+            let mut cmd = tokio::process::Command::new(&shell);
+            cmd.arg("-c")
                 .arg(command)
                 .current_dir(cwd)
-                .kill_on_drop(true)
-                .output();
+                .kill_on_drop(true);
+            if sandboxed {
+                let writable = sandbox_writable.to_vec();
+                unsafe {
+                    cmd.pre_exec(move || {
+                        crate::sandbox::apply_landlock(&writable).map_err(std::io::Error::other)
+                    });
+                }
+            }
+            let child = cmd.output();
             match tokio::time::timeout(CMD_TIMEOUT, child).await {
                 Err(_) => format!("Error: command timed out after {}s", CMD_TIMEOUT.as_secs()),
                 Ok(Err(e)) => format!("Error: {e}"),

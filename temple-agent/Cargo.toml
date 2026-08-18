@@ -22,6 +22,7 @@ toml = "0.8"
 dirs = "5"
 rand = "0.8"
 base64 = "0.22"
+landlock = "0.4.7"
 
 [dev-dependencies]
 tempfile = "3"

@@ -45,8 +45,11 @@ pub async fn run_agent_server(
         .await
         .expect("Failed to open database"),
     );
-    // One-time mirror of existing KV rows into Open WebUI (idempotent).
+    // One-time mirror of existing KV rows into Open WebUI (idempotent),
+    // then converge the cache with the remote (prune UI-deleted rows,
+    // refresh UI-edited values).
     memory.sync_memories_to_openwebui().await;
+    memory.reconcile_memories_from_openwebui().await;
 
     // Initialize model backend
     let backend = backend::ModelBackend::new(cfg.backends.clone());
@@ -69,6 +72,23 @@ pub async fn run_agent_server(
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| "/var/lib/temple".into()),
     )));
+    // Writable set for sandboxed commands: allowed dirs + configured
+    // extras + the agent's HOME and state dir (nix/cargo caches).
+    let mut sandbox_writable = cfg.allowed_dirs.clone();
+    sandbox_writable.extend(cfg.sandbox.extra_writable_dirs.iter().cloned());
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && !sandbox_writable.contains(&home) {
+            sandbox_writable.push(home);
+        }
+    }
+    let state_dir = cfg
+        .db_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/var/lib/temple".into());
+    if !sandbox_writable.contains(&state_dir) {
+        sandbox_writable.push(state_dir);
+    }
     let agent = agent::Agent::new(
         backend,
         memory.clone(),
@@ -78,6 +98,8 @@ pub async fn run_agent_server(
         session_logs,
         &cfg.searxng_url,
         local_execution,
+        cfg.sandbox.enabled,
+        sandbox_writable,
     );
     let agent = Arc::new(agent);
 

@@ -373,6 +373,12 @@ pub struct Agent {
     /// emitting ToolRequestNeeded for a remote client. Signal sessions and
     /// headless cron sessions then need no external executor.
     local_execution: bool,
+    /// Confine `execute_command` with Landlock (read-only fs except the
+    /// writable set). A command that cannot be confined fails.
+    sandbox_enabled: bool,
+    /// Directories confined commands may write: session cwd + allowed
+    /// dirs + HOME + these extras. Built at construction from config.
+    sandbox_writable: Vec<String>,
 }
 
 impl Agent {
@@ -386,6 +392,8 @@ impl Agent {
         session_logs: Arc<crate::session_log::SessionLog>,
         searxng_url: &str,
         local_execution: bool,
+        sandbox_enabled: bool,
+        sandbox_writable: Vec<String>,
     ) -> Self {
         Self {
             backend,
@@ -406,6 +414,8 @@ impl Agent {
             nextcloud,
             default_permission,
             local_execution,
+            sandbox_enabled,
+            sandbox_writable,
         }
     }
 
@@ -421,7 +431,14 @@ impl Agent {
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String, String> {
         if self.local_execution {
-            return Ok(crate::local_tools::execute_local_tool(name, args_json, session_cwd).await);
+            return Ok(crate::local_tools::execute_local_tool(
+                name,
+                args_json,
+                session_cwd,
+                self.sandbox_enabled,
+                &self.sandbox_writable,
+            )
+            .await);
         }
         let request_id = Uuid::new_v4();
         let rx = self.ask_tool(request_id).await;

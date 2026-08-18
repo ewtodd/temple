@@ -70,6 +70,18 @@ let
     ++ optional (cfg.modelEndpoints != { }) (
       concatStringsSep "\n" ([ "backends = {" ] ++ backendLines ++ [ "}" ])
     )
+    ++ optional cfg.sandbox.enable (
+      concatStringsSep "\n" (
+        [ "" "[sandbox]" "enabled = true" ]
+        ++ optional (cfg.sandbox.extraWritableDirs != [ ]) (
+          concatStringsSep "\n" (
+            [ "extra_writable_dirs = [" ]
+            ++ map (d: "  \"${d}\"") cfg.sandbox.extraWritableDirs
+            ++ [ "]" ]
+          )
+        )
+      )
+    )
     ++ [
       ""
       "[models]"
@@ -163,6 +175,16 @@ in
     defaultPermission = mkOption {
       type = types.str;
       default = "default";
+    };
+
+    sandbox = {
+      enable = mkEnableOption "Landlock confinement for executed commands (read-only fs except allowed dirs / HOME / /tmp / /dev)";
+      extraWritableDirs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "/scratch" ];
+        description = "Extra writable directories for sandboxed commands.";
+      };
     };
 
     authTokenFile = mkOption {

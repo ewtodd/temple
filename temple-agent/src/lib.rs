@@ -18,6 +18,7 @@ pub mod openwebui;
 pub mod permissions;
 pub mod queue;
 pub mod router;
+pub mod sandbox;
 pub mod server;
 pub mod session_log;
 pub mod signal;
