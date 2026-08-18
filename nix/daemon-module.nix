@@ -68,7 +68,9 @@ let
       ]
     )
     ++ optional (cfg.modelEndpoints != { }) (
-      concatStringsSep "\n" ([ "backends = {" ] ++ backendLines ++ [ "}" ])
+      # A [backends] section, not an inline table: TOML forbids newlines
+      # inside inline tables.
+      concatStringsSep "\n" ([ "" "[backends]" ] ++ map (l: "  ${l}") backendLines)
     )
     ++ optional cfg.sandbox.enable (
       concatStringsSep "\n" (
