@@ -863,7 +863,9 @@ fn verify_daemon_pubkey(pubkey: &str, dir: &std::path::Path) -> Option<String> {
             continue;
         }
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            if contents.lines().any(|line| line.trim() == key) {
+            // Compare key material only (type + blob): the client sends
+            // "ssh-ed25519 <blob>" while stored lines may carry comments.
+            if contents.lines().any(|line| key_material(line) == key) {
                 return path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -872,4 +874,16 @@ fn verify_daemon_pubkey(pubkey: &str, dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// First two whitespace-separated fields of an authorized_keys line
+/// (key type + base64 blob), or the whole trimmed line when shorter.
+fn key_material(line: &str) -> String {
+    let mut fields = line.split_whitespace();
+    let first = fields.next();
+    let second = fields.next();
+    match (first, second) {
+        (Some(a), Some(b)) => format!("{a} {b}"),
+        _ => line.trim().to_string(),
+    }
 }
