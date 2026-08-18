@@ -2,7 +2,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
 use std::sync::Arc;
 use temple_agent::{
-    agent, auth, backend, config, cron, memory, nextcloud, permissions, router, server,
+    agent, auth, backend, config, cron, memory, nextcloud, openwebui, permissions, router, server,
     session_log, signal,
 };
 use temple_protocol::PermissionMode;
@@ -97,10 +97,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Listening on: {}", cfg.listen);
 
     let memory = Arc::new(
-        memory::Memory::open(&cfg.db_path)
-            .await
-            .expect("Failed to open database"),
+        memory::Memory::open(
+            &cfg.db_path,
+            openwebui::openwebui_from_config(&cfg.openwebui),
+        )
+        .await
+        .expect("Failed to open database"),
     );
+    // One-time mirror of existing KV rows into Open WebUI (idempotent).
+    memory.sync_memories_to_openwebui().await;
 
     // Initialize model backend
     let backend = backend::ModelBackend::new(cfg.backends.clone());

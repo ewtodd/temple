@@ -7,16 +7,32 @@ use uuid::Uuid;
 
 pub struct Memory {
     conn: Arc<Mutex<Connection>>,
+    /// Optional Open WebUI bridge. When set, `set_memory` writes through
+    /// as free-text lines and semantic recall queries the remote store.
+    openwebui: Option<Arc<crate::openwebui::OpenWebUi>>,
 }
 
 impl Memory {
-    pub async fn open(path: &Path) -> rusqlite::Result<Self> {
+    pub async fn open(
+        path: &Path,
+        openwebui: Option<Arc<crate::openwebui::OpenWebUi>>,
+    ) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await.ok();
             }
         }
         let conn = Connection::open(path)?;
+        let memory = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            openwebui,
+        };
+        memory.init_schema().await?;
+        Ok(memory)
+    }
+
+    async fn init_schema(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().await;
         // Use PRAGMA user_version to track schema migrations so we don't
         // run ALTER TABLE blindly every startup (which logs spurious errors
         // when columns already exist).
@@ -231,9 +247,7 @@ impl Memory {
             DROP TABLE skills;\
             ALTER TABLE skills_v7 RENAME TO skills;",
         )?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(())
     }
 
     // ── Conversations ──
@@ -298,7 +312,117 @@ impl Memory {
              ON CONFLICT(key, scope) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
             rusqlite::params![uuid::Uuid::new_v4().to_string(), key, value, scope, now],
         )?;
+        drop(conn);
+        // Write-through to Open WebUI (best effort): upsert the matching
+        // "key: value" line so the web UI and temple see the same facts.
+        // The local row stays authoritative on failure.
+        if let Some(ow) = &self.openwebui {
+            let line = crate::openwebui::memory_line(key, value, scope);
+            let prefix = crate::openwebui::line_prefix(&line);
+            match ow.list_memories().await {
+                Ok(memories) => match memories.iter().find(|m| m.content.starts_with(&prefix)) {
+                    Some(existing) => {
+                        if let Err(e) = ow.update_memory(&existing.id, &line).await {
+                            tracing::warn!("openwebui update {key}: {e}");
+                        }
+                    }
+                    None => {
+                        if let Err(e) = ow.add_memory(&line).await {
+                            tracing::warn!("openwebui add {key}: {e}");
+                        }
+                    }
+                },
+                Err(e) => tracing::warn!("openwebui list during save: {e}"),
+            }
+        }
         Ok(())
+    }
+
+    /// Semantic recall via Open WebUI (needs its embedding backend), with
+    /// keyword search as a fallback when vector search is unavailable.
+    /// Returns remote memory lines; `Err` when the bridge is absent or
+    /// unreachable, so callers can fall back to local scope reads.
+    pub async fn recall_memories(&self, query: &str, limit: u32) -> Result<Vec<String>, String> {
+        let ow = self.openwebui.as_ref().ok_or("openwebui not configured")?;
+        match ow.query_memories(query, limit).await {
+            Ok(hits) if !hits.is_empty() => Ok(hits),
+            // Empty vector result (no memories or below relevance) — try
+            // keyword search before giving up.
+            _ => {
+                let hits = ow
+                    .search_memories(query, limit)
+                    .await
+                    .map_err(|e| format!("openwebui keyword fallback: {e}"))?;
+                Ok(hits.into_iter().map(|m| m.content).collect())
+            }
+        }
+    }
+
+    /// One-time import of local KV rows into Open WebUI. Idempotent: rows
+    /// whose "key: " line already exists remotely are left alone. Called
+    /// at startup when the bridge is enabled.
+    pub async fn sync_memories_to_openwebui(&self) {
+        let Some(ow) = &self.openwebui else {
+            return;
+        };
+        let local = match self.list_all_memories().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("openwebui sync: local read failed: {e}");
+                return;
+            }
+        };
+        let remote = match ow.list_memories().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("openwebui sync: list failed: {e}");
+                return;
+            }
+        };
+        let mut imported = 0usize;
+        for entry in &local {
+            let line = crate::openwebui::memory_line(&entry.key, &entry.value, &entry.scope);
+            let prefix = crate::openwebui::line_prefix(&line);
+            if remote.iter().any(|m| m.content.starts_with(&prefix)) {
+                continue;
+            }
+            match ow.add_memory(&line).await {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    tracing::warn!("openwebui sync: add {} failed: {e}", entry.key);
+                }
+            }
+        }
+        if imported > 0 {
+            tracing::info!("openwebui sync: imported {imported} local memories");
+        }
+    }
+
+    /// Every local memory row across all scopes (for the one-time import).
+    pub async fn list_all_memories(&self) -> rusqlite::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, key, value, scope, created_at, updated_at FROM memory_store ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MemoryEntry {
+                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                key: row.get(1)?,
+                value: row.get(2)?,
+                scope: row.get(3)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                    .map(|d| d.to_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                updated_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+                    .map(|d| d.to_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows.flatten() {
+            results.push(r);
+        }
+        Ok(results)
     }
 
     pub async fn get_memory(&self, key: &str, scope: &str) -> rusqlite::Result<Option<String>> {

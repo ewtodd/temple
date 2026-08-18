@@ -41,6 +41,11 @@ let
       title_model = if cfg.titleModel != null then cfg.titleModel else cfg.researcherModel;
     };
     searxng_url = cfg.searxngUrl;
+    openwebui = {
+      enabled = cfg.openWebUI.enable;
+      base_url = cfg.openWebUI.baseUrl;
+      api_key_env = cfg.openWebUI.apiKeyEnv;
+    };
   } // optionalAttrs (cfg.tlsCertFile != null && cfg.tlsKeyFile != null) {
     tls = {
       cert = cfg.tlsCertFile;
@@ -226,6 +231,30 @@ in
       type = types.str;
       default = "http://127.0.0.1:8888/search";
       description = "SearXNG JSON API endpoint for the searxng-web_search tool.";
+    };
+
+    openWebUI = mkOption {
+      type = types.submodule {
+        options = {
+          enable = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Bridge temple memories to Open WebUI (write-through + semantic recall).";
+          };
+          baseUrl = mkOption {
+            type = types.str;
+            default = "http://127.0.0.1:8081";
+            description = "Open WebUI base URL; /api/v1 is appended.";
+          };
+          apiKeyEnv = mkOption {
+            type = types.str;
+            default = "OPENWEBUI_API_KEY";
+            description = "Environment variable holding the Open WebUI API key (one key = one Open WebUI user).";
+          };
+        };
+      };
+      default = { };
+      description = "Open WebUI memory bridge settings.";
     };
 
     openFirewall = mkOption {

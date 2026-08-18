@@ -12,6 +12,7 @@ pub mod cron;
 pub mod direct_tools;
 pub mod memory;
 pub mod nextcloud;
+pub mod openwebui;
 pub mod permissions;
 pub mod queue;
 pub mod router;

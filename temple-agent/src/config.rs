@@ -23,10 +23,36 @@ pub struct Config {
     /// SearXNG JSON API endpoint used by the searxng-web_search tool.
     #[serde(default = "default_searxng_url")]
     pub searxng_url: String,
+    /// Open WebUI memory bridge.
+    #[serde(default)]
+    pub openwebui: OpenWebUiConfig,
 }
 
 fn default_searxng_url() -> String {
     "http://127.0.0.1:8888/search".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OpenWebUiConfig {
+    /// Bridge memories to Open WebUI (write-through + semantic recall).
+    pub enabled: bool,
+    /// Open WebUI base URL, e.g. "http://127.0.0.1:8081" or
+    /// "https://ai.ethanwtodd.com". The /api/v1 prefix is appended.
+    pub base_url: String,
+    /// Environment variable holding the API key. One key = one Open WebUI
+    /// user; all memories land under that account.
+    pub api_key_env: String,
+}
+
+impl Default for OpenWebUiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "http://127.0.0.1:8081".into(),
+            api_key_env: "OPENWEBUI_API_KEY".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -161,6 +187,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             listen_health: default_health_listen(),
             searxng_url: default_searxng_url(),
+            openwebui: OpenWebUiConfig::default(),
         }
     }
 }

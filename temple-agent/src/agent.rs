@@ -1342,7 +1342,7 @@ impl Agent {
             };
             // Build dynamic preamble (date, memories, skills) and prepend to
             // the user turn so the system prompt stays byte-stable.
-            let preamble = self.build_dynamic_preamble(&s.username).await;
+            let preamble = self.build_dynamic_preamble(&s.username, content).await;
             if !preamble.is_empty() {
                 self.log(
                     session_id,
@@ -2774,17 +2774,31 @@ Git conventions:
     /// and learned skills. This content changes frequently, so it is
     /// prepended to the user turn rather than baked into the system prompt,
     /// keeping the prefix cache warm across the session.
-    async fn build_dynamic_preamble(&self, username: &str) -> String {
+    async fn build_dynamic_preamble(&self, username: &str, user_query: &str) -> String {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
         let mut parts = vec![format!("[Current date: {now}]")];
 
-        if let Ok(memories) = self.memory.get_all_memory(username).await {
-            if !memories.is_empty() {
+        // Semantic recall via Open WebUI when the bridge is up; fall back
+        // to the local scope read (which the bridge mirrors anyway).
+        let remote_hits = self.memory.recall_memories(user_query, 8).await;
+        match remote_hits {
+            Ok(hits) if !hits.is_empty() => {
                 let mut s = format!("\n\nWhat you know about {username}:\n");
-                for m in memories.iter().take(20) {
-                    s.push_str(&format!("- **{}**: {}\n", m.key, m.value));
+                for hit in hits.iter().take(8) {
+                    s.push_str(&format!("- {hit}\n"));
                 }
                 parts.push(s);
+            }
+            _ => {
+                if let Ok(memories) = self.memory.get_all_memory(username).await {
+                    if !memories.is_empty() {
+                        let mut s = format!("\n\nWhat you know about {username}:\n");
+                        for m in memories.iter().take(20) {
+                            s.push_str(&format!("- **{}**: {}\n", m.key, m.value));
+                        }
+                        parts.push(s);
+                    }
+                }
             }
         }
 
