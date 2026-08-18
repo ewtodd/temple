@@ -43,7 +43,15 @@ impl DirectTools {
                 .expect("http client"),
         }
     }
+}
 
+impl Default for DirectTools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectTools {
     pub async fn fetch(&self, url: &str) -> Result<String, String> {
         let client = self.client.clone();
         let url = url.to_string();

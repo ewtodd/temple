@@ -30,16 +30,6 @@ pub async fn run_server(
         tracing::info!("TLS enabled");
     }
 
-    // Keep-alive: ping the warm model every 30s so llamaswap doesn't unload it
-    let keep_alive = agent.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            keep_alive.keep_warm().await;
-        }
-    });
-
     loop {
         let (stream, peer) = listener.accept().await?;
         tracing::info!("New connection from {peer}");

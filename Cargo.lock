@@ -2409,6 +2409,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "temple-agent"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "dirs",
+ "futures-util",
+ "native-tls",
+ "rand",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "temple-protocol",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "temple-client"
 version = "0.1.0"
 dependencies = [
@@ -2450,22 +2474,12 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
- "futures-util",
- "native-tls",
  "rand",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
+ "temple-agent",
  "temple-protocol",
  "tokio",
- "tokio-native-tls",
- "tokio-tungstenite",
- "tokio-util",
- "toml",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
 ]
 

@@ -342,7 +342,7 @@ impl ModelBackend {
         }
     }
 
-    /// Non-streaming completion (used for keep-alive pings).
+    /// Non-streaming completion (titles, summarization, cron jobs, health probes).
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, String> {
         let endpoint = self.get_endpoint(&req.model)?.to_string();
         let resp = self
@@ -652,16 +652,20 @@ pub struct SamplingParams {
     pub top_k: u32,
 }
 
-impl SamplingPreset {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for SamplingPreset {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "deterministic" => Self::Deterministic,
             "coding" => Self::Coding,
             "creative" => Self::Creative,
             _ => Self::General,
-        }
+        })
     }
+}
 
+impl SamplingPreset {
     pub fn params(&self) -> SamplingParams {
         match self {
             Self::Deterministic => SamplingParams {

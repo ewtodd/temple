@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["temple-protocol", "temple-server", "temple-client"]
+members = ["temple-protocol", "temple-agent", "temple-server", "temple-client"]
 
 [workspace.package]
 version = "0.1.0"

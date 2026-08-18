@@ -22,7 +22,8 @@ system. Use at your own risk. Do not expose to untrusted networks.
 <!---->
 `temple` is an always-on server/client AI agent harness. **renco** is the
 agent — a persistent coding assistant that lives on oracle (M2 Mac mini,
-aarch64) and talks to GPU-hosted models via LiteLLM. Tools execute on
+aarch64) and talks to GPU-hosted models served by llama-swap on
+son-of-anton. Tools execute on
 your local machine through a headless daemon or the TUI client.
 <!---->
 The names `renco` and `temple` are a reference to the character Renco from the novel *Temple* by Matthew Reilly.
@@ -32,8 +33,8 @@ The names `renco` and `temple` are a reference to the character Renco from the n
 │               temple-server (oracle, daemon)                 │
 │  • WebSocket API + pubkey auth                               │
 │  • Agent loop with remote tool dispatch                      │
-│  • MCP tools via litellm (fetch, searxng, nixos, arxiv,     │
-│    context7) — run server-side                               │
+│  • MCP tools (fetch, searxng, nixos, arxiv,                 │
+│    context7) — run server-side                              │
 │  • Permission system (per-session, user-prompted)            │
 │  • SQLite memory + skills + personality                      │
 │  • Planner/executor/reviewer pipeline (deepseek + qwen)      │
@@ -49,9 +50,9 @@ The names `renco` and `temple` are a reference to the character Renco from the n
 └─────────────────────────┘
          │                        ▲
          ▼                        │ Signal
-    litellm proxy → models    (phone)
-    (deepseek on son-of-anton,
-     qwen + gemma on anton)
+    llama-swap → models
+    (everything on son-of-anton:
+     deepseek, qwen, gemma)      (phone)
 ```
 <!---->
 ## Quick start
@@ -120,7 +121,7 @@ Local tools (`read_file`, `write_file`, `list_dir`, `edit_file`,
 `execute_command`) execute on the client machine via ToolRequest/ToolResult
 messages over WebSocket.
 MCP tools (fetch, searxng, nixos, arxiv, context7)
-and `save_memory` run on oracle via the LiteLLM proxy.
+and `save_memory` run on oracle.
 <!---->
 ### Router
 Heuristic classifier determines model routing.
@@ -152,9 +153,6 @@ Owned by the authenticated user (e.g. "ethan").
 `--continue` resumes the most recent session in the same directory.
 Sessions persist across connections — resume from TUI, continue from
 Signal, pick up from another host.
-<!---->
-### Keep-alive
-Pings the primary model every 30s to keep llama-swap resident.
 <!---->
 ### Cron
 03:00 skills extraction, 04:00 smart `nix flake update` (GitHub compare

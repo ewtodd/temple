@@ -1,22 +1,9 @@
-mod agent;
-mod auth;
-mod backend;
-mod config;
-mod cron;
-mod direct_tools;
-
-mod mcp;
-mod memory;
-mod nextcloud;
-mod permissions;
-mod queue;
-mod router;
-mod server;
-mod signal;
-
 use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
 use std::sync::Arc;
+use temple_agent::{
+    agent, auth, backend, config, cron, mcp, memory, nextcloud, permissions, router, server, signal,
+};
 use temple_protocol::PermissionMode;
 use tokio::sync::Mutex;
 
@@ -140,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to configured MCP servers via stdio JSON-RPC 2.0
     for (name, srv) in &cfg.mcp_servers {
-        match crate::mcp::McpClient::connect(name, &srv.command, &srv.args).await {
+        match mcp::McpClient::connect(name, &srv.command, &srv.args).await {
             Ok(client) => {
                 agent.add_mcp_client(client).await;
             }
@@ -1710,14 +1697,9 @@ fn generate_and_save_token(
 /// Send a Signal message to the conversation it came from — the group
 /// when the inbound message was a group message, else the sender's DM.
 /// Long messages are split; failures are logged, not swallowed.
-async fn send_conv(
-    signal: &crate::signal::Signal,
-    sender: &str,
-    group_id: &Option<String>,
-    text: &str,
-) {
+async fn send_conv(signal: &signal::Signal, sender: &str, group_id: &Option<String>, text: &str) {
     // Signal doesn't render markdown — convert to its inline formatting
-    let text = crate::signal::markdown_to_signal(text);
+    let text = signal::markdown_to_signal(text);
     let result = match group_id {
         Some(g) => signal.send_multi_group(g, &text).await,
         None => signal.send_multi(sender, &text).await,
@@ -1752,11 +1734,7 @@ fn mode_tag(mode: temple_protocol::PermissionMode) -> &'static str {
     }
 }
 
-async fn notify_admins(
-    signal: &crate::signal::Signal,
-    memory: &crate::memory::Memory,
-    message: &str,
-) {
+async fn notify_admins(signal: &signal::Signal, memory: &memory::Memory, message: &str) {
     match memory.get_admins().await {
         Ok(admins) if !admins.is_empty() => {
             for (phone, uuid) in &admins {
@@ -1776,11 +1754,11 @@ async fn notify_admins(
 /// Describe an image via a vision-capable model. Takes a pre-encoded
 /// data:image/...;base64,... URL and returns the model's text response.
 async fn backend_describe_image(
-    backend: &crate::backend::ModelBackend,
+    backend: &backend::ModelBackend,
     model: &str,
     image_url: &str,
 ) -> Result<String, String> {
-    use crate::backend::{ContentPart, ImageUrl, MessageContent};
+    use backend::{ContentPart, ImageUrl, MessageContent};
 
     let content = MessageContent::Parts(vec![
         ContentPart::ImageUrl {
@@ -1791,9 +1769,9 @@ async fn backend_describe_image(
         },
     ]);
 
-    let req = crate::backend::ChatRequest {
+    let req = backend::ChatRequest {
         model: model.to_string(),
-        messages: vec![crate::backend::ChatMessage {
+        messages: vec![backend::ChatMessage {
             role: "user".into(),
             content: Some(content),
             tool_calls: None,

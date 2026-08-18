@@ -167,7 +167,15 @@ impl PermissionResolver {
             pending: Mutex::new(HashMap::new()),
         }
     }
+}
 
+impl Default for PermissionResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PermissionResolver {
     pub async fn ask(&self, request_id: Uuid) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id, tx);
@@ -354,8 +362,6 @@ pub struct Agent {
     pub models: ModelConfig,
     /// Global priority queue — one agent loop at a time across all sessions
     pub queue: crate::queue::RequestQueue,
-    /// Last time a real request started (keep-warm skips while this is fresh)
-    last_request: std::sync::Mutex<Instant>,
     tools: Mutex<Vec<ToolDefinition>>,
     /// Active daemon connections: username → count (multiple sessions per user).
     /// Used for Signal sandboxing — users without a daemon get restricted tools.
@@ -392,9 +398,6 @@ impl Agent {
             pending_tools: Mutex::new(HashMap::new()),
             models,
             queue: crate::queue::RequestQueue::new(),
-            last_request: std::sync::Mutex::new(
-                Instant::now() - std::time::Duration::from_secs(3600),
-            ),
             tools: Mutex::new(Vec::new()),
             daemon_connections: Mutex::new(HashMap::new()),
             daemon_channels: Mutex::new(HashMap::new()),
@@ -750,35 +753,6 @@ impl Agent {
     /// Register a new MCP client. Called at startup from main.
     pub async fn add_mcp_client(&self, client: crate::mcp::McpClient) {
         self.mcp_clients.lock().await.push(client);
-    }
-
-    /// Ensure the brain model stays loaded in llamaswap.
-    /// Does NOT send "ping" (that corrupts KV cache). Instead sends
-    /// a minimal request that llama.cpp's prefix cache handles gracefully.
-    /// Skipped when real traffic recently hit the model — those requests
-    /// keep it resident on their own.
-    pub async fn keep_warm(&self) {
-        {
-            let last = self.last_request.lock().unwrap();
-            if last.elapsed() < std::time::Duration::from_secs(300) {
-                return;
-            }
-        }
-        // A 1-token completion with the same system prompt prefix as real
-        // requests — llama.cpp caches the prefix, so this is cheap and
-        // doesn't displace the real conversation cache.
-        let req = ChatRequest {
-            model: self.models.default_model.clone(),
-            messages: vec![ChatMessage::system("ok"), ChatMessage::user(".")],
-            tools: None,
-            stream: Some(false),
-            stream_options: None,
-            max_tokens: Some(1),
-            temperature: Some(0.0),
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
-            ..Default::default()
-        };
-        let _ = self.backend.chat(req).await;
     }
 
     pub async fn open_session(
@@ -1545,8 +1519,6 @@ impl Agent {
                 detail: format!("your turn now (waited {}s)", waited.as_secs()),
             });
         }
-        *self.last_request.lock().unwrap() = Instant::now();
-
         // Get or lazily detect project context (cached per-session)
         let (_project_context, base_system_prompt, cached_tools) = {
             let mut sessions = self.sessions.lock().await;
@@ -2192,8 +2164,12 @@ impl Agent {
                         .get(&session_id)
                         .and_then(|s| s.sampling_preset.clone())
                 };
-                let sp =
-                    SamplingPreset::from_str(sampling.as_deref().unwrap_or("general")).params();
+                let sp = sampling
+                    .as_deref()
+                    .unwrap_or("general")
+                    .parse()
+                    .unwrap_or(SamplingPreset::General)
+                    .params();
                 ChatRequest {
                     model: model.to_string(),
                     messages,
