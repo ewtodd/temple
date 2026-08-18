@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 temple-protocol = { path = "../temple-protocol" }
+temple-agent = { path = "../temple-agent" }
 ratatui = "0.30"
 crossterm = "0.29"
 serde_json = "1"

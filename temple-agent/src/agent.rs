@@ -369,9 +369,14 @@ pub struct Agent {
     daemon_channels: Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<ServerMessage>>>>,
     pub nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
     pub default_permission: PermissionMode,
+    /// Execute filesystem tools in-process (embedded daemon) instead of
+    /// emitting ToolRequestNeeded for a remote client. Signal sessions and
+    /// headless cron sessions then need no external executor.
+    local_execution: bool,
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)] // Every dependency is wired once at construction.
     pub fn new(
         backend: ModelBackend,
         memory: Arc<Memory>,
@@ -380,6 +385,7 @@ impl Agent {
         default_permission: PermissionMode,
         session_logs: Arc<crate::session_log::SessionLog>,
         searxng_url: &str,
+        local_execution: bool,
     ) -> Self {
         Self {
             backend,
@@ -399,7 +405,33 @@ impl Agent {
             daemon_channels: Mutex::new(HashMap::new()),
             nextcloud,
             default_permission,
+            local_execution,
         }
+    }
+
+    /// Run a filesystem tool: either in-process (embedded daemon) or by
+    /// emitting ToolRequestNeeded for a connected client, waiting for the
+    /// result either way. Consent was already checked by the caller.
+    async fn route_tool(
+        &self,
+        name: &str,
+        args_json: &str,
+        session_cwd: &str,
+        cancel_token: &CancellationToken,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<String, String> {
+        if self.local_execution {
+            return Ok(crate::local_tools::execute_local_tool(name, args_json, session_cwd).await);
+        }
+        let request_id = Uuid::new_v4();
+        let rx = self.ask_tool(request_id).await;
+        emit(AgentEvent::ToolRequestNeeded {
+            request_id,
+            name: name.to_string(),
+            args_json: args_json.to_string(),
+            session_cwd: session_cwd.to_string(),
+        });
+        self.wait_tool_result(request_id, rx, cancel_token).await
     }
 
     /// Summarise the oldest portion of a session's conversation into a
@@ -2871,8 +2903,6 @@ Git conventions:
                     emit,
                 )
                 .await?;
-                let request_id = Uuid::new_v4();
-                let rx = self.ask_tool(request_id).await;
                 let mut resolved_args = args.clone();
                 resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
                 let resolved_args_json =
@@ -2884,13 +2914,14 @@ Git conventions:
                     .get(&session_id)
                     .map(|s| s.cwd.clone())
                     .unwrap_or_else(|| ".".into());
-                emit(AgentEvent::ToolRequestNeeded {
-                    request_id,
-                    name: "read_file".to_string(),
-                    args_json: resolved_args_json,
-                    session_cwd,
-                });
-                self.wait_tool_result(request_id, rx, cancel_token).await
+                self.route_tool(
+                    "read_file",
+                    &resolved_args_json,
+                    &session_cwd,
+                    cancel_token,
+                    emit,
+                )
+                .await
             }
 
             "write_file" => {
@@ -2916,8 +2947,6 @@ Git conventions:
                     emit,
                 )
                 .await?;
-                let request_id = Uuid::new_v4();
-                let rx = self.ask_tool(request_id).await;
                 let mut resolved_args = args.clone();
                 resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
                 let resolved_args_json =
@@ -2929,13 +2958,14 @@ Git conventions:
                     .get(&session_id)
                     .map(|s| s.cwd.clone())
                     .unwrap_or_else(|| ".".into());
-                emit(AgentEvent::ToolRequestNeeded {
-                    request_id,
-                    name: "write_file".to_string(),
-                    args_json: resolved_args_json,
-                    session_cwd,
-                });
-                self.wait_tool_result(request_id, rx, cancel_token).await
+                self.route_tool(
+                    "write_file",
+                    &resolved_args_json,
+                    &session_cwd,
+                    cancel_token,
+                    emit,
+                )
+                .await
             }
 
             "list_dir" => {
@@ -2960,10 +2990,7 @@ Git conventions:
                     emit,
                 )
                 .await?;
-                let request_id = Uuid::new_v4();
-                let rx = self.ask_tool(request_id).await;
-                let mut resolved_args = args.clone();
-                resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
+                let resolved_args = args.clone();
                 let resolved_args_json =
                     serde_json::to_string(&resolved_args).unwrap_or_else(|_| args_json.to_string());
                 let session_cwd = self
@@ -2973,13 +3000,14 @@ Git conventions:
                     .get(&session_id)
                     .map(|s| s.cwd.clone())
                     .unwrap_or_else(|| ".".into());
-                emit(AgentEvent::ToolRequestNeeded {
-                    request_id,
-                    name: "list_dir".to_string(),
-                    args_json: resolved_args_json,
-                    session_cwd,
-                });
-                self.wait_tool_result(request_id, rx, cancel_token).await
+                self.route_tool(
+                    "list_dir",
+                    &resolved_args_json,
+                    &session_cwd,
+                    cancel_token,
+                    emit,
+                )
+                .await
             }
 
             "execute_command" => {
@@ -3022,8 +3050,6 @@ Git conventions:
                     )
                     .await?;
                 }
-                let request_id = Uuid::new_v4();
-                let rx = self.ask_tool(request_id).await;
                 let session_cwd = self
                     .sessions
                     .lock()
@@ -3031,17 +3057,19 @@ Git conventions:
                     .get(&session_id)
                     .map(|s| s.cwd.clone())
                     .unwrap_or_else(|| ".".into());
-                emit(AgentEvent::ToolRequestNeeded {
-                    request_id,
-                    name: "execute_command".to_string(),
-                    args_json: if command == raw_command {
-                        args_json.to_string()
-                    } else {
-                        serde_json::json!({ "command": command }).to_string()
-                    },
-                    session_cwd,
-                });
-                self.wait_tool_result(request_id, rx, cancel_token).await
+                let args_json = if command == raw_command {
+                    args_json.to_string()
+                } else {
+                    serde_json::json!({ "command": command }).to_string()
+                };
+                self.route_tool(
+                    "execute_command",
+                    &args_json,
+                    &session_cwd,
+                    cancel_token,
+                    emit,
+                )
+                .await
             }
 
             "save_memory" => {
@@ -3084,8 +3112,6 @@ Git conventions:
                     emit,
                 )
                 .await?;
-                let request_id = Uuid::new_v4();
-                let rx = self.ask_tool(request_id).await;
                 let mut resolved_args = args.clone();
                 resolved_args["path"] = serde_json::json!(resolved.to_string_lossy());
                 let resolved_args_json =
@@ -3097,13 +3123,14 @@ Git conventions:
                     .get(&session_id)
                     .map(|s| s.cwd.clone())
                     .unwrap_or_else(|| ".".into());
-                emit(AgentEvent::ToolRequestNeeded {
-                    request_id,
-                    name: "edit_file".to_string(),
-                    args_json: resolved_args_json,
-                    session_cwd,
-                });
-                self.wait_tool_result(request_id, rx, cancel_token).await
+                self.route_tool(
+                    "edit_file",
+                    &resolved_args_json,
+                    &session_cwd,
+                    cancel_token,
+                    emit,
+                )
+                .await
             }
             "recall_memory" => {
                 let username = {
@@ -3235,15 +3262,15 @@ Git conventions:
                 )
                 .await?;
                 let command = format!("rg --json --no-heading -n {pattern}");
-                let request_id = Uuid::new_v4();
-                let rx = self.ask_tool(request_id).await;
-                emit(AgentEvent::ToolRequestNeeded {
-                    request_id,
-                    name: "execute_command".to_string(),
-                    args_json: serde_json::json!({ "command": command }).to_string(),
-                    session_cwd: cwd,
-                });
-                self.wait_tool_result(request_id, rx, cancel_token).await
+                let session_cwd = cwd;
+                self.route_tool(
+                    "execute_command",
+                    &serde_json::json!({ "command": command }).to_string(),
+                    &session_cwd,
+                    cancel_token,
+                    emit,
+                )
+                .await
             }
             "fetch" | "fetch-fetch" => {
                 let url = args["url"].as_str().ok_or("fetch: missing url")?;

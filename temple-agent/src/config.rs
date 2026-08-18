@@ -23,6 +23,10 @@ pub struct Config {
     /// SearXNG JSON API endpoint used by the searxng-web_search tool.
     #[serde(default = "default_searxng_url")]
     pub searxng_url: String,
+    /// Directory of authorized client public keys, one file per owner
+    /// (pubkey auth for TUI/daemon connections).
+    #[serde(default = "default_authorized_keys_dir")]
+    pub authorized_keys_dir: String,
     /// Open WebUI memory bridge.
     #[serde(default)]
     pub openwebui: OpenWebUiConfig,
@@ -30,6 +34,10 @@ pub struct Config {
 
 fn default_searxng_url() -> String {
     "http://127.0.0.1:8888/search".into()
+}
+
+fn default_authorized_keys_dir() -> String {
+    "/var/lib/temple/authorized_keys".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -187,6 +195,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             listen_health: default_health_listen(),
             searxng_url: default_searxng_url(),
+            authorized_keys_dir: default_authorized_keys_dir(),
             openwebui: OpenWebUiConfig::default(),
         }
     }

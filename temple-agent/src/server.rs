@@ -135,7 +135,10 @@ async fn handle_connection(
                 // The client sends its system username (e.g. "e-work") but
                 // authorized_keys files are keyed by owner (e.g. "ethan").
                 if let Some(ref pubkey) = open.daemon_pubkey {
-                    match verify_daemon_pubkey(pubkey) {
+                    match verify_daemon_pubkey(
+                        pubkey,
+                        std::path::Path::new(&config.authorized_keys_dir),
+                    ) {
                         Some(owner) => {
                             auth_owner = Some(owner.clone());
                             daemon_owner = Some(owner.clone());
@@ -845,13 +848,12 @@ async fn handle_connection(
 
 /// Verify a daemon public key against all authorized_keys/* files.
 /// Returns the owning username if found, or None.
-fn verify_daemon_pubkey(pubkey: &str) -> Option<String> {
+fn verify_daemon_pubkey(pubkey: &str, dir: &std::path::Path) -> Option<String> {
     let key = pubkey.trim();
     if key.is_empty() {
         return None;
     }
-    let dir = std::path::PathBuf::from("/var/lib/temple/authorized_keys");
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return None,
     };

@@ -1,6 +1,5 @@
 mod app;
 mod client;
-mod daemon;
 mod input;
 mod render;
 mod state;
@@ -11,7 +10,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 
 #[derive(Parser)]
-#[command(name = "temple", about = "renco TUI client")]
+#[command(name = "temple", about = "renco TUI client + headless daemon")]
 struct Cli {
     #[arg(short, long, default_value = "127.0.0.1:42123")]
     server: String,
@@ -30,16 +29,19 @@ struct Cli {
     tls: bool,
     #[arg(long, value_enum)]
     generate_completions: Option<Shell>,
-    /// Run as a headless daemon — executes tool requests locally, no UI.
-    /// Requires --identity. Permission mode comes from the session, not the daemon.
+    /// Run as a headless daemon — hosts the full agent locally (loop,
+    /// tools, Signal, cron) and serves the TUI over a local WebSocket.
+    /// Requires --config with the per-user agent configuration.
     #[arg(long)]
     daemon: bool,
+    /// Agent config file (temple-server style TOML). Required with --daemon.
+    #[arg(long, required_if_eq("daemon", "true"))]
+    config: Option<std::path::PathBuf>,
     /// Log the full session conversation to .temple-session.log in CWD
     #[arg(long)]
     log_session: bool,
     /// Path to SSH private key for daemon authentication (e.g. ~/.ssh/id_ed25519).
-    /// Required when --daemon.
-    #[arg(long, required_if_eq("daemon", "true"))]
+    #[arg(long)]
     identity: Option<String>,
 }
 
@@ -65,28 +67,14 @@ fn main() {
         .unwrap_or_else(|| whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()));
 
     if cli.daemon {
-        let pubkey = cli.identity.and_then(|path| {
-            let pub_path = if path.ends_with(".pub") {
-                path.clone()
-            } else {
-                format!("{path}.pub")
-            };
-            std::fs::read_to_string(&pub_path).ok().map(|s| {
-                let parts: Vec<&str> = s.trim().splitn(3, ' ').collect();
-                if parts.len() >= 2 {
-                    format!("{} {}", parts[0], parts[1])
-                } else {
-                    s.trim().to_string()
-                }
-            })
-        });
-        if pubkey.is_none() {
-            eprintln!("temple-daemon: --identity is required in daemon mode");
-            std::process::exit(1);
-        }
+        // Headless daemon: the full agent runs in-process (loop, tools,
+        // Signal, cron) and the TUI connects to its local WebSocket.
+        let cfg = temple_agent::config::Config::load(cli.config.as_deref());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = daemon::run(cli.server, client_id, pubkey.unwrap()).await {
+            if let Err(e) =
+                temple_agent::agent_server::run_agent_server(std::sync::Arc::new(cfg), true).await
+            {
                 eprintln!("temple-daemon: fatal: {e}");
                 std::process::exit(1);
             }
