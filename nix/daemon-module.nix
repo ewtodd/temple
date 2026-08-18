@@ -66,14 +66,14 @@ let
         "api_key_env = \"${cfg.openWebUI.apiKeyEnv}\""
       ]
     )
+    ++ optional (cfg.modelEndpoints != { }) (
+      concatStringsSep "\n" ([ "backends = {" ] ++ backendLines ++ [ "}" ])
+    )
     ++ [
       ""
       "[models]"
     ]
     ++ modelLines cfg
-    ++ optional (cfg.modelEndpoints != { }) (
-      concatStringsSep "\n" ([ "backends = {" ] ++ backendLines ++ [ "}" ])
-    )
   );
 in
 {
