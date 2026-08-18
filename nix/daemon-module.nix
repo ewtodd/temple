@@ -274,6 +274,9 @@ in
         "temple/temple-daemon.toml" = {
           text = configText;
           mode = "0400";
+          # The service account must be able to read its own config.
+          user = cfg.serviceUser;
+          group = cfg.serviceUser;
         };
       }
       (listToAttrs (mapAttrsToList (owner: keys: {
@@ -281,6 +284,8 @@ in
         value = {
           text = concatStringsSep "\n" keys + "\n";
           mode = "0400";
+          user = cfg.serviceUser;
+          group = cfg.serviceUser;
         };
       }) cfg.authorizedKeys))
       (optionalAttrs (cfg.gitSafeDirectories != [ ]) {
