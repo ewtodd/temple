@@ -129,8 +129,9 @@ Simple → researcher model.
 Medium → default model.
 Complex → planner→executor→reviewer pipeline.
 Critical → direct.
-First substantive message locks the model for the
-session; `/model auto` re-enables routing.
+Routing is per request — every message re-classifies;
+`/model NAME` pins a model for the session, `/model auto`
+re-enables routing.
 Signal sessions auto-use the
 router model.
 <!---->

@@ -309,11 +309,6 @@ struct SessionCtx {
     /// True when the user explicitly picked a model via /model — routing
     /// is bypassed and this model is used directly.  /model auto clears it.
     model_override: bool,
-    /// Model locked by the router for the session. The first substantive
-    /// (non-Simple, non-command) message stamps this, and all subsequent
-    /// messages reuse it without re-classifying.  Cleared by /model and
-    /// on reset.  In-memory only — not persisted to DB.
-    last_routed_model: Option<String>,
     /// Coding-session task list, persisted with the session.
     todos: Vec<temple_protocol::TodoItem>,
     /// Stable system prompt — built once on first use and reused for the
@@ -805,7 +800,6 @@ impl Agent {
                 permission_mode: self.default_permission,
                 project_context: None,
                 model_override: false,
-                last_routed_model: None,
                 todos: Vec::new(),
                 cached_system_prompt: None,
                 cached_tools: None,
@@ -866,7 +860,6 @@ impl Agent {
                 permission_mode: self.default_permission,
                 project_context: None,
                 model_override: false,
-                last_routed_model: None,
                 todos: Vec::new(),
                 cached_system_prompt: None,
                 cached_tools: None,
@@ -991,7 +984,6 @@ impl Agent {
                 permission_mode,
                 project_context: None,
                 model_override: false,
-                last_routed_model: None,
                 todos,
                 cached_system_prompt: None,
                 cached_tools: None,
@@ -1241,7 +1233,6 @@ impl Agent {
         if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
             s.model = model.to_string();
             s.model_override = true;
-            s.last_routed_model = None;
         }
     }
 
@@ -1250,7 +1241,6 @@ impl Agent {
         if let Some(s) = self.sessions.lock().await.get_mut(&session_id) {
             s.model = self.models.default_model.clone();
             s.model_override = false;
-            s.last_routed_model = None;
         }
     }
 
@@ -1373,15 +1363,7 @@ impl Agent {
         let _loop_guard = loop_lock.lock().await;
 
         // Get session info
-        let (
-            username,
-            cwd,
-            session_model,
-            session_kind,
-            model_override,
-            last_routed_model,
-            force_pipeline,
-        ) = {
+        let (username, cwd, session_model, session_kind, model_override, force_pipeline) = {
             let mut sessions = self.sessions.lock().await;
             let Some(s) = sessions.get_mut(&session_id) else {
                 emit(AgentEvent::Error("session not found".into()));
@@ -1436,7 +1418,6 @@ impl Agent {
                 s.model.clone(),
                 s.kind,
                 s.model_override,
-                s.last_routed_model.clone(),
                 s.force_pipeline,
             )
         };
@@ -1446,17 +1427,14 @@ impl Agent {
         // is already confident about Simple and Complex; only truly
         // ambiguous queries fall through to Medium and get refined.
         // Classification costs ~500ms for a ~10-token response — acceptable
-        // for the correctness gain.
+        // for the correctness gain. Every request re-classifies: routing is
+        // per request, never locked for the session.
         let is_command = content.starts_with('/') || content.starts_with(':');
         // Classifier model used to refine an ambiguous (Medium) query; None
         // when the heuristic was conclusive. Logged with the routing event.
         let mut refined_by: Option<String> = None;
-        let complexity = if is_command
-            || session_kind == SessionKind::Headless
-            || model_override
-            || last_routed_model.is_some()
-        {
-            None // commands, headless, /model override, or locked session model skip routing
+        let complexity = if is_command || session_kind == SessionKind::Headless || model_override {
+            None // commands, headless, and /model override skip routing
         } else {
             let heuristic = Router::classify(content);
             if heuristic == ComplexityClass::Medium {
@@ -1483,16 +1461,15 @@ impl Agent {
                 Some(heuristic)
             }
         };
-        let route = match (complexity, model_override, &last_routed_model) {
+        let route = match (complexity, model_override, is_command) {
             (Some(c), _, _) => Router::route(c, &self.models, session_kind),
             (_, true, _) => Route::Direct {
                 model: session_model,
             },
-            (_, _, Some(m)) => Route::Direct { model: m.clone() },
-            (None, false, None) if is_command => Route::Direct {
+            (None, false, true) => Route::Direct {
                 model: session_model,
             },
-            (None, false, None) => Route::Direct {
+            (None, false, false) => Route::Direct {
                 model: self.models.default_model.clone(),
             },
         };
@@ -1548,17 +1525,6 @@ impl Agent {
             );
         }
 
-        // Lock the model for the session if this was a substantive routed
-        // message — avoids shuffling models mid-conversation.  Simple
-        // greetings and commands don't lock.
-        let was_locked = last_routed_model.is_some();
-        if complexity.is_some_and(|c| c != ComplexityClass::Simple) && !is_command {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.get_mut(&session_id) {
-                s.last_routed_model = Some(lane.clone());
-            }
-        }
-
         // Immediate ack — before any queue wait — so the user knows their
         // message is being worked on, what model(s), and how deep the line is.
         {
@@ -1574,13 +1540,10 @@ impl Agent {
             };
             let (busy, waiting) = self.queue.lane_status(&lane);
             let ahead = waiting + busy as usize;
-            let is_locked_now = !was_locked
-                && complexity.is_some_and(|c| c != ComplexityClass::Simple)
-                && !is_command;
-            let detail = if is_locked_now {
+            let detail = if !is_command && complexity.is_some() {
                 format!(
-                    "routing: selected {model_desc} for this session\n\
-                     use /model <name> to override or /model auto to re-route"
+                    "routing: using {model_desc} for this request\n\
+                     use /model <name> to pin a model, /model auto to re-enable routing"
                 )
             } else if ahead == 0 {
                 "message received — you're next up".to_string()
