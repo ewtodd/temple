@@ -2,7 +2,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{self, Shell};
 use std::sync::Arc;
 use temple_agent::{
-    agent, auth, backend, config, cron, mcp, memory, nextcloud, permissions, router, server,
+    agent, auth, backend, config, cron, memory, nextcloud, permissions, router, server,
     session_log, signal,
 };
 use temple_protocol::PermissionMode;
@@ -130,22 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nextcloud.clone(),
         default_perm,
         session_logs,
+        &cfg.searxng_url,
     );
     let agent = Arc::new(agent);
 
-    // Connect to configured MCP servers via stdio JSON-RPC 2.0
-    for (name, srv) in &cfg.mcp_servers {
-        match mcp::McpClient::connect(name, &srv.command, &srv.args).await {
-            Ok(client) => {
-                agent.add_mcp_client(client).await;
-            }
-            Err(e) => {
-                tracing::error!("{e}");
-            }
-        }
-    }
-
-    // Load tools (local + MCP)
+    // Load tools (all local — direct HTTP implementations)
     agent.refresh_tools().await;
 
     // Signal two-way loop: inbound messages → agent → outbound reply

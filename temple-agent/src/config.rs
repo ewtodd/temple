@@ -20,16 +20,13 @@ pub struct Config {
     /// Health check listen address (host:port). When set, responds with 200 OK on HTTP GET.
     #[serde(default = "default_health_listen")]
     pub listen_health: String,
-    /// MCP servers to connect via stdio JSON-RPC. Keyed by name.
-    #[serde(default)]
-    pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    /// SearXNG JSON API endpoint used by the searxng-web_search tool.
+    #[serde(default = "default_searxng_url")]
+    pub searxng_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct McpServerConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
+fn default_searxng_url() -> String {
+    "http://127.0.0.1:8888/search".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -163,7 +160,7 @@ impl Default for Config {
             auth_token_file: None,
             tls: TlsConfig::default(),
             listen_health: default_health_listen(),
-            mcp_servers: std::collections::HashMap::new(),
+            searxng_url: default_searxng_url(),
         }
     }
 }

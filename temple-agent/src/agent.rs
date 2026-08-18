@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::backend::{
     ChatMessage, ChatRequest, MessageContent, ModelBackend, SamplingPreset, StreamEvent,
-    ToolDefinition, ToolFunctionDef,
+    ToolDefinition,
 };
 use crate::config::ModelConfig;
 use crate::memory::Memory;
@@ -369,10 +369,6 @@ pub struct Agent {
     daemon_channels: Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<ServerMessage>>>>,
     pub nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
     pub default_permission: PermissionMode,
-    /// MCP server clients for remote tool dispatch. Each client is a
-    /// running subprocess that implements the MCP JSON-RPC 2.0 protocol
-    /// over stdio. Populated at startup from config.
-    mcp_clients: Mutex<Vec<crate::mcp::McpClient>>,
 }
 
 impl Agent {
@@ -383,10 +379,11 @@ impl Agent {
         nextcloud: Arc<tokio::sync::Mutex<crate::nextcloud::Nextcloud>>,
         default_permission: PermissionMode,
         session_logs: Arc<crate::session_log::SessionLog>,
+        searxng_url: &str,
     ) -> Self {
         Self {
             backend,
-            direct: crate::direct_tools::DirectTools::new(),
+            direct: crate::direct_tools::DirectTools::new(searxng_url),
             memory,
             permissions: Arc::new(PermissionResolver::new()),
             session_logs,
@@ -402,7 +399,6 @@ impl Agent {
             daemon_channels: Mutex::new(HashMap::new()),
             nextcloud,
             default_permission,
-            mcp_clients: Mutex::new(Vec::new()),
         }
     }
 
@@ -725,33 +721,7 @@ impl Agent {
 
     /// Load local tool definitions.
     pub async fn refresh_tools(&self) {
-        let mut tools = local_tools();
-        let mut mcp = self.mcp_clients.lock().await;
-        for client in mcp.iter_mut() {
-            match client.list_tools().await {
-                Ok(mcp_tools) => {
-                    for t in mcp_tools {
-                        tools.push(ToolDefinition {
-                            type_field: "function".into(),
-                            function: ToolFunctionDef {
-                                name: t.name,
-                                description: t.description,
-                                parameters: t.input_schema,
-                            },
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("mcp: failed to list tools: {e}");
-                }
-            }
-        }
-        *self.tools.lock().await = tools;
-    }
-
-    /// Register a new MCP client. Called at startup from main.
-    pub async fn add_mcp_client(&self, client: crate::mcp::McpClient) {
-        self.mcp_clients.lock().await.push(client);
+        *self.tools.lock().await = local_tools();
     }
 
     /// Append one event to a session's log, never blocking the loop on
@@ -3413,21 +3383,7 @@ Git conventions:
                 Ok(out.trim_end().to_string())
             }
 
-            _ => {
-                // Check MCP clients for this tool
-                let mcp_name = name.to_string();
-                let args_val = args.clone();
-                let mut mcp = self.mcp_clients.lock().await;
-                for client in mcp.iter_mut() {
-                    match client.call_tool(&mcp_name, &args_val).await {
-                        Ok(result) => return Ok(result),
-                        Err(e) => {
-                            tracing::debug!("mcp: {e}");
-                        }
-                    }
-                }
-                Err(format!("unknown tool: {name}"))
-            }
+            _ => Err(format!("unknown tool: {name}")),
         }
     }
 

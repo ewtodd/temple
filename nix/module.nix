@@ -40,13 +40,12 @@ let
       router_model = if cfg.routerModel != null then cfg.routerModel else cfg.researcherModel;
       title_model = if cfg.titleModel != null then cfg.titleModel else cfg.researcherModel;
     };
+    searxng_url = cfg.searxngUrl;
   } // optionalAttrs (cfg.tlsCertFile != null && cfg.tlsKeyFile != null) {
     tls = {
       cert = cfg.tlsCertFile;
       key = cfg.tlsKeyFile;
     };
-  } // optionalAttrs (cfg.mcpServers != {}) {
-    mcp_servers = cfg.mcpServers;
   });
 
   portStr = if lib.hasPrefix "[" cfg.listen
@@ -223,32 +222,10 @@ in
       };
     };
 
-    mcpServers = mkOption {
-      type = types.attrsOf (types.submodule {
-        options = {
-          command = mkOption {
-            type = types.str;
-            example = "uvx";
-            description = "Command to spawn the MCP server process. uvx is recommended for Python MCP servers — temple's systemd service already has uv in PATH.";
-          };
-          args = mkOption {
-            type = types.listOf types.str;
-            default = [ ];
-            description = "Arguments for the MCP server command.";
-          };
-        };
-      });
-      default = {
-        fetch = { command = "uvx"; args = [ "mcp-server-fetch" ]; };
-        arxiv = { command = "uvx"; args = [ "arxiv-mcp-server" "--store-path" "/tmp/arxiv-cache" ]; };
-        nixos = { command = "uvx"; args = [ "mcp-server-nixos" ]; };
-        searxng = { command = "uvx"; args = [ "mcp-server-searxng" "--search-url" "http://127.0.0.1:8081/search?q={query}&format=json" ]; };
-        context7 = { command = "uvx"; args = [ "mcp-server-context7" ]; };
-      };
-      description = ''MCP servers to connect via stdio JSON-RPC 2.0. Tools from
-        these servers are discovered at startup and made available to the LLM
-        alongside built-in local tools. Defaults cover fetch, arxiv, nixos,
-        searxng (localhost:8081), and context7 — override or add your own.'';
+    searxngUrl = mkOption {
+      type = types.str;
+      default = "http://127.0.0.1:8888/search";
+      description = "SearXNG JSON API endpoint for the searxng-web_search tool.";
     };
 
     openFirewall = mkOption {

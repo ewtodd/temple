@@ -10,7 +10,6 @@ pub mod backend;
 pub mod config;
 pub mod cron;
 pub mod direct_tools;
-pub mod mcp;
 pub mod memory;
 pub mod nextcloud;
 pub mod permissions;

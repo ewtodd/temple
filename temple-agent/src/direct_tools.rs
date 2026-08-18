@@ -31,23 +31,25 @@ where
 /// Each function takes arguments and returns a result string.
 pub struct DirectTools {
     client: HttpClient,
+    searxng_url: String,
 }
 
 impl DirectTools {
-    pub fn new() -> Self {
+    pub fn new(searxng_url: &str) -> Self {
         Self {
             client: HttpClient::builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent("temple/0.1")
                 .build()
                 .expect("http client"),
+            searxng_url: searxng_url.to_string(),
         }
     }
 }
 
 impl Default for DirectTools {
     fn default() -> Self {
-        Self::new()
+        Self::new("http://127.0.0.1:8888/search")
     }
 }
 
@@ -77,7 +79,7 @@ impl DirectTools {
                 let fmt = "json".to_string();
                 let cat = "general".to_string();
                 let resp = client
-                    .get("http://localhost:8081/search")
+                    .get(self.searxng_url.clone())
                     .query(&[("q", &query), ("format", &fmt), ("categories", &cat)])
                     .send()
                     .await
