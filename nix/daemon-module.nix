@@ -263,6 +263,8 @@ in
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
+
     users.users.${cfg.serviceUser} = {
       isSystemUser = true;
       group = cfg.serviceUser;
