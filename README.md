@@ -10,6 +10,14 @@ C A R R Y   T H E   S P I R I T   O F   T H E   P E O P L E
 <!---->
 # temple — renco's agent harness
 <!---->
+**ARCHIVED — August 2026.** This project is archived. It is preserved as
+documentation of what open-weight LLMs could produce at this point in 2026
+when asked to build an agent harness from scratch: a working daemon
+architecture, but with enough bugs that it is not usable in practice. The
+design ideas live on in its successor — the second iteration,
+[ewtodd/renco](https://github.com/ewtodd/renco) — which supersedes it.
+**Do not run this against a machine you care about.**
+<!---->
 **WARNING: Experimental local-AI agent harness. Not production software.**
 It runs LLM agents that execute shell commands and read/write files on your
 system. Use at your own risk. Do not expose to untrusted networks.
